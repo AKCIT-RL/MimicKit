@@ -1,0 +1,7 @@
+--num_envs 64
+
+--engine_config data/engines/isaac_gym_engine.yaml
+--env_config data/envs/amp_g1_wave_overfit_env.yaml
+--agent_config data/agents/amp_g1_wave_low_gp_agent.yaml
+
+--out_dir output/amp_g1_wave_low_gp/

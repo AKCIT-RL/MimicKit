@@ -21,6 +21,7 @@ class DeepMimicEnv(char_env.CharEnv):
         self._tar_obs_steps = env_config.get("tar_obs_steps", [1])
         self._tar_obs_steps = torch.tensor(self._tar_obs_steps, device=device, dtype=torch.int)
         self._rand_reset = env_config.get("rand_reset", True)
+        self._truncate_reset_time = env_config.get("truncate_reset_time", False)
         
         self._ref_char_offset = torch.tensor(env_config["ref_char_offset"], device=device, dtype=torch.float)
         self._log_tracking_error = env_config.get("log_tracking_error", False)
@@ -51,6 +52,20 @@ class DeepMimicEnv(char_env.CharEnv):
     
     def get_reward_fail(self):
         return 0.0
+
+    def _validate_envs(self):
+        super()._validate_envs()
+
+        if (self._engine.get_control_mode() == engine.ControlMode.pos):
+            char_id = self._get_char_id()
+            kp, kd = self._engine.get_obj_pd_gains(0, char_id)
+            torque_limits = self._engine.get_obj_torque_limits(0, char_id)
+            assert np.isfinite(kp).all() and np.isfinite(kd).all(), "PD gains contain NaN or Inf"
+            assert (kp > 0).all(), f"Position control requires positive stiffness for every DoF, got {kp}"
+            assert (kd > 0).all(), f"Position control requires positive damping for every DoF, got {kd}"
+            assert np.isfinite(torque_limits).all(), "Torque limits contain NaN or Inf"
+            assert (torque_limits > 0).all(), f"Position control requires positive torque limits, got {torque_limits}"
+        return
     
     def set_mode(self, mode):
         super().set_mode(mode)
@@ -174,7 +189,7 @@ class DeepMimicEnv(char_env.CharEnv):
 
     def _reset_ref_motion(self, env_ids):
         n = len(env_ids)
-        motion_ids, motion_times = self._sample_motion_times(n)
+        motion_ids, motion_times = self._sample_reset_motion_times(n)
         self._motion_ids[env_ids] = motion_ids
         self._motion_time_offsets[env_ids] = motion_times
 
@@ -279,6 +294,17 @@ class DeepMimicEnv(char_env.CharEnv):
 
         if (self._rand_reset):
             motion_times = self._motion_lib.sample_time(motion_ids)
+        else:
+            motion_times = torch.zeros(n, dtype=torch.float, device=self._device)
+
+        return motion_ids, motion_times
+
+    def _sample_reset_motion_times(self, n):
+        motion_ids = self._motion_lib.sample_motions(n)
+
+        if (self._rand_reset):
+            truncate_time = self._episode_length if self._truncate_reset_time else None
+            motion_times = self._motion_lib.sample_time(motion_ids, truncate_time=truncate_time)
         else:
             motion_times = torch.zeros(n, dtype=torch.float, device=self._device)
 

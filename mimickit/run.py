@@ -48,8 +48,15 @@ def train(agent, max_samples, out_dir, save_int_models, logger_type):
                       save_int_models=save_int_models, logger_type=logger_type)
     return
 
-def test(agent, test_episodes):
+def test(agent, env, test_episodes, out_dir):
     result = agent.test_model(num_episodes=test_episodes)
+
+    diagnostics = env.record_diagnostics()
+    recording = diagnostics.get("sim_recording")
+    if (recording is not None):
+        video_file = os.path.join(out_dir, "playback.mp4")
+        recording.save(video_file)
+        Logger.print("Saved video to: {}".format(video_file))
     
     Logger.print("Mean Return: {}".format(result["mean_return"]))
     Logger.print("Mean Episode Length: {}".format(result["mean_ep_len"]))
@@ -124,7 +131,7 @@ def run(rank, num_procs, device, master_port, args):
         
     elif (mode == "test"):
         test_episodes = args.parse_int("test_episodes", np.iinfo(np.int64).max)
-        test(agent=agent, test_episodes=test_episodes)
+        test(agent=agent, env=env, test_episodes=test_episodes, out_dir=out_dir)
 
     else:
         assert(False), "Unsupported mode: {}".format(mode)

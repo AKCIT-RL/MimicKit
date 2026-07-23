@@ -184,8 +184,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
         return
     
     def _update_ref_motion(self):
-        if (self._enable_ref_char()):
-            super()._update_ref_motion()
+        super()._update_ref_motion()
         return
     
     def _update_observations(self, env_ids=None):

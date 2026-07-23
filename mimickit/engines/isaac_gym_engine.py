@@ -77,6 +77,14 @@ class IsaacGymEngine(engine.Engine):
         else:
             self._control_mode = engine.ControlMode.none
 
+        self._position_stiffness = config.get("position_stiffness", None)
+        self._position_damping = config.get("position_damping", None)
+        if ((self._position_stiffness is None) != (self._position_damping is None)):
+            raise ValueError("position_stiffness and position_damping must be configured together")
+        if (self._position_stiffness is not None):
+            if (self._position_stiffness <= 0 or self._position_damping <= 0):
+                raise ValueError("Position stiffness and damping overrides must be positive")
+
         self._obj_kp = [[] for i in range(num_envs)]
         self._obj_kd = [[] for i in range(num_envs)]
         self._obj_torque_lim = [[] for i in range(num_envs)]
@@ -177,6 +185,10 @@ class IsaacGymEngine(engine.Engine):
             control_mode = self.get_control_mode()
 
         dof_props = self._gym.get_actor_dof_properties(env_ptr, obj_id)
+        if (control_mode == engine.ControlMode.pos and self._position_stiffness is not None):
+            dof_props["stiffness"][:] = self._position_stiffness
+            dof_props["damping"][:] = self._position_damping
+
         kp = dof_props["stiffness"]
         kd = dof_props["damping"]
         

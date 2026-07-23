@@ -24,6 +24,11 @@ class WAMPAgent(amp_agent.AMPAgent):
     def _load_params(self, config):
         super()._load_params(config)
         self._disc_score_scale = config["disc_score_scale"]
+        # Reward can use a smaller scale than the critic loss so that the
+        # tanh mapping stays in its linear regime even when the critic
+        # saturates the loss boundary (|score| >> 1/disc_score_scale).
+        self._disc_reward_score_scale = config.get("disc_reward_score_scale",
+                                                   self._disc_score_scale)
         return
 
     def _store_disc_replay_data(self):
@@ -75,6 +80,6 @@ class WAMPAgent(amp_agent.AMPAgent):
             disc_scores = torch_util.eval_minibatch(self._model.eval_disc, disc_inputs,
                                                     self._disc_eval_batch_size)
             disc_scores = disc_scores.squeeze(-1)
-            disc_r = wgan_util.compute_wamp_disc_rewards(disc_scores, self._disc_score_scale,
+            disc_r = wgan_util.compute_wamp_disc_rewards(disc_scores, self._disc_reward_score_scale,
                                                          self._disc_reward_scale)
         return disc_r

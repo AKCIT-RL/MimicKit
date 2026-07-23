@@ -8,4 +8,4 @@
 --logger wandb
 --save_int_models true
 --max_samples 50003968
---out_dir output/wamp_g1_wave_50m_seed1/
+--out_dir output/wamp_g1_wave_50m_seed1_v2/

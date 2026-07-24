@@ -1,0 +1,11 @@
+--num_envs 256
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine.yaml
+--env_config data/envs/wamp_g1_steering_env.yaml
+--agent_config data/agents/wamp_g1_steering_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 50003968
+--out_dir output/wamp_g1_steering_50m_seed1/

@@ -83,3 +83,40 @@ def compute_wamp_disc_rewards(scores, score_scale, reward_scale):
     """
     r = 0.5 * (1.0 + torch.tanh(score_scale * scores))
     return reward_scale * r
+
+
+def update_score_stats_ema(mean, var, scores, alpha):
+    """EMA update of running critic-score statistics.
+
+    Tracks the (drifting) distribution of agent scores so the reward can be
+    computed on standardized scores. Uses an exponential moving average
+    instead of count-weighted running stats because the score distribution
+    is non-stationary (the critic and the policy both move); count-weighted
+    averages lag by O(num_iters) and cannot track the drift.
+
+    Args:
+        mean: [1] current running mean.
+        var: [1] current running variance.
+        scores: [N] raw critic scores of the current batch.
+        alpha: EMA coefficient in (0, 1]; weight of the new batch.
+    Returns:
+        (new_mean, new_var) detached [1] tensors.
+    """
+    batch_mean = torch.mean(scores.detach())
+    batch_var = torch.var(scores.detach(), unbiased=False)
+    new_mean = (1.0 - alpha) * mean + alpha * batch_mean
+    new_var = (1.0 - alpha) * var + alpha * batch_var
+    return new_mean.reshape(1), new_var.reshape(1)
+
+
+def normalize_scores(scores, mean, var, min_std=1e-3, z_clip=4.0):
+    """Standardize critic scores with running stats, clamped to [-z_clip, z_clip].
+
+    Makes the style reward invariant to additive/multiplicative drift of the
+    critic scores: even when the absolute scores saturate the tanh boundary
+    (e.g. mean -20), the relative ranking within the agent distribution is
+    preserved and remapped into the informative region of the reward tanh.
+    """
+    std = torch.sqrt(torch.clamp_min(var, min_std * min_std))
+    z = (scores - mean) / std
+    return torch.clamp(z, -z_clip, z_clip)

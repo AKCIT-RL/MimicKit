@@ -1,6 +1,7 @@
 import torch
 
 import learning.amp_agent as amp_agent
+import learning.base_agent as base_agent
 import learning.wgan_util as wgan_util
 import util.torch_util as torch_util
 
@@ -19,6 +20,14 @@ class WAMPAgent(amp_agent.AMPAgent):
 
     def __init__(self, config, env, device):
         super().__init__(config, env, device)
+
+        if (self._disc_reward_norm):
+            # Running stats of the raw agent critic scores (EMA, single GPU).
+            # Registered as buffers so they persist in checkpoints.
+            self.register_buffer("_disc_score_mean",
+                                 torch.zeros([1], device=device, dtype=torch.float32))
+            self.register_buffer("_disc_score_var",
+                                 torch.ones([1], device=device, dtype=torch.float32))
         return
 
     def _load_params(self, config):
@@ -29,6 +38,11 @@ class WAMPAgent(amp_agent.AMPAgent):
         # saturates the loss boundary (|score| >> 1/disc_score_scale).
         self._disc_reward_score_scale = config.get("disc_reward_score_scale",
                                                    self._disc_score_scale)
+        # Standardize scores with running stats before the reward tanh, making
+        # the style reward invariant to critic-score drift (logits running to
+        # e.g. -20 flatten the raw tanh reward to a constant ~0).
+        self._disc_reward_norm = bool(config.get("disc_reward_norm", False))
+        self._disc_reward_norm_alpha = float(config.get("disc_reward_norm_alpha", 0.05))
         return
 
     def _store_disc_replay_data(self):
@@ -80,6 +94,21 @@ class WAMPAgent(amp_agent.AMPAgent):
             disc_scores = torch_util.eval_minibatch(self._model.eval_disc, disc_inputs,
                                                     self._disc_eval_batch_size)
             disc_scores = disc_scores.squeeze(-1)
+
+            if (self._disc_reward_norm):
+                if (self._mode == base_agent.AgentMode.TRAIN):
+                    # One large on-policy batch per iteration; test batches are
+                    # small and must not contaminate the stats.
+                    new_mean, new_var = wgan_util.update_score_stats_ema(
+                        self._disc_score_mean, self._disc_score_var,
+                        disc_scores, self._disc_reward_norm_alpha)
+                    self._disc_score_mean[:] = new_mean
+                    self._disc_score_var[:] = new_var
+
+                disc_scores = wgan_util.normalize_scores(disc_scores,
+                                                         self._disc_score_mean,
+                                                         self._disc_score_var)
+
             disc_r = wgan_util.compute_wamp_disc_rewards(disc_scores, self._disc_reward_score_scale,
                                                          self._disc_reward_scale)
         return disc_r

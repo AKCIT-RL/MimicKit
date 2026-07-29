@@ -84,6 +84,31 @@ def compute_out_of_bounds_flags(ball_pos, field_length, field_width):
 
 
 @torch.jit.script
+def compute_ball_out_flags(ball_pos, field_length, field_width, goal_pos, goal_dir,
+                           goal_width, ball_radius):
+    # type: (Tensor, float, float, Tensor, Tensor, float, float) -> Tensor
+    """Out-of-bounds that does not fire inside the goal mouth corridor.
+
+    The center-based OOB test trips on the goal line before the
+    fully-across goal test (depth < -ball_radius) can fire. Exempt the thin
+    corridor behind the goal mouth so a scoring ball is flagged as a goal,
+    never as out.
+    """
+    oob = compute_out_of_bounds_flags(ball_pos, field_length, field_width)
+
+    rel = ball_pos[..., 0:2] - goal_pos
+    depth = torch.sum(rel * goal_dir, dim=-1)
+    lateral = rel[..., 0] * (-goal_dir[..., 1]) + rel[..., 1] * goal_dir[..., 0]
+
+    slack = 0.05
+    in_corridor = torch.abs(lateral) < 0.5 * goal_width + ball_radius
+    crossing_band = depth >= -(ball_radius + slack)
+    exempt = torch.logical_and(in_corridor, crossing_band)
+
+    return torch.logical_and(oob, torch.logical_not(exempt))
+
+
+@torch.jit.script
 def compute_stagnation_flags(root_pos, window_root_pos, move_threshold):
     # type: (Tensor, Tensor, float) -> Tensor
     """Robot displaced less than move_threshold (planar) since window_root_pos
@@ -136,3 +161,19 @@ def compute_joint_limit_penalty(dof_pos, dof_low, dof_high):
     below = torch.clamp_min(dof_low - dof_pos, 0.0)
     above = torch.clamp_min(dof_pos - dof_high, 0.0)
     return torch.sum(below + above, dim=-1)
+
+
+@torch.jit.script
+def compute_ball_contact_flags(foot_pos, ball_pos, contact_dist):
+    # type: (Tensor, Tensor, float) -> Tensor
+    """Foot within contact_dist of the ball center (3D)."""
+    d = torch.linalg.norm(foot_pos - ball_pos, dim=-1)
+    return d < contact_dist
+
+
+@torch.jit.script
+def compute_base_accel_penalty(root_vel, prev_root_vel, dt):
+    # type: (Tensor, Tensor, float) -> Tensor
+    """Squared base acceleration: ||(v_t - v_{t-1}) / dt||^2."""
+    accel = (root_vel - prev_root_vel) / dt
+    return torch.sum(torch.square(accel), dim=-1)

@@ -27,11 +27,26 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         assert len(critic_weights) == 2, \
             "critic_weights must be [goal_weight, aux_weight]"
         self._critic_weights = [float(w) for w in critic_weights]
+
+        # weight of the AMP style reward inside the aux stream. Envs that
+        # publish an "aux_reward" (e.g. soccer regularizations, Table 3)
+        # get aux = aux_style_weight * disc_r + aux_reward; envs without it
+        # keep the pure style stream.
+        self._aux_style_weight = float(config.get("aux_style_weight", 1.0))
+        self._has_aux_env_reward = False
         return
 
     def _build_model(self, config):
         model_config = config["model"]
         self._model = mcwamp_model.MCWAMPModel(model_config, self._env)
+        return
+
+    def _record_data_post_step(self, next_obs, r, done, next_info):
+        super()._record_data_post_step(next_obs, r, done, next_info)
+
+        if ("aux_reward" in next_info):
+            self._exp_buffer.record("aux_env_reward", next_info["aux_reward"])
+            self._has_aux_env_reward = True
         return
 
     def _compute_rewards(self):
@@ -71,6 +86,10 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         done = self._exp_buffer.get_data("done")
         rand_action_mask = self._exp_buffer.get_data("rand_action_mask")
 
+        aux_r = self._aux_style_weight * disc_r
+        if (self._has_aux_env_reward):
+            aux_r = aux_r + self._exp_buffer.get_data("aux_env_reward")
+
         norm_next_obs = self._obs_norm.normalize(next_obs)
         next_critic_inputs = {"obs": norm_next_obs}
         next_vals = torch_util.eval_minibatch(self._model.eval_critic, next_critic_inputs,
@@ -81,15 +100,15 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         fail_mask = (done == base_env.DoneFlags.FAIL.value)
 
         # Goal stream bootstraps with the env's terminal task rewards. The
-        # style stream yields no further reward after termination, and the
-        # WAMP style reward is bounded in [0, 1], so 0 is the exact terminal
-        # value for both outcomes.
+        # aux stream (style + env regularizations, including any terminal
+        # penalty paid on the final step) yields no further reward after
+        # termination, so 0 is the exact terminal value for both outcomes.
         next_vals[..., 0][succ_mask] = self._compute_succ_val()
         next_vals[..., 0][fail_mask] = self._compute_fail_val()
         next_vals[..., 1][succ_mask] = 0.0
         next_vals[..., 1][fail_mask] = 0.0
 
-        rewards = torch.stack([task_r, disc_r], dim=-1)
+        rewards = torch.stack([task_r, aux_r], dim=-1)
         new_vals = torch.stack(
             [rl_util.compute_td_lambda_return(rewards[..., s], next_vals[..., s], done,
                                               self._discount, self._td_lambda)

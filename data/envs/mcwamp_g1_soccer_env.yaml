@@ -30,8 +30,36 @@ ball_radius: 0.11 # m
 spawn_margin: 1.0 # m
 ball_spawn_min_dist: 0.5 # m
 
+# random ball perturbations (teleport or planar velocity push)
+ball_perturb_time_min: 4.0 # s
+ball_perturb_time_max: 8.0 # s
+ball_perturb_teleport_prob: 0.5
+ball_perturb_speed_min: 1.0 # m/s
+ball_perturb_speed_max: 4.0 # m/s
+
 # goal-stream reward weights (Table 3)
+reward_goal_scored_w: 15.0
 reward_ball_approach_w: 50.0
+reward_goal_progress_w: 500.0
+
+# aux-stream reward weights (Table 3, signed; env part — the agent adds the
+# AMP style term). Head terms and the non-foot collision penalty are omitted
+# for the G1 (no actuated head; falls already terminate the episode).
+reward_survival_w: 3.0
+reward_termination_w: -1000.0
+reward_stagnation_w: -100.0
+reward_kick_sideways_w: 20.0
+reward_kick_forward_w: -20.0
+reward_foot_proximity_w: -5.0
+reward_action_rate_w: -1.0
+reward_joint_limit_w: -100.0
+reward_base_accel_w: -0.001
+
+stagnation_window: 1.0 # s
+stagnation_move_threshold: 0.1 # m
+ball_contact_dist: 0.25 # m (foot body to ball center)
+foot_min_dist: 0.2 # m
+kick_feet_bodies: ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 # deepmimic pose reward weights (test-mode diagnostics)
 reward_pose_w: 0.5

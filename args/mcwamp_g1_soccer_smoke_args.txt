@@ -8,4 +8,5 @@
 --logger wandb
 --save_int_models true
 --max_samples 10000000
---out_dir output/mcwamp_g1_soccer_smoke_seed1/
+--model_file output/soccer_warmstart/model_init.pt
+--out_dir output/mcwamp_g1_soccer_smoke_ws2_seed1/

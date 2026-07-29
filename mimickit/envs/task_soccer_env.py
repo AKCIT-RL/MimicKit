@@ -361,6 +361,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         if (len(env_ids) > 0):
             self._reset_char_placement(env_ids)
+            # the placement moved/rotated the root, so the rigid body state
+            # written by char_env's reset is stale; recompute it with FK or
+            # key-body obs will mix the old pose with the new root position
+            self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
             self._record_reset_prev_states(env_ids)
             self._task_reward_buf[env_ids] = 0.0

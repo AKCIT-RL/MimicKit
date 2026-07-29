@@ -34,6 +34,16 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         # keep the pure style stream.
         self._aux_style_weight = float(config.get("aux_style_weight", 1.0))
         self._has_aux_env_reward = False
+
+        # Per-stream reward scale applied before TD(lambda). Because the
+        # advantages are standardized per stream, a uniform scale on a
+        # stream leaves the policy gradient unchanged -- this only keeps
+        # the critic targets (and hence the critic loss) well-conditioned
+        # when the env uses large raw reward weights (e.g. soccer Table 3).
+        critic_reward_scales = config.get("critic_reward_scales", [1.0, 1.0])
+        assert len(critic_reward_scales) == 2, \
+            "critic_reward_scales must be [goal_scale, aux_scale]"
+        self._critic_reward_scales = [float(s) for s in critic_reward_scales]
         return
 
     def _build_model(self, config):
@@ -90,6 +100,11 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         if (self._has_aux_env_reward):
             aux_r = aux_r + self._exp_buffer.get_data("aux_env_reward")
 
+        goal_scale = self._critic_reward_scales[0]
+        aux_scale = self._critic_reward_scales[1]
+        task_r = goal_scale * task_r
+        aux_r = aux_scale * aux_r
+
         norm_next_obs = self._obs_norm.normalize(next_obs)
         next_critic_inputs = {"obs": norm_next_obs}
         next_vals = torch_util.eval_minibatch(self._model.eval_critic, next_critic_inputs,
@@ -103,8 +118,8 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         # aux stream (style + env regularizations, including any terminal
         # penalty paid on the final step) yields no further reward after
         # termination, so 0 is the exact terminal value for both outcomes.
-        next_vals[..., 0][succ_mask] = self._compute_succ_val()
-        next_vals[..., 0][fail_mask] = self._compute_fail_val()
+        next_vals[..., 0][succ_mask] = goal_scale * self._compute_succ_val()
+        next_vals[..., 0][fail_mask] = goal_scale * self._compute_fail_val()
         next_vals[..., 1][succ_mask] = 0.0
         next_vals[..., 1][fail_mask] = 0.0
 

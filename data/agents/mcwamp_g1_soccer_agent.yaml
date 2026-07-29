@@ -65,3 +65,9 @@ critic_weights: [2.0, 1.0]
 
 # aux stream = aux_style_weight * disc_r + env aux reward (Table 3: AMP style 0.3)
 aux_style_weight: 0.3
+
+# Per-stream reward scale before TD(lambda). Policy-invariant (per-stream
+# advantage standardization); keeps critic targets O(1-10) despite Table 3's
+# raw weights (goal progress 500, termination -1000) so the critic loss
+# stays well-conditioned under plain SGD.
+critic_reward_scales: [0.01, 0.01]

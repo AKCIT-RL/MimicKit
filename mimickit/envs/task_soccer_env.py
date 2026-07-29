@@ -11,10 +11,10 @@ import util.torch_util as torch_util
 class TaskSoccerEnv(smp_env.SMPEnv):
     """Soccer task env (arXiv:2511.03996): one robot, one ball, one goal.
 
-    The field is a fixed region of the shared world frame, centered at the
-    origin (envs only interact with their own ball via per-env collision
-    groups). The goal is a virtual line segment on the +x edge of the field;
-    there are no physical goal posts.
+    Each env owns its own field region of the shared world frame, laid out on
+    a spatial grid (see ``_field_offset``) so envs never overlap in the
+    broadphase. The goal is a virtual line segment on the +x edge of each
+    field; there are no physical goal posts.
     """
 
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
@@ -22,6 +22,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._field_width = float(env_config.get("field_width", 9.0))
         self._goal_width = float(env_config.get("goal_width", 2.6))
         self._ball_radius = float(env_config.get("ball_radius", 0.11))
+        # gap between neighboring fields; every env gets its own field region
+        # of the world so thousands of robots+balls never share one 14x9 box
+        # (a single shared field blows up the PhysX broadphase pair count)
+        self._field_sep = float(env_config.get("field_sep", 2.0))
         # keep spawns away from the field border so the ball does not
         # immediately go out of bounds
         self._spawn_margin = float(env_config.get("spawn_margin", 1.0))
@@ -97,8 +101,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         super()._build_sim_tensors(config)
 
         num_envs = self.get_num_envs()
+
+        # per-env field centers on a grid (world frame)
+        n_cols = int(np.ceil(np.sqrt(num_envs)))
+        n_rows = int(np.ceil(num_envs / n_cols))
+        pitch_x = self._field_length + 2.0 * self._field_sep
+        pitch_y = self._field_width + 2.0 * self._field_sep
+        idx = torch.arange(num_envs, device=self._device)
+        col = (idx % n_cols).float()
+        row = torch.div(idx, n_cols, rounding_mode="floor").float()
+        self._field_offset = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._field_offset[:, 0] = (col - 0.5 * (n_cols - 1)) * pitch_x
+        self._field_offset[:, 1] = (row - 0.5 * (n_rows - 1)) * pitch_y
+
         self._goal_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._goal_pos[:, 0] = 0.5 * self._field_length
+        self._goal_pos += self._field_offset
         self._goal_dir = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._goal_dir[:, 0] = -1.0
 
@@ -183,13 +201,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     def _update_task(self):
-        # 1. detect events with the pre-reset ball state
+        # 1. detect events with the pre-reset ball state (field-local frame)
         ball_pos = self._get_ball_pos()
+        ball_pos_local = ball_pos.clone()
+        ball_pos_local[:, 0:2] -= self._field_offset
+        goal_pos_local = self._goal_pos - self._field_offset
         self._goal_scored_buf[:] = soccer_util.compute_goal_scored_flags(
-            ball_pos, self._goal_pos, self._goal_dir, self._goal_width, self._ball_radius)
+            ball_pos_local, goal_pos_local, self._goal_dir, self._goal_width, self._ball_radius)
         self._ball_oob_buf[:] = soccer_util.compute_ball_out_flags(
-            ball_pos, self._field_length, self._field_width,
-            self._goal_pos, self._goal_dir, self._goal_width, self._ball_radius)
+            ball_pos_local, self._field_length, self._field_width,
+            goal_pos_local, self._goal_dir, self._goal_width, self._ball_radius)
         # a scored ball is also outside the field; count it only as a goal
         self._ball_oob_buf &= ~self._goal_scored_buf
 
@@ -368,6 +389,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos = self._engine.get_root_pos(char_id)[env_ids].clone()
         root_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
         root_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+        root_pos[:, 0:2] += self._field_offset[env_ids]
 
         theta = 2.0 * np.pi * torch.rand(n, device=self._device) - np.pi
         axis = torch.zeros([n, 3], device=self._device, dtype=torch.float)
@@ -402,6 +424,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
         ball_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
         ball_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+        ball_pos[:, 0:2] += self._field_offset[env_ids]
         ball_pos[:, 2] = self._ball_radius
 
         # keep the ball from spawning inside the robot

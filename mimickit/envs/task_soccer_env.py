@@ -5,6 +5,7 @@ import engines.engine as engine
 import envs.base_env as base_env
 import envs.smp_env as smp_env
 import envs.soccer_util as soccer_util
+import envs.task_steering_env as task_steering_env
 import util.torch_util as torch_util
 
 
@@ -30,6 +31,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # immediately go out of bounds
         self._spawn_margin = float(env_config.get("spawn_margin", 1.0))
         self._ball_spawn_min_dist = float(env_config.get("ball_spawn_min_dist", 0.5))
+
+        # auto steering command toward the ball (T1 kicking-env style); fills
+        # the steering-task obs slots preserved by the warm-start transplant
+        self._steer_speed_max = float(env_config.get("steer_speed_max", 1.5))
+        self._steer_stop_dist = float(env_config.get("steer_stop_dist", 0.45))
+
+        # spawn the ball in front of the robot (T1: "closer ball so robot can
+        # actually reach and kick it") instead of uniformly over the field
+        self._ball_spawn_near = bool(env_config.get("ball_spawn_near", True))
+        self._ball_spawn_front_min = float(env_config.get("ball_spawn_front_min", 0.5))
+        self._ball_spawn_front_max = float(env_config.get("ball_spawn_front_max", 2.0))
+        self._ball_spawn_lateral = float(env_config.get("ball_spawn_lateral", 0.5))
 
         # random ball perturbations (teleport or velocity push)
         self._ball_perturb_time_min = float(env_config.get("ball_perturb_time_min", 4.0))
@@ -187,12 +200,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             goal_pos = goal_pos[env_ids]
             goal_dir = goal_dir[env_ids]
 
+        # steering command slots first, so the obs prefix (char + steering
+        # task dims) matches the steering checkpoint layout column-for-column
+        steer_cmd = soccer_util.compute_ball_steer_command(root_pos, ball_pos,
+                                                           self._steer_stop_dist,
+                                                           self._steer_speed_max)
+        steer_obs = task_steering_env.compute_steering_observations(
+            root_rot, steer_cmd[..., 0:2], steer_cmd[..., 2], steer_cmd[..., 0:2])
+
         task_obs = soccer_util.compute_soccer_observations(root_pos, root_rot, ball_pos,
                                                            goal_pos, goal_dir)
         # ball detection mask (Table 2); the perception model is not simulated
         # yet, so the ball is always visible
         ball_mask = torch.ones_like(task_obs[..., 0:1])
-        obs = torch.cat([obs, task_obs, ball_mask], dim=-1)
+        obs = torch.cat([obs, steer_obs, task_obs, ball_mask], dim=-1)
         return obs
 
     def _update_misc(self):
@@ -425,15 +446,33 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         half_x = 0.5 * self._field_length - self._spawn_margin
         half_y = 0.5 * self._field_width - self._spawn_margin
 
+        char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)[env_ids]
+
         ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
-        ball_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
-        ball_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
-        ball_pos[:, 0:2] += self._field_offset[env_ids]
+        if (self._ball_spawn_near):
+            # in front of the robot in its heading frame, then clamped into
+            # the field so border spawns stay in bounds
+            root_rot = self._engine.get_root_rot(char_id)[env_ids]
+            heading_rot = torch_util.calc_heading_quat(root_rot)
+            offset = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+            offset[:, 0] = (self._ball_spawn_front_max - self._ball_spawn_front_min) \
+                * torch.rand(n, device=self._device) + self._ball_spawn_front_min
+            offset[:, 1] = self._ball_spawn_lateral \
+                * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            offset = torch_util.quat_rotate(heading_rot, offset)
+
+            ball_local = root_pos[:, 0:2] + offset[:, 0:2] - self._field_offset[env_ids]
+            ball_local[:, 0] = torch.clamp(ball_local[:, 0], -half_x, half_x)
+            ball_local[:, 1] = torch.clamp(ball_local[:, 1], -half_y, half_y)
+            ball_pos[:, 0:2] = ball_local + self._field_offset[env_ids]
+        else:
+            ball_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            ball_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            ball_pos[:, 0:2] += self._field_offset[env_ids]
         ball_pos[:, 2] = self._ball_radius
 
         # keep the ball from spawning inside the robot
-        char_id = self._get_char_id()
-        root_pos = self._engine.get_root_pos(char_id)[env_ids]
         delta = ball_pos[:, 0:2] - root_pos[:, 0:2]
         dist = torch.linalg.norm(delta, dim=-1, keepdim=True)
         too_close = (dist < self._ball_spawn_min_dist).squeeze(-1)

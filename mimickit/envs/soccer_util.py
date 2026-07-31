@@ -40,6 +40,26 @@ def compute_soccer_observations(root_pos, root_rot, ball_pos, goal_pos, goal_dir
 
 
 @torch.jit.script
+def compute_ball_steer_command(root_pos, ball_pos, stop_dist, speed_max):
+    # type: (Tensor, Tensor, float, float) -> Tensor
+    """Auto steering command toward the ball (T1 kicking-env style).
+
+    The command fills the steering-task obs slots of a policy warm-started
+    from a steering checkpoint, so the pretrained velocity tracking drags the
+    robot to the ball without relying on exploration. Speed ramps linearly
+    with distance beyond ``stop_dist`` (command is zeroed near the ball so
+    the kick rewards take over) and saturates at ``speed_max``.
+
+    Returns [N, 3]: world-frame unit target dir (x, y) and target speed.
+    """
+    delta = ball_pos[..., 0:2] - root_pos[..., 0:2]
+    dist = torch.norm(delta, dim=-1)
+    tar_dir = delta / torch.clamp_min(dist, 1e-6).unsqueeze(-1)
+    tar_speed = torch.clamp(dist - stop_dist, min=0.0, max=speed_max)
+    return torch.cat([tar_dir, tar_speed.unsqueeze(-1)], dim=-1)
+
+
+@torch.jit.script
 def compute_ball_approach_reward(root_pos, prev_root_pos, ball_pos, prev_ball_pos):
     # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     """Potential-based robot->ball shaping: r = d_prev - d_curr (planar)."""

@@ -30,6 +30,17 @@ ball_radius: 0.11 # m
 spawn_margin: 1.0 # m
 ball_spawn_min_dist: 0.5 # m
 
+# auto steering command toward the ball (fills the steering obs slots kept by
+# the warm-start transplant; T1 kicking-env mechanism)
+steer_speed_max: 1.5 # m/s (steering policy trained on 0.5-2.5)
+steer_stop_dist: 0.45 # m (command zeroed near the ball)
+
+# ball spawn in front of the robot (T1-style curriculum)
+ball_spawn_near: true
+ball_spawn_front_min: 0.5 # m
+ball_spawn_front_max: 2.0 # m
+ball_spawn_lateral: 0.5 # m
+
 # random ball perturbations (teleport or planar velocity push)
 ball_perturb_time_min: 4.0 # s
 ball_perturb_time_max: 8.0 # s

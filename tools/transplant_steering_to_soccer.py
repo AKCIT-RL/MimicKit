@@ -1,11 +1,14 @@
 """Transplant MCWAMP steering weights into the soccer model layout.
 
 The steering policy (obs = 237 char dims + 5 task dims = 242) and the soccer
-policy (obs = 237 char dims + 7 task dims = 244) share the character obs
-prefix, the action space and the discriminator (same dataset / key bodies).
-Only the first layer of the actor/critics and the obs normalizer depend on
-the obs layout, so we copy the shared prefix columns from the steering
-checkpoint and keep the soccer-initialized values for the new task columns.
+policy (obs = 237 char dims + 5 steering-command dims + 7 soccer dims = 249)
+share the [char obs | steering task obs] prefix: the soccer env fills the
+steering slots with an auto command toward the ball, so the pretrained
+velocity-tracking columns keep their meaning. The action space and the
+discriminator (same dataset / key bodies) also match. Only the first layer of
+the actor/critics and the obs normalizer depend on the obs layout, so we copy
+the shared prefix columns from the steering checkpoint and keep the
+soccer-initialized values for the new task columns.
 
 Usage (inside the mimickit container, cwd = /workspace/MimicKit):
     python3.8 tools/transplant_steering_to_soccer.py \
@@ -19,7 +22,9 @@ import os
 
 import torch
 
-CHAR_OBS_DIM = 237  # shared char obs prefix (task obs is appended at the end)
+# char obs (237) + steering task obs (5); the new soccer dims are appended
+# after this prefix
+PREFIX_OBS_DIM = 242
 
 
 def main():
@@ -47,11 +52,11 @@ def main():
             # obs-dependent tensors: last dim is the obs dim
             assert s.shape[:-1] == d.shape[:-1], \
                 "unexpected mismatch {}: {} vs {}".format(k, s.shape, d.shape)
-            assert s.shape[-1] >= CHAR_OBS_DIM and d.shape[-1] >= CHAR_OBS_DIM, \
-                "obs dim smaller than char obs prefix for {}".format(k)
-            d[..., :CHAR_OBS_DIM] = s[..., :CHAR_OBS_DIM]
+            assert s.shape[-1] >= PREFIX_OBS_DIM and d.shape[-1] >= PREFIX_OBS_DIM, \
+                "obs dim smaller than shared prefix for {}".format(k)
+            d[..., :PREFIX_OBS_DIM] = s[..., :PREFIX_OBS_DIM]
             print("prefix-copied {}: {} -> {} (first {} dims)".format(
-                k, tuple(s.shape), tuple(d.shape), CHAR_OBS_DIM))
+                k, tuple(s.shape), tuple(d.shape), PREFIX_OBS_DIM))
             n_prefix += 1
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)

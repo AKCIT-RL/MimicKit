@@ -97,9 +97,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_feet_bodies = env_config.get(
             "kick_feet_bodies", ["left_ankle_roll_link", "right_ankle_roll_link"])
 
+        # opt-in viewer extras (default off: stock MimicKit behavior). Purely
+        # cosmetic — no physics, obs or reward impact.
+        self._visualize_field = bool(env_config.get("visualize_field", False))
+        self._visualize_debug_arrows = bool(env_config.get("visualize_debug_arrows", False))
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
+
+        if (self._visualize and self._visualize_field):
+            self._build_field_visuals()
         return
 
     def _build_envs(self, config, num_envs):
@@ -192,6 +200,84 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _get_ball_pos(self):
         return self._engine.get_root_pos(self._get_ball_id())
+
+    def _build_field_visuals(self):
+        starts, ends, cols = soccer_util.build_field_line_segments(
+            self._field_length, self._field_width, self._goal_width)
+        offsets = self._field_offset.cpu().numpy()  # [N, 2]
+        num_envs = self.get_num_envs()
+        off3 = np.zeros([num_envs, 1, 3], dtype=np.float32)
+        off3[:, 0, 0:2] = offsets
+        # [N, S, 3]: field-local segments shifted onto each env's field
+        self._field_line_starts = starts[np.newaxis] + off3
+        self._field_line_ends = ends[np.newaxis] + off3
+        self._field_line_cols = cols
+        return
+
+    def _render_scene(self):
+        super()._render_scene()
+        if (self._visualize_field):
+            self._render_field_lines()
+        if (self._visualize_debug_arrows):
+            self._render_debug_arrows()
+        return
+
+    def _render_field_lines(self):
+        num_envs = self.get_num_envs()
+        for i in range(num_envs):
+            self._engine.draw_lines(i, self._field_line_starts[i],
+                                    self._field_line_ends[i],
+                                    self._field_line_cols, 2.0)
+        return
+
+    def _render_debug_arrows(self):
+        char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)
+        ball_pos = self._get_ball_pos()
+        ball_vel = self._engine.get_root_vel(self._get_ball_id())
+
+        # blue: ball -> goal (the direction the kick-direction reward pays)
+        to_goal = self._goal_pos - ball_pos[:, 0:2]
+        to_goal = to_goal / torch.clamp_min(torch.linalg.norm(to_goal, dim=-1, keepdim=True), 1e-6)
+        # red: steering command the env feeds into the policy's obs
+        steer_cmd = soccer_util.compute_ball_steer_command(
+            root_pos, ball_pos, self._steer_stop_dist, self._steer_speed_max)
+        rolling = torch.linalg.norm(ball_vel[:, 0:2], dim=-1) >= self._ball_rolling_speed
+
+        root_np = root_pos.cpu().numpy()
+        ball_np = ball_pos.cpu().numpy()
+        goal_dir_np = to_goal.cpu().numpy()
+        steer_np = steer_cmd.cpu().numpy()
+        rolling_np = rolling.cpu().numpy()
+
+        blue = np.array([[0.1, 0.3, 1.0, 1.0]], dtype=np.float32)
+        red = np.array([[1.0, 0.1, 0.1, 1.0]], dtype=np.float32)
+        white = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+        orange = np.array([[1.0, 0.6, 0.0, 1.0]], dtype=np.float32)
+
+        num_envs = self.get_num_envs()
+        for i in range(num_envs):
+            # kick direction (1 m arrow from the ball)
+            start = ball_np[i:i + 1].copy()
+            start[0, 2] = 0.15
+            end = start.copy()
+            end[0, 0:2] += goal_dir_np[i]
+            self._engine.draw_lines(i, start, end, blue, 2.0)
+
+            # steering command (dir scaled by commanded speed)
+            s = root_np[i:i + 1].copy()
+            s[0, 2] = 0.15
+            e = s.copy()
+            e[0, 0:2] += steer_np[i, 0:2] * max(float(steer_np[i, 2]), 0.1)
+            self._engine.draw_lines(i, s, e, red, 2.0)
+
+            # ball state pole: white = still, orange = rolling
+            p0 = ball_np[i:i + 1].copy()
+            p1 = p0.copy()
+            p1[0, 2] += 0.6
+            col = orange if rolling_np[i] else white
+            self._engine.draw_lines(i, p0, p1, col, 2.0)
+        return
 
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)

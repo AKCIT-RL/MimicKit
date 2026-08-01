@@ -216,3 +216,68 @@ def compute_base_accel_penalty(root_vel, prev_root_vel, dt):
     """Squared base acceleration: ||(v_t - v_{t-1}) / dt||^2."""
     accel = (root_vel - prev_root_vel) / dt
     return torch.sum(torch.square(accel), dim=-1)
+
+
+def build_field_line_segments(field_length, field_width, goal_width,
+                              goal_area_length=1.0, goal_area_width=4.0,
+                              penalty_area_length=3.0, penalty_area_width=6.0,
+                              penalty_mark_dist=2.1, center_circle_radius=1.5,
+                              line_z=0.02, goal_post_height=1.25,
+                              circle_segments=24):
+    """Viewer-only field markings (RoboCup AdultSize layout by default).
+
+    Numpy, field-local frame (field center at the origin, active goal on the
+    +x edge). Returns (starts [S, 3], ends [S, 3], colors [S, 4]) float32 for
+    ``engine.draw_lines``. Purely cosmetic: no physics, obs or reward use.
+    """
+    import numpy as np
+
+    hl = 0.5 * field_length
+    hw = 0.5 * field_width
+    z = line_z
+    white = (1.0, 1.0, 1.0, 1.0)
+    green = (0.1, 0.9, 0.2, 1.0)
+
+    segs = []  # (x0, y0, z0, x1, y1, z1, color)
+
+    def add(p0, p1, col=white):
+        segs.append((p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], col))
+
+    # touch lines + goal lines (perimeter)
+    add((-hl, -hw, z), (hl, -hw, z))
+    add((-hl, hw, z), (hl, hw, z))
+    add((-hl, -hw, z), (-hl, hw, z))
+    add((hl, -hw, z), (hl, hw, z))
+
+    # halfway line + center circle
+    add((0.0, -hw, z), (0.0, hw, z))
+    ang = np.linspace(0.0, 2.0 * np.pi, circle_segments + 1)
+    cx = center_circle_radius * np.cos(ang)
+    cy = center_circle_radius * np.sin(ang)
+    for i in range(circle_segments):
+        add((cx[i], cy[i], z), (cx[i + 1], cy[i + 1], z))
+
+    # goal/penalty areas + penalty mark, both ends (sign = goal-line side)
+    for sign in (1.0, -1.0):
+        for depth, width in ((goal_area_length, goal_area_width),
+                             (penalty_area_length, penalty_area_width)):
+            xg = sign * hl                # goal line
+            xf = sign * (hl - depth)      # front edge of the area
+            hw_a = 0.5 * width
+            add((xg, -hw_a, z), (xf, -hw_a, z))
+            add((xg, hw_a, z), (xf, hw_a, z))
+            add((xf, -hw_a, z), (xf, hw_a, z))
+        xm = sign * (hl - penalty_mark_dist)
+        add((xm - 0.1, 0.0, z), (xm + 0.1, 0.0, z))
+        add((xm, -0.1, z), (xm, 0.1, z))
+
+    # active goal mouth on +x: highlighted line + two vertical posts
+    hg = 0.5 * goal_width
+    add((hl, -hg, z), (hl, hg, z), green)
+    add((hl, -hg, z), (hl, -hg, goal_post_height), green)
+    add((hl, hg, z), (hl, hg, goal_post_height), green)
+    add((hl, -hg, goal_post_height), (hl, hg, goal_post_height), green)
+
+    arr = np.array([s[:6] for s in segs], dtype=np.float32)
+    cols = np.array([s[6] for s in segs], dtype=np.float32)
+    return arr[:, 0:3].copy(), arr[:, 3:6].copy(), cols

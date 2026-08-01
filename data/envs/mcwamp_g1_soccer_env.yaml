@@ -28,6 +28,10 @@ field_width: 9.0 # m (y)
 goal_width: 2.6 # m
 ball_radius: 0.11 # m
 spawn_margin: 1.0 # m
+
+# viewer extras (cosmetic only; ignored in headless training)
+visualize_field: true
+visualize_debug_arrows: true
 ball_spawn_min_dist: 0.5 # m
 
 # auto steering command toward the ball (fills the steering obs slots kept by

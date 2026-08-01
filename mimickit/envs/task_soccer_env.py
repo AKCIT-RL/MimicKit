@@ -43,6 +43,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_spawn_front_min = float(env_config.get("ball_spawn_front_min", 0.5))
         self._ball_spawn_front_max = float(env_config.get("ball_spawn_front_max", 2.0))
         self._ball_spawn_lateral = float(env_config.get("ball_spawn_lateral", 0.5))
+        # soft resets (goal / out of bounds / perturb teleport) respawn the
+        # ball uniformly over the field so kicking it out costs a walk
+        self._ball_soft_reset_far = bool(env_config.get("ball_soft_reset_far", True))
 
         # random ball perturbations (teleport or velocity push)
         self._ball_perturb_time_min = float(env_config.get("ball_perturb_time_min", 4.0))
@@ -55,6 +58,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_goal_scored_w = float(env_config.get("reward_goal_scored_w", 15.0))
         self._reward_ball_approach_w = float(env_config.get("reward_ball_approach_w", 50.0))
         self._reward_goal_progress_w = float(env_config.get("reward_goal_progress_w", 500.0))
+
+        # directional kick reward (T1 kicking env): ball velocity toward the
+        # goal above a threshold, credit concentrated at the impact
+        self._reward_kick_direction_w = float(env_config.get("reward_kick_direction_w", 25.0))
+        self._kick_direction_min_vel = float(env_config.get("kick_direction_min_vel", 1.0))
+        self._kick_direction_decay = float(env_config.get("kick_direction_decay", 0.2))
+        self._kick_direction_max = float(env_config.get("kick_direction_max", 30.0))
+
+        # ball-state reward gating (T1 ball_rolling_scale): while the ball
+        # rolls, the robot->ball approach potential is zeroed so chasing the
+        # ball it just kicked cannot be farmed
+        self._ball_rolling_speed = float(env_config.get("ball_rolling_speed", 0.1))
+        self._gate_approach_when_rolling = bool(env_config.get("gate_approach_when_rolling", True))
+
+        # quadratic waiting penalty on ball-still time (T1); saturates at
+        # waiting_time_max so 60 s episodes cannot blow it up
+        self._reward_waiting_w = float(env_config.get("reward_waiting_w", -3.0))
+        self._waiting_time_max = float(env_config.get("waiting_time_max", 3.0))
 
         # aux-stream reward weights (Table 3, signed). Head terms and the
         # non-foot collision penalty are omitted for the G1 (no actuated
@@ -140,6 +161,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._goal_scored_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_oob_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_perturb_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+
+        # ball motion timers (T1): drive the kick-direction decay, the
+        # approach gating and the waiting penalty
+        self._ball_moving_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._ball_still_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
         # aux-stream state
         self._aux_reward_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -235,9 +261,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # a scored ball is also outside the field; count it only as a goal
         self._ball_oob_buf &= ~self._goal_scored_buf
 
+        # ball motion timers (before reward caching: the decay and gating of
+        # this step must see the up-to-date times)
+        ball_vel = self._engine.get_root_vel(self._get_ball_id())
+        rolling = torch.linalg.norm(ball_vel[:, 0:2], dim=-1) >= self._ball_rolling_speed
+        dt = self._engine.get_timestep()
+        self._ball_moving_time[:] = torch.where(rolling, self._ball_moving_time + dt,
+                                                torch.zeros_like(self._ball_moving_time))
+        self._ball_still_time[:] = torch.where(rolling, torch.zeros_like(self._ball_still_time),
+                                               self._ball_still_time + dt)
+
         # 2. cache the rewards before any ball teleport corrupts the
         #    potentials or the contact geometry
-        self._cache_task_reward(ball_pos)
+        self._cache_task_reward(ball_pos, ball_vel, rolling)
         self._cache_aux_reward(ball_pos)
 
         # 3. goal or out of bounds resets ONLY the ball; the robot and the
@@ -245,20 +281,26 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         soft_reset_mask = torch.logical_or(self._goal_scored_buf, self._ball_oob_buf)
         soft_reset_ids = soft_reset_mask.nonzero(as_tuple=False).flatten()
         if (len(soft_reset_ids) > 0):
-            self._reset_ball(soft_reset_ids)
+            self._reset_ball(soft_reset_ids, near=not self._ball_soft_reset_far)
 
         # 4. random ball perturbations
         self._update_ball_perturb()
         return
 
-    def _cache_task_reward(self, ball_pos):
+    def _cache_task_reward(self, ball_pos, ball_vel, rolling):
         char_id = self._get_char_id()
         root_pos = self._engine.get_root_pos(char_id)
 
         approach_r = soccer_util.compute_ball_approach_reward(root_pos, self._prev_root_pos,
                                                               ball_pos, self._prev_ball_pos)
+        if (self._gate_approach_when_rolling):
+            # no credit for chasing a ball the robot just kicked
+            approach_r = approach_r * (~rolling).float()
         progress_r = soccer_util.compute_goal_progress_reward(ball_pos, self._prev_ball_pos,
                                                               self._goal_pos)
+        dir_r = soccer_util.compute_kick_direction_reward(
+            ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
+            self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
         goal_r = self._goal_scored_buf.float()
 
         # on the goal step the ball crosses past the potential's minimum, so
@@ -267,7 +309,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         shaping_mask = (~self._goal_scored_buf).float()
 
         self._task_reward_buf[:] = shaping_mask * (self._reward_ball_approach_w * approach_r
-                                                   + self._reward_goal_progress_w * progress_r) \
+                                                   + self._reward_goal_progress_w * progress_r
+                                                   + self._reward_kick_direction_w * dir_r) \
             + self._reward_goal_scored_w * goal_r
         return
 
@@ -325,6 +368,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         base_accel = soccer_util.compute_base_accel_penalty(root_vel, self._prev_root_vel, dt)
         aux_r += self._reward_base_accel_w * base_accel
 
+        # waiting penalty (T1): grows quadratically with ball-still time,
+        # saturating at waiting_time_max; zero while the ball rolls
+        wait_frac = torch.clamp(self._ball_still_time / self._waiting_time_max, max=1.0)
+        aux_r += self._reward_waiting_w * wait_frac * wait_frac
+
         self._aux_reward_buf[:] = aux_r
         return
 
@@ -350,7 +398,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
             teleport_ids = env_ids[teleport_mask]
             if (len(teleport_ids) > 0):
-                self._reset_ball(teleport_ids)
+                self._reset_ball(teleport_ids, near=not self._ball_soft_reset_far)
 
             push_ids = env_ids[~teleport_mask]
             m = len(push_ids)
@@ -395,6 +443,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._aux_reward_buf[env_ids] = 0.0
             self._action_rate_buf[env_ids] = 0.0
             self._prev_action[env_ids] = 0.0
+            self._ball_moving_time[env_ids] = 0.0
+            self._ball_still_time[env_ids] = 0.0
             char_id = self._get_char_id()
             self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
             self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
@@ -441,7 +491,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_pos[env_ids] = self._get_ball_pos()[env_ids]
         return
 
-    def _sample_ball_pos(self, env_ids):
+    def _sample_ball_pos(self, env_ids, near=True):
         n = env_ids.shape[0]
         half_x = 0.5 * self._field_length - self._spawn_margin
         half_y = 0.5 * self._field_width - self._spawn_margin
@@ -450,7 +500,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos = self._engine.get_root_pos(char_id)[env_ids]
 
         ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
-        if (self._ball_spawn_near):
+        if (self._ball_spawn_near and near):
             # in front of the robot in its heading frame, then clamped into
             # the field so border spawns stay in bounds
             root_rot = self._engine.get_root_rot(char_id)[env_ids]
@@ -482,11 +532,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         return ball_pos
 
-    def _reset_ball(self, env_ids):
+    def _reset_ball(self, env_ids, near=True):
         n = env_ids.shape[0]
         ball_id = self._get_ball_id()
 
-        ball_pos = self._sample_ball_pos(env_ids)
+        ball_pos = self._sample_ball_pos(env_ids, near=near)
         ball_rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
         ball_rot[:, 3] = 1.0
         zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)
@@ -497,5 +547,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._engine.set_root_ang_vel(env_ids, ball_id, zero_vel)
 
         self._prev_ball_pos[env_ids] = ball_pos
+        self._ball_moving_time[env_ids] = 0.0
+        self._ball_still_time[env_ids] = 0.0
         self._resample_ball_perturb_times(env_ids)
         return

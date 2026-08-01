@@ -9,4 +9,4 @@
 --save_int_models true
 --max_samples 20000000
 --model_file output/soccer_warmstart/model_init_p1p2.pt
---out_dir output/mcwamp_g1_soccer_smoke_p1p2_seed1/
+--out_dir output/mcwamp_g1_soccer_smoke_p4_seed1/

@@ -60,6 +60,25 @@ def compute_ball_steer_command(root_pos, ball_pos, stop_dist, speed_max):
 
 
 @torch.jit.script
+def compute_kick_direction_reward(ball_pos, ball_vel, goal_pos, min_vel, decay_tau,
+                                  ball_moving_time, max_reward):
+    # type: (Tensor, Tensor, Tensor, float, float, Tensor, float) -> Tensor
+    """Ball velocity toward the goal, above a minimum speed (T1 kicking env).
+
+    Only the planar velocity component projected on the ball->goal direction
+    counts, minus ``min_vel`` (accidental touches and slow dribbles pay
+    nothing). The exponential decay over ``ball_moving_time`` concentrates
+    the credit at the impact instead of paying while the ball coasts.
+    """
+    to_goal = goal_pos - ball_pos[..., 0:2]
+    to_goal = to_goal / torch.clamp_min(torch.norm(to_goal, dim=-1, keepdim=True), 1e-6)
+    v_dir = torch.sum(ball_vel[..., 0:2] * to_goal, dim=-1)
+    above = torch.clamp_min(v_dir - min_vel, 0.0)
+    decay = torch.exp(-ball_moving_time / decay_tau)
+    return torch.clamp(above * decay, min=0.0, max=max_reward)
+
+
+@torch.jit.script
 def compute_ball_approach_reward(root_pos, prev_root_pos, ball_pos, prev_ball_pos):
     # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     """Potential-based robot->ball shaping: r = d_prev - d_curr (planar)."""

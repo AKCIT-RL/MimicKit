@@ -66,6 +66,11 @@ reward_action_rate_w: -1.0
 reward_joint_limit_w: -100.0
 reward_base_accel_w: -0.001
 
+# waiting penalty (T1): quadratic in ball-still time, saturates at
+# waiting_time_max; complements the robot-motion stagnation term
+reward_waiting_w: -3.0
+waiting_time_max: 3.0 # s
+
 stagnation_window: 1.0 # s
 stagnation_move_threshold: 0.1 # m
 ball_contact_dist: 0.25 # m (foot body to ball center)

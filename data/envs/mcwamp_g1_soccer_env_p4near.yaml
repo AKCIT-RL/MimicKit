@@ -29,12 +29,6 @@ goal_width: 2.6 # m
 ball_radius: 0.11 # m
 spawn_margin: 1.0 # m
 
-# P4 ablation winners (A/B 20M, seed 1): far reset collapses kicking (0.77
-# kicks/ep); T1's min_vel 1.0 assumes 3-5 m/s kicks and pays ~nothing at our
-# current 1.5-1.6 m/s impact speeds.
-ball_soft_reset_far: false
-kick_direction_min_vel: 0.3
-
 # viewer extras (cosmetic only; ignored in headless training)
 visualize_field: true
 visualize_debug_arrows: true
@@ -99,3 +93,6 @@ reward_vel_scale: 0.01
 reward_root_pose_scale: 5.0
 reward_root_vel_scale: 1.0
 reward_key_pos_scale: 10.0
+
+# P4 ablation: revert far soft-reset (near respawn like P1+P2)
+ball_soft_reset_far: false

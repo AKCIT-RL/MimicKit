@@ -168,7 +168,15 @@ class Engine:
     @abc.abstractmethod
     def set_body_forces(self, env_id, obj_id, body_id, forces):
         return
-    
+
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None):
+        """Per-env collision-shape randomization (build time, before sim init)."""
+        raise NotImplementedError("set_obj_shape_props not supported by engine {}".format(self.get_name()))
+
+    def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
+        """Per-env body mass/CoM randomization (build time, before sim init)."""
+        raise NotImplementedError("scale_obj_masses not supported by engine {}".format(self.get_name()))
+
     @abc.abstractmethod
     def get_obj_type(self, obj_id):
         return

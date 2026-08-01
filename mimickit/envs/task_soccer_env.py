@@ -54,6 +54,54 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_perturb_speed_min = float(env_config.get("ball_perturb_speed_min", 1.0))
         self._ball_perturb_speed_max = float(env_config.get("ball_perturb_speed_max", 4.0))
 
+        # per-env static domain randomization (Frente C; ranges follow the
+        # HTWK T1 deploy stack, which is validated on real hardware)
+        self._rand_ball_props = bool(env_config.get("rand_ball_props", False))
+        self._rand_ball_mass_scale = list(env_config.get("rand_ball_mass_scale", [0.7, 1.3]))
+        self._rand_ball_friction = list(env_config.get("rand_ball_friction", [0.2, 1.2]))
+        self._rand_ball_restitution = list(env_config.get("rand_ball_restitution", [0.1, 0.9]))
+
+        self._rand_char_props = bool(env_config.get("rand_char_props", False))
+        self._rand_char_friction = list(env_config.get("rand_char_friction", [0.1, 2.0]))
+        self._rand_char_base_mass_scale = list(env_config.get("rand_char_base_mass_scale", [0.8, 1.2]))
+        self._rand_char_base_com = list(env_config.get("rand_char_base_com", [-0.1, 0.1]))
+        self._rand_char_other_mass_scale = list(env_config.get("rand_char_other_mass_scale", [0.98, 1.02]))
+
+        # random velocity pushes on the robot (paper: physical confrontation;
+        # magnitude matches the HTWK T1 push: ~10 N x 1 s / ~30 kg)
+        self._char_push_enable = bool(env_config.get("char_push_enable", False))
+        self._char_push_time_min = float(env_config.get("char_push_time_min", 5.0))
+        self._char_push_time_max = float(env_config.get("char_push_time_max", 10.0))
+        self._char_push_vel_std = float(env_config.get("char_push_vel_std", 0.3))
+        self._char_push_ang_vel_std = float(env_config.get("char_push_ang_vel_std", 0.1))
+
+        # steering-crutch anneal (Frente D): the steering obs block is scaled
+        # 1 -> 0 between start and end samples (the paper's actor receives no
+        # steering command). start < 0 disables; start == end == 0 zeroes it
+        # from the first step (eval configs).
+        self._steer_anneal_start_samples = float(env_config.get("steer_anneal_start_samples", -1.0))
+        self._steer_anneal_end_samples = float(env_config.get("steer_anneal_end_samples", -1.0))
+
+        # uneven ground (engine-side): inject one tile per field so the
+        # engine's ground meshes and the env's field grid cannot diverge;
+        # spawns are raised by the bump amplitude
+        self._ground_z_offset = 0.0
+        self._build_field_offsets = None
+        ground_config = engine_config.get("ground", None)
+        if (ground_config is not None and ground_config.get("type", "plane") == "uneven"):
+            offsets = soccer_util.compute_field_offsets(
+                num_envs, self._field_length, self._field_width, self._field_sep)
+            if ("tile_centers" not in ground_config):
+                ground_config["tile_centers"] = offsets.tolist()
+                ground_config["tile_size"] = [self._field_length + 2.0 * self._field_sep,
+                                              self._field_width + 2.0 * self._field_sep]
+            self._ground_z_offset = float(ground_config.get("random_height", 0.02))
+            # uneven ground uses env_spacing 0 (one global mesh region per
+            # field); spread actors over their fields already at creation so
+            # they are not all piled at the origin, which explodes the PhysX
+            # GPU broadphase pair count before the first reset
+            self._build_field_offsets = offsets
+
         # goal-stream reward weights (Table 3)
         self._reward_goal_scored_w = float(env_config.get("reward_goal_scored_w", 15.0))
         self._reward_ball_approach_w = float(env_config.get("reward_ball_approach_w", 50.0))
@@ -116,18 +164,68 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     def _build_env(self, env_id, config):
-        super()._build_env(env_id, config)
+        if (self._build_field_offsets is not None):
+            # temporarily shift the char spawn to this env's field so actors
+            # are created spread out (restored right after)
+            offset = self._build_field_offsets[env_id]
+            orig_root_pos = self._init_root_pos
+            self._init_root_pos = orig_root_pos.clone()
+            self._init_root_pos[0] += float(offset[0])
+            self._init_root_pos[1] += float(offset[1])
+            self._init_root_pos[2] += self._ground_z_offset
+            try:
+                super()._build_env(env_id, config)
+            finally:
+                self._init_root_pos = orig_root_pos
+        else:
+            super()._build_env(env_id, config)
 
         ball_id = self._build_ball(env_id)
         if (env_id == 0):
             self._ball_id = ball_id
         else:
             assert(ball_id == self._ball_id)
+
+        self._randomize_env_props(env_id, ball_id)
+        return
+
+    def _randomize_env_props(self, env_id, ball_id):
+        """Per-env static randomization, applied at build time (before the sim
+        is initialized, which is required by Isaac Gym's GPU pipeline)."""
+        if (self._rand_ball_props):
+            friction = np.random.uniform(self._rand_ball_friction[0], self._rand_ball_friction[1])
+            restitution = np.random.uniform(self._rand_ball_restitution[0],
+                                            self._rand_ball_restitution[1])
+            self._engine.set_obj_shape_props(env_id, ball_id, friction=friction,
+                                             restitution=restitution)
+            num_bodies = self._engine.get_obj_num_bodies(ball_id)
+            mass_scale = np.random.uniform(self._rand_ball_mass_scale[0],
+                                           self._rand_ball_mass_scale[1])
+            self._engine.scale_obj_masses(env_id, ball_id, np.full([num_bodies], mass_scale))
+
+        if (self._rand_char_props):
+            char_id = self._get_char_id()
+            friction = np.random.uniform(self._rand_char_friction[0], self._rand_char_friction[1])
+            self._engine.set_obj_shape_props(env_id, char_id, friction=friction)
+
+            num_bodies = self._engine.get_obj_num_bodies(char_id)
+            mass_scales = np.random.uniform(self._rand_char_other_mass_scale[0],
+                                            self._rand_char_other_mass_scale[1],
+                                            size=num_bodies)
+            mass_scales[0] = np.random.uniform(self._rand_char_base_mass_scale[0],
+                                               self._rand_char_base_mass_scale[1])
+            com_offsets = np.zeros([num_bodies, 3])
+            com_offsets[0] = np.random.uniform(self._rand_char_base_com[0],
+                                               self._rand_char_base_com[1], size=3)
+            self._engine.scale_obj_masses(env_id, char_id, mass_scales, com_offsets)
         return
 
     def _build_ball(self, env_id):
         ball_asset_file = "data/assets/objects/soccer_ball.xml"
-        start_pos = np.array([2.0, 0.0, self._ball_radius], dtype=np.float32)
+        start_pos = np.array([2.0, 0.0, self._ball_radius + self._ground_z_offset],
+                             dtype=np.float32)
+        if (self._build_field_offsets is not None):
+            start_pos[0:2] += self._build_field_offsets[env_id]
         start_rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
         ball_id = self._engine.create_obj(env_id=env_id,
@@ -144,17 +242,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         num_envs = self.get_num_envs()
 
-        # per-env field centers on a grid (world frame)
-        n_cols = int(np.ceil(np.sqrt(num_envs)))
-        n_rows = int(np.ceil(num_envs / n_cols))
-        pitch_x = self._field_length + 2.0 * self._field_sep
-        pitch_y = self._field_width + 2.0 * self._field_sep
-        idx = torch.arange(num_envs, device=self._device)
-        col = (idx % n_cols).float()
-        row = torch.div(idx, n_cols, rounding_mode="floor").float()
-        self._field_offset = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
-        self._field_offset[:, 0] = (col - 0.5 * (n_cols - 1)) * pitch_x
-        self._field_offset[:, 1] = (row - 0.5 * (n_rows - 1)) * pitch_y
+        # per-env field centers on a grid (world frame); the same helper
+        # sizes the uneven-ground mesh, so layout and terrain cannot diverge
+        offsets = soccer_util.compute_field_offsets(num_envs, self._field_length,
+                                                    self._field_width, self._field_sep)
+        self._field_offset = torch.tensor(offsets, device=self._device, dtype=torch.float)
 
         self._goal_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._goal_pos[:, 0] = 0.5 * self._field_length
@@ -169,6 +261,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._goal_scored_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_oob_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_perturb_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._char_push_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        # global control-step counter driving the steering anneal (samples
+        # seen by the agent ~= steps * num_envs)
+        self._total_env_steps = 0
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -282,6 +378,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)
         self._record_prev_states()
+        self._total_env_steps += 1
 
         self._action_rate_buf[:] = soccer_util.compute_action_rate_penalty(actions,
                                                                            self._prev_action)
@@ -319,6 +416,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                            self._steer_speed_max)
         steer_obs = task_steering_env.compute_steering_observations(
             root_rot, steer_cmd[..., 0:2], steer_cmd[..., 2], steer_cmd[..., 0:2])
+        # steering-crutch anneal (Frente D): fade the whole steering block to
+        # zeros so the final policy matches the paper's command-free actor
+        steer_scale = soccer_util.compute_anneal_scale(
+            self._total_env_steps * self.get_num_envs(),
+            self._steer_anneal_start_samples, self._steer_anneal_end_samples)
+        if (steer_scale < 1.0):
+            steer_obs = steer_obs * steer_scale
 
         task_obs = soccer_util.compute_soccer_observations(root_pos, root_rot, ball_pos,
                                                            goal_pos, goal_dir)
@@ -369,8 +473,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (len(soft_reset_ids) > 0):
             self._reset_ball(soft_reset_ids, near=not self._ball_soft_reset_far)
 
-        # 4. random ball perturbations
+        # 4. random ball perturbations + robot pushes
         self._update_ball_perturb()
+        self._update_char_push()
         return
 
     def _cache_task_reward(self, ball_pos, ball_vel, rolling):
@@ -507,6 +612,32 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_perturb_times[env_ids] = self._time_buf[env_ids] + rand_dt
         return
 
+    def _update_char_push(self):
+        if (not self._char_push_enable):
+            return
+        trigger_mask = self._time_buf >= self._char_push_times
+        env_ids = trigger_mask.nonzero(as_tuple=False).flatten()
+        n = len(env_ids)
+        if (n > 0):
+            char_id = self._get_char_id()
+            vel = self._engine.get_root_vel(char_id)[env_ids].clone()
+            vel[:, 0:2] += self._char_push_vel_std * torch.randn([n, 2], device=self._device)
+            self._engine.set_root_vel(env_ids, char_id, vel)
+
+            ang_vel = self._engine.get_root_ang_vel(char_id)[env_ids].clone()
+            ang_vel[:, 2] += self._char_push_ang_vel_std * torch.randn([n], device=self._device)
+            self._engine.set_root_ang_vel(env_ids, char_id, ang_vel)
+
+            self._resample_char_push_times(env_ids)
+        return
+
+    def _resample_char_push_times(self, env_ids):
+        n = len(env_ids)
+        rand_dt = (self._char_push_time_max - self._char_push_time_min) \
+            * torch.rand(n, device=self._device) + self._char_push_time_min
+        self._char_push_times[env_ids] = self._time_buf[env_ids] + rand_dt
+        return
+
     def _update_reward(self):
         self._reward_buf[:] = self._task_reward_buf
         return
@@ -535,6 +666,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
             self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
             self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
+            self._resample_char_push_times(env_ids)
         return
 
     def _reset_char_placement(self, env_ids):
@@ -551,6 +683,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
         root_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
         root_pos[:, 0:2] += self._field_offset[env_ids]
+        root_pos[:, 2] += self._ground_z_offset
 
         theta = 2.0 * np.pi * torch.rand(n, device=self._device) - np.pi
         axis = torch.zeros([n, 3], device=self._device, dtype=torch.float)
@@ -606,7 +739,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
             ball_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
             ball_pos[:, 0:2] += self._field_offset[env_ids]
-        ball_pos[:, 2] = self._ball_radius
+        ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
 
         # keep the ball from spawning inside the robot
         delta = ball_pos[:, 0:2] - root_pos[:, 0:2]

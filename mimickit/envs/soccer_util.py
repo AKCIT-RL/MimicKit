@@ -7,6 +7,7 @@ distance) for robot->ball and ball->goal, a terminal goal reward, and shaping
 components for the arch/inside-foot kick. No simulator dependencies.
 """
 
+import numpy as np
 import torch
 
 import util.torch_util as torch_util
@@ -281,3 +282,51 @@ def build_field_line_segments(field_length, field_width, goal_width,
     arr = np.array([s[:6] for s in segs], dtype=np.float32)
     cols = np.array([s[6] for s in segs], dtype=np.float32)
     return arr[:, 0:3].copy(), arr[:, 3:6].copy(), cols
+
+
+def compute_field_offsets(num_envs, field_length, field_width, field_sep):
+    """Per-env field centers on a centered grid (world frame).
+
+    Single source of truth for the field layout: the env places fields with
+    these offsets and the engine sizes the uneven-ground mesh from the same
+    grid (see ``compute_field_grid_extent``). Returns float32 [N, 2].
+    """
+    n_cols = int(np.ceil(np.sqrt(num_envs)))
+    n_rows = int(np.ceil(num_envs / n_cols))
+    pitch_x = field_length + 2.0 * field_sep
+    pitch_y = field_width + 2.0 * field_sep
+    idx = np.arange(num_envs)
+    col = (idx % n_cols).astype(np.float32)
+    row = (idx // n_cols).astype(np.float32)
+    offsets = np.zeros([num_envs, 2], dtype=np.float32)
+    offsets[:, 0] = (col - 0.5 * (n_cols - 1)) * pitch_x
+    offsets[:, 1] = (row - 0.5 * (n_rows - 1)) * pitch_y
+    return offsets
+
+
+def compute_field_grid_extent(num_envs, field_length, field_width, field_sep):
+    """Total (size_x, size_y) in meters of the field grid, centered at the
+    origin. Covers every field of ``compute_field_offsets`` including the
+    separation strip around each one."""
+    n_cols = int(np.ceil(np.sqrt(num_envs)))
+    n_rows = int(np.ceil(num_envs / n_cols))
+    size_x = n_cols * (field_length + 2.0 * field_sep)
+    size_y = n_rows * (field_width + 2.0 * field_sep)
+    return size_x, size_y
+
+
+def compute_anneal_scale(samples, start_samples, end_samples):
+    """Linear 1 -> 0 anneal factor over a sample budget.
+
+    start_samples < 0 disables the anneal (always 1). end_samples <=
+    start_samples makes the schedule a step: 1 before start, 0 at/after it
+    (used by eval configs to zero the steering crutch outright).
+    """
+    if (start_samples < 0):
+        return 1.0
+    if (samples < start_samples):
+        return 1.0
+    if (end_samples <= start_samples):
+        return 0.0
+    frac = (samples - start_samples) / float(end_samples - start_samples)
+    return float(np.clip(1.0 - frac, 0.0, 1.0))

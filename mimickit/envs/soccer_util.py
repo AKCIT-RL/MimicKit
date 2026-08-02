@@ -330,3 +330,46 @@ def compute_anneal_scale(samples, start_samples, end_samples):
         return 0.0
     frac = (samples - start_samples) / float(end_samples - start_samples)
     return float(np.clip(1.0 - frac, 0.0, 1.0))
+
+
+@torch.jit.script
+def compute_perception_noise_std(dist, dist_coef: float, base_std: float):
+    # type: (Tensor, float, float) -> Tensor
+    """Ball-position noise std as a function of distance (paper section 9):
+    sigma = dist_coef * d + base_std (paper: 0.124 * d + 0.149)."""
+    return dist_coef * dist + base_std
+
+
+@torch.jit.script
+def compute_ball_detection_prob(dist, in_fov, base_prob: float,
+                                full_range: float, decay_range: float):
+    # type: (Tensor, Tensor, float, float, float) -> Tensor
+    """Detection probability of the ball (paper section 9).
+
+    base_prob inside the FOV up to full_range meters, decaying linearly to 0
+    over the next decay_range meters; 0 outside the FOV.
+    dist: [N] planar robot->ball distance; in_fov: [N] bool.
+    """
+    decay = 1.0 - (dist - full_range) / decay_range
+    prob = base_prob * torch.clamp(decay, min=0.0, max=1.0)
+    prob = torch.where(dist <= full_range,
+                       torch.full_like(prob, base_prob), prob)
+    prob = prob * in_fov.float()
+    return prob
+
+
+@torch.jit.script
+def compute_ball_in_fov(root_pos, root_rot, ball_pos, fov_half_rad: float):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Whether the ball bearing is within +-fov_half_rad of the robot heading.
+
+    fov_half_rad <= 0 disables the check (always True). Uses the heading
+    (yaw-only) frame; returns [N] bool.
+    """
+    if (fov_half_rad <= 0.0):
+        return torch.ones_like(root_pos[..., 0], dtype=torch.bool)
+    heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
+    ball_rel = ball_pos - root_pos
+    local_ball = torch_util.quat_rotate(heading_inv_rot, ball_rel)
+    bearing = torch.atan2(local_ball[..., 1], local_ball[..., 0])
+    return torch.abs(bearing) <= fov_half_rad

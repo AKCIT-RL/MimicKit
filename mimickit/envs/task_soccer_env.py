@@ -75,6 +75,25 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._char_push_vel_std = float(env_config.get("char_push_vel_std", 0.3))
         self._char_push_ang_vel_std = float(env_config.get("char_push_ang_vel_std", 0.1))
 
+        # virtual perception (Frente E, paper section 9): the actor's ball obs
+        # go through a simulated camera pipeline (noise + latency + frame rate
+        # + detection dropout); rewards and events keep the true state. The
+        # obs CONTRACT is unchanged: the same ball slots + mask now carry the
+        # perceived values instead of ground truth.
+        self._virtual_perception = bool(env_config.get("virtual_perception", False))
+        self._percep_freq_mean = float(env_config.get("percep_freq_mean", 25.36))     # Hz
+        self._percep_freq_std = float(env_config.get("percep_freq_std", 1.06))        # Hz
+        self._percep_latency_mean = float(env_config.get("percep_latency_mean", 0.116))  # s
+        self._percep_latency_std = float(env_config.get("percep_latency_std", 0.018))   # s
+        self._percep_noise_dist_coef = float(env_config.get("percep_noise_dist_coef", 0.124))
+        self._percep_noise_base = float(env_config.get("percep_noise_base", 0.149))     # m
+        self._percep_detect_prob = float(env_config.get("percep_detect_prob", 0.9))
+        self._percep_detect_full_range = float(env_config.get("percep_detect_full_range", 7.0))  # m
+        self._percep_detect_decay_range = float(env_config.get("percep_detect_decay_range", 3.0))  # m
+        # full FOV angle in deg; <= 0 disables the FOV check. G1 has no
+        # actuated neck (Frente G pending), so the FOV is fixed to the heading.
+        self._percep_fov_deg = float(env_config.get("percep_fov_deg", 120.0))
+
         # steering-crutch anneal (Frente D): the steering obs block is scaled
         # 1 -> 0 between start and end samples (the paper's actor receives no
         # steering command). start < 0 disables; start == end == 0 zeroes it
@@ -277,6 +296,23 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._stagnation_anchor_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._stagnation_anchor_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
+        # virtual-perception pipeline state (Frente E). Measurements are
+        # captured at the camera frame rate and delivered ~latency later;
+        # since latency (~116 ms) > frame period (~40 ms) several frames are
+        # in flight at once -> ring buffer of K slots per env. "percep" is
+        # what the actor currently sees (zero-order hold).
+        K = 8
+        self._percep_buf_slots = K
+        self._percep_period = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_next_capture = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_buf_pos = torch.zeros([num_envs, K, 2], device=self._device, dtype=torch.float)
+        self._percep_buf_valid = torch.zeros([num_envs, K], device=self._device, dtype=torch.bool)
+        self._percep_buf_deliver = torch.full([num_envs, K], float("inf"),
+                                              device=self._device, dtype=torch.float)
+        self._percep_buf_head = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
+
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
         self._action_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -402,12 +438,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         goal_pos = self._goal_pos
         goal_dir = self._goal_dir
 
+        if (self._virtual_perception):
+            # the actor only ever sees the virtual camera's ball estimate
+            # (noise + latency + dropout); z is irrelevant for the heading-
+            # frame planar obs, keep the true one
+            ball_pos = ball_pos.clone()
+            ball_pos[:, 0:2] = self._percep_ball_pos
+            ball_mask_all = self._percep_ball_valid.float().unsqueeze(-1)
+        else:
+            ball_mask_all = torch.ones([ball_pos.shape[0], 1], device=self._device,
+                                       dtype=torch.float)
+
         if (env_ids is not None):
             root_pos = root_pos[env_ids]
             root_rot = root_rot[env_ids]
             ball_pos = ball_pos[env_ids]
             goal_pos = goal_pos[env_ids]
             goal_dir = goal_dir[env_ids]
+            ball_mask_all = ball_mask_all[env_ids]
 
         # steering command slots first, so the obs prefix (char + steering
         # task dims) matches the steering checkpoint layout column-for-column
@@ -426,9 +474,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         task_obs = soccer_util.compute_soccer_observations(root_pos, root_rot, ball_pos,
                                                            goal_pos, goal_dir)
-        # ball detection mask (Table 2); the perception model is not simulated
-        # yet, so the ball is always visible
-        ball_mask = torch.ones_like(task_obs[..., 0:1])
+        # ball detection mask (Table 2); real dropout when the virtual
+        # perception pipeline is enabled, constant 1 otherwise
+        ball_mask = ball_mask_all
         obs = torch.cat([obs, steer_obs, task_obs, ball_mask], dim=-1)
         return obs
 
@@ -476,6 +524,83 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # 4. random ball perturbations + robot pushes
         self._update_ball_perturb()
         self._update_char_push()
+        if (self._virtual_perception):
+            self._update_perception()
+        return
+
+    def _update_perception(self):
+        """One tick of the virtual camera pipeline (Frente E).
+
+        Deliver first (measurements captured ~latency ago become what the
+        actor sees; if several are due, the most recent wins), then capture
+        (a new noisy measurement enters the ring at the sampled frame rate)."""
+        # deliver: pick, per env, the due slot with the latest deliver time
+        due = self._percep_buf_deliver <= self._time_buf.unsqueeze(-1)  # [N, K]
+        any_due = due.any(dim=-1)
+        if (any_due.any()):
+            deliver_times = torch.where(due, self._percep_buf_deliver,
+                                        torch.full_like(self._percep_buf_deliver, -float("inf")))
+            latest = deliver_times.argmax(dim=-1)  # [N]
+            env_ids = any_due.nonzero(as_tuple=False).flatten()
+            slots = latest[env_ids]
+            valid = self._percep_buf_valid[env_ids, slots]
+            upd = env_ids[valid]
+            self._percep_ball_pos[upd] = self._percep_buf_pos[env_ids, slots][valid]
+            self._percep_ball_valid[env_ids] = valid
+            self._percep_buf_deliver[due] = float("inf")
+
+        # capture
+        capture = self._time_buf >= self._percep_next_capture
+        if (capture.any()):
+            env_ids = capture.nonzero(as_tuple=False).flatten()
+            char_id = self._get_char_id()
+            root_pos = self._engine.get_root_pos(char_id)[env_ids]
+            root_rot = self._engine.get_root_rot(char_id)[env_ids]
+            ball_pos = self._get_ball_pos()[env_ids]
+
+            dist = torch.linalg.norm(ball_pos[:, 0:2] - root_pos[:, 0:2], dim=-1)
+            in_fov = soccer_util.compute_ball_in_fov(
+                root_pos, root_rot, ball_pos,
+                0.5 * self._percep_fov_deg * np.pi / 180.0)
+            detect_prob = soccer_util.compute_ball_detection_prob(
+                dist, in_fov, self._percep_detect_prob,
+                self._percep_detect_full_range, self._percep_detect_decay_range)
+            detected = torch.rand_like(dist) < detect_prob
+
+            noise_std = soccer_util.compute_perception_noise_std(
+                dist, self._percep_noise_dist_coef, self._percep_noise_base)
+            noisy_pos = ball_pos[:, 0:2] + noise_std.unsqueeze(-1) * torch.randn_like(ball_pos[:, 0:2])
+
+            latency = self._percep_latency_mean \
+                + self._percep_latency_std * torch.randn_like(dist)
+            latency = torch.clamp(latency, min=0.0)
+
+            head = self._percep_buf_head[env_ids]
+            self._percep_buf_pos[env_ids, head] = noisy_pos
+            self._percep_buf_valid[env_ids, head] = detected
+            self._percep_buf_deliver[env_ids, head] = self._time_buf[env_ids] + latency
+            self._percep_buf_head[env_ids] = (head + 1) % self._percep_buf_slots
+            self._percep_next_capture[env_ids] = self._percep_next_capture[env_ids] \
+                + self._percep_period[env_ids]
+        return
+
+    def _reset_perception(self, env_ids):
+        """Per-episode camera parameters + a clean first measurement (the
+        true ball position, valid), so the policy never sees stale data from
+        the previous episode."""
+        n = len(env_ids)
+        freq = self._percep_freq_mean \
+            + self._percep_freq_std * torch.randn([n], device=self._device)
+        freq = torch.clamp(freq, min=1.0)
+        self._percep_period[env_ids] = 1.0 / freq
+        # desync the first capture across envs (time_buf is 0 after reset)
+        self._percep_next_capture[env_ids] = self._percep_period[env_ids] \
+            * torch.rand([n], device=self._device)
+        self._percep_buf_deliver[env_ids] = float("inf")
+        self._percep_buf_valid[env_ids] = False
+        self._percep_buf_head[env_ids] = 0
+        self._percep_ball_pos[env_ids] = self._get_ball_pos()[env_ids][:, 0:2]
+        self._percep_ball_valid[env_ids] = True
         return
 
     def _cache_task_reward(self, ball_pos, ball_vel, rolling):
@@ -652,6 +777,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # key-body obs will mix the old pose with the new root position
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
+            if (self._virtual_perception):
+                self._reset_perception(env_ids)
             self._record_reset_prev_states(env_ids)
             self._task_reward_buf[env_ids] = 0.0
             self._goal_scored_buf[env_ids] = False

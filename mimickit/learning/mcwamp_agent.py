@@ -3,6 +3,7 @@ import torch
 import envs.base_env as base_env
 import learning.mcwamp_model as mcwamp_model
 import learning.multi_critic_util as multi_critic_util
+import learning.normalizer as normalizer
 import learning.rl_util as rl_util
 import learning.wamp_agent as wamp_agent
 import util.mp_util as mp_util
@@ -51,12 +52,60 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         self._model = mcwamp_model.MCWAMPModel(model_config, self._env)
         return
 
+    def _build_normalizers(self):
+        super()._build_normalizers()
+        # asymmetric critic (paper Table 2): when the env publishes a
+        # privileged critic_obs (same layout as the obs, true ball state),
+        # the critics train on it with their own normalizer while the actor
+        # keeps the perceived obs.
+        self._use_critic_obs = bool(getattr(self._env, "has_critic_obs", lambda: False)())
+        if (self._use_critic_obs):
+            obs_space = self._env.get_obs_space()
+            obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
+            self._critic_obs_norm = normalizer.Normalizer(
+                obs_space.shape, clip=10.0, device=self._device, dtype=obs_dtype)
+        return
+
+    def load_state_dict(self, state_dict):
+        # warm-start compat: checkpoints saved before the asymmetric critic
+        # lack the critic_obs normalizer; seed it from the obs normalizer
+        # (identical layout, so the stats are a valid starting point).
+        if (self._use_critic_obs):
+            for key in list(self.state_dict().keys()):
+                if (key.startswith("_critic_obs_norm.") and key not in state_dict):
+                    src = "_obs_norm." + key[len("_critic_obs_norm."):]
+                    state_dict[key] = state_dict[src].clone()
+        else:
+            # eval of an asymmetric-critic checkpoint in an env without a
+            # critic_obs: the normalizer does not exist here, drop its keys
+            state_dict = {k: v for k, v in state_dict.items()
+                          if not k.startswith("_critic_obs_norm.")}
+        super().load_state_dict(state_dict)
+        return
+
+    def _update_normalizers(self):
+        super()._update_normalizers()
+        if (self._use_critic_obs):
+            self._critic_obs_norm.update()
+        return
+
+    def _record_data_pre_step(self, obs, info, action, action_info):
+        super()._record_data_pre_step(obs, info, action, action_info)
+        if (self._use_critic_obs):
+            critic_obs = info["critic_obs"]
+            self._exp_buffer.record("critic_obs", critic_obs)
+            if (self._need_normalizer_update()):
+                self._critic_obs_norm.record(critic_obs)
+        return
+
     def _record_data_post_step(self, next_obs, r, done, next_info):
         super()._record_data_post_step(next_obs, r, done, next_info)
 
         if ("aux_reward" in next_info):
             self._exp_buffer.record("aux_env_reward", next_info["aux_reward"])
             self._has_aux_env_reward = True
+        if (self._use_critic_obs):
+            self._exp_buffer.record("next_critic_obs", next_info["critic_obs"])
         return
 
     def _compute_rewards(self):
@@ -89,8 +138,14 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
     def _build_multi_critic_train_data(self):
         self.eval()
 
-        obs = self._exp_buffer.get_data("obs")
-        next_obs = self._exp_buffer.get_data("next_obs")
+        if (self._use_critic_obs):
+            obs = self._exp_buffer.get_data("critic_obs")
+            next_obs = self._exp_buffer.get_data("next_critic_obs")
+            obs_norm = self._critic_obs_norm
+        else:
+            obs = self._exp_buffer.get_data("obs")
+            next_obs = self._exp_buffer.get_data("next_obs")
+            obs_norm = self._obs_norm
         task_r = self._exp_buffer.get_data("reward")
         disc_r = self._exp_buffer.get_data("disc_reward")
         done = self._exp_buffer.get_data("done")
@@ -105,7 +160,7 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         task_r = goal_scale * task_r
         aux_r = aux_scale * aux_r
 
-        norm_next_obs = self._obs_norm.normalize(next_obs)
+        norm_next_obs = obs_norm.normalize(next_obs)
         next_critic_inputs = {"obs": norm_next_obs}
         next_vals = torch_util.eval_minibatch(self._model.eval_critic, next_critic_inputs,
                                               self._critic_eval_batch_size)
@@ -129,7 +184,7 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
                                               self._discount, self._td_lambda)
              for s in range(rewards.shape[-1])], dim=-1)
 
-        norm_obs = self._obs_norm.normalize(obs)
+        norm_obs = obs_norm.normalize(obs)
         critic_inputs = {"obs": norm_obs}
         vals = torch_util.eval_minibatch(self._model.eval_critic, critic_inputs,
                                          self._critic_eval_batch_size)
@@ -153,7 +208,10 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         return info
 
     def _compute_critic_loss(self, batch):
-        norm_obs = self._obs_norm.normalize(batch["obs"])
+        if (self._use_critic_obs):
+            norm_obs = self._critic_obs_norm.normalize(batch["critic_obs"])
+        else:
+            norm_obs = self._obs_norm.normalize(batch["obs"])
         tar_val = batch["tar_val"]
         pred = self._model.eval_critic(norm_obs)
 

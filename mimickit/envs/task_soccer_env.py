@@ -325,6 +325,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._task_hist_steps > 0):
             self._task_hist_buf = torch.zeros([num_envs, self._task_hist_steps, 12],
                                               device=self._device, dtype=torch.float)
+            if (self._virtual_perception):
+                # privileged twin (true ball) for the asymmetric critic
+                self._critic_task_hist_buf = torch.zeros(
+                    [num_envs, self._task_hist_steps, 12],
+                    device=self._device, dtype=torch.float)
 
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
@@ -441,10 +446,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_pos[:] = self._get_ball_pos()
         return
 
-    def _compute_task_block(self, env_ids=None):
+    def _compute_task_block(self, env_ids=None, privileged=False):
         """The 12-dim task block exactly as the actor sees it this step:
         steering obs (annealed), soccer obs (perceived ball when the virtual
-        perception is on) and the ball detection mask."""
+        perception is on) and the ball detection mask. With privileged=True
+        the block uses the TRUE ball state and mask 1 (asymmetric critic)."""
         char_id = self._get_char_id()
         root_pos = self._engine.get_root_pos(char_id)
         root_rot = self._engine.get_root_rot(char_id)
@@ -452,7 +458,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         goal_pos = self._goal_pos
         goal_dir = self._goal_dir
 
-        if (self._virtual_perception):
+        if (self._virtual_perception and not privileged):
             # the actor only ever sees the virtual camera's ball estimate
             # (noise + latency + dropout); z is irrelevant for the heading-
             # frame planar obs, keep the true one
@@ -555,6 +561,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # the newest history entry matches what the actor sees this step
             self._task_hist_buf[:, :-1] = self._task_hist_buf[:, 1:].clone()
             self._task_hist_buf[:, -1] = self._compute_task_block()
+            if (self._virtual_perception):
+                self._critic_task_hist_buf[:, :-1] = self._critic_task_hist_buf[:, 1:].clone()
+                self._critic_task_hist_buf[:, -1] = self._compute_task_block(privileged=True)
         return
 
     def _update_perception(self):
@@ -731,7 +740,26 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
         self._info["aux_reward"] = self._aux_reward_buf
+        if (self._virtual_perception):
+            # asymmetric critic (paper Table 2): the critic trains on the
+            # TRUE ball state while the actor only ever sees the perceived
+            # one. Fresh tensor every call: no aliasing with later mutations.
+            self._info["critic_obs"] = self._compute_critic_obs()
         return
+
+    def has_critic_obs(self):
+        """Whether this env publishes a privileged critic_obs in the info."""
+        return self._virtual_perception
+
+    def _compute_critic_obs(self):
+        """Actor-layout obs with the perceived ball slots replaced by the
+        true ball state (current block + history). Same shape as the obs."""
+        obs = super()._compute_obs()
+        block = self._compute_task_block(privileged=True)
+        obs = torch.cat([obs, block], dim=-1)
+        if (self._task_hist_steps > 0):
+            obs = torch.cat([obs, self._critic_task_hist_buf.flatten(start_dim=1)], dim=-1)
+        return obs
 
     def _update_ball_perturb(self):
         trigger_mask = self._time_buf >= self._ball_perturb_times
@@ -811,6 +839,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._task_hist_steps > 0):
                 # replicate the post-reset block: no stale data, no zero mixing
                 self._task_hist_buf[env_ids] = self._compute_task_block(env_ids).unsqueeze(1)
+                if (self._virtual_perception):
+                    self._critic_task_hist_buf[env_ids] = \
+                        self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
             self._record_reset_prev_states(env_ids)
             self._task_reward_buf[env_ids] = 0.0
             self._goal_scored_buf[env_ids] = False

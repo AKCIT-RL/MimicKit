@@ -94,6 +94,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # actuated neck (Frente G pending), so the FOV is fixed to the heading.
         self._percep_fov_deg = float(env_config.get("percep_fov_deg", 120.0))
 
+        # task-obs history (Frente F-lite): the actor also receives the last
+        # H task blocks (steer 5 + soccer 6 + mask 1 = 12 dims) it saw, so it
+        # can filter perception noise and estimate ball velocity / latency.
+        # 0 disables (contract stays 249 dims). Paper uses 1 s of history
+        # through an encoder; 10 frames (~333 ms) cover latency (~3.5 steps)
+        # + velocity estimation.
+        self._task_hist_steps = int(env_config.get("task_obs_history_steps", 0))
+
         # steering-crutch anneal (Frente D): the steering obs block is scaled
         # 1 -> 0 between start and end samples (the paper's actor receives no
         # steering command). start < 0 disables; start == end == 0 zeroes it
@@ -313,6 +321,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
 
+        # task-obs history buffer (Frente F-lite); 12 = steer 5 + soccer 6 + mask 1
+        if (self._task_hist_steps > 0):
+            self._task_hist_buf = torch.zeros([num_envs, self._task_hist_steps, 12],
+                                              device=self._device, dtype=torch.float)
+
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
         self._action_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -428,9 +441,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_pos[:] = self._get_ball_pos()
         return
 
-    def _compute_obs(self, env_ids=None):
-        obs = super()._compute_obs(env_ids)
-
+    def _compute_task_block(self, env_ids=None):
+        """The 12-dim task block exactly as the actor sees it this step:
+        steering obs (annealed), soccer obs (perceived ball when the virtual
+        perception is on) and the ball detection mask."""
         char_id = self._get_char_id()
         root_pos = self._engine.get_root_pos(char_id)
         root_rot = self._engine.get_root_rot(char_id)
@@ -444,10 +458,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # frame planar obs, keep the true one
             ball_pos = ball_pos.clone()
             ball_pos[:, 0:2] = self._percep_ball_pos
-            ball_mask_all = self._percep_ball_valid.float().unsqueeze(-1)
+            ball_mask = self._percep_ball_valid.float().unsqueeze(-1)
         else:
-            ball_mask_all = torch.ones([ball_pos.shape[0], 1], device=self._device,
-                                       dtype=torch.float)
+            ball_mask = torch.ones([ball_pos.shape[0], 1], device=self._device,
+                                   dtype=torch.float)
 
         if (env_ids is not None):
             root_pos = root_pos[env_ids]
@@ -455,7 +469,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_pos = ball_pos[env_ids]
             goal_pos = goal_pos[env_ids]
             goal_dir = goal_dir[env_ids]
-            ball_mask_all = ball_mask_all[env_ids]
+            ball_mask = ball_mask[env_ids]
 
         # steering command slots first, so the obs prefix (char + steering
         # task dims) matches the steering checkpoint layout column-for-column
@@ -476,8 +490,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                            goal_pos, goal_dir)
         # ball detection mask (Table 2); real dropout when the virtual
         # perception pipeline is enabled, constant 1 otherwise
-        ball_mask = ball_mask_all
-        obs = torch.cat([obs, steer_obs, task_obs, ball_mask], dim=-1)
+        return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
+
+    def _compute_obs(self, env_ids=None):
+        obs = super()._compute_obs(env_ids)
+        block = self._compute_task_block(env_ids)
+        obs = torch.cat([obs, block], dim=-1)
+        if (self._task_hist_steps > 0):
+            # history is mutated once per step in _update_task (and refilled
+            # on reset), NEVER here: _compute_obs is also used as a shape
+            # probe by get_obs_space()
+            hist = self._task_hist_buf if env_ids is None else self._task_hist_buf[env_ids]
+            obs = torch.cat([obs, hist.flatten(start_dim=1)], dim=-1)
         return obs
 
     def _update_misc(self):
@@ -526,6 +550,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._update_char_push()
         if (self._virtual_perception):
             self._update_perception()
+        if (self._task_hist_steps > 0):
+            # exactly one roll per physics step, after the perception tick so
+            # the newest history entry matches what the actor sees this step
+            self._task_hist_buf[:, :-1] = self._task_hist_buf[:, 1:].clone()
+            self._task_hist_buf[:, -1] = self._compute_task_block()
         return
 
     def _update_perception(self):
@@ -779,6 +808,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._reset_ball(env_ids)
             if (self._virtual_perception):
                 self._reset_perception(env_ids)
+            if (self._task_hist_steps > 0):
+                # replicate the post-reset block: no stale data, no zero mixing
+                self._task_hist_buf[env_ids] = self._compute_task_block(env_ids).unsqueeze(1)
             self._record_reset_prev_states(env_ids)
             self._task_reward_buf[env_ids] = 0.0
             self._goal_scored_buf[env_ids] = False

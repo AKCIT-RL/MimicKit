@@ -1,0 +1,9 @@
+motions:
+  - file: "data/motions/g1/g1_walk.pkl"
+    weight: 2.0
+  - file: "data/motions/g1/g1_run.pkl"
+    weight: 1.0
+  - file: "data/motions/g1/g1_kick_cmu.pkl"
+    weight: 0.15
+  - file: "data/motions/g1/g1_kick_cmu_mirror.pkl"
+    weight: 0.15

@@ -37,10 +37,18 @@ def main():
     src = torch.load(args.src, map_location="cpu")
     dst = torch.load(args.dst, map_location="cpu")
 
-    assert set(src.keys()) == set(dst.keys()), "checkpoint key sets differ"
+    assert not (set(src.keys()) - set(dst.keys())), \
+        "steering has keys missing in soccer: {}".format(set(src.keys()) - set(dst.keys()))
+    dst_only = set(dst.keys()) - set(src.keys())
+    if dst_only:
+        # soccer-only state (e.g. privileged critic obs normalizer) keeps its
+        # soccer-initialized values
+        print("kept soccer-only keys: {}".format(sorted(dst_only)))
 
     n_copied = n_prefix = 0
     for k in dst.keys():
+        if k in dst_only:
+            continue
         s, d = src[k], dst[k]
         if (not torch.is_tensor(s)):
             dst[k] = s

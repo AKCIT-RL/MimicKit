@@ -226,7 +226,8 @@ class IsaacLabEngine(engine.Engine):
     
     def render(self):
         self._sim.render()
-        self._draw_interface.clear_lines()
+        if (hasattr(self, "_draw_interface")):
+            self._draw_interface.clear_lines()
         super().render()
         return
     
@@ -579,6 +580,9 @@ class IsaacLabEngine(engine.Engine):
         return self._control_mode
     
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
+        if (not hasattr(self, "_draw_interface")):
+            return
+
         env_offset = self._env_offsets[env_id].cpu().numpy()
         start_pts = start_verts.copy()
         end_pts = end_verts.copy()
@@ -1035,7 +1039,8 @@ class IsaacLabEngine(engine.Engine):
             obj_type = self.get_obj_type(obj_id)
             if (obj_type == engine.ObjType.articulated):
                 obj = self._objs[obj_id]
-                body_order_sim2common, body_order_common2sim, dof_order_sim2common, dof_order_common2sim = self._build_body_order(obj)
+                asset_file = self._obj_cfgs[0][obj_id].asset_file
+                body_order_sim2common, body_order_common2sim, dof_order_sim2common, dof_order_common2sim = self._build_body_order(obj, asset_file)
 
                 body_order_sim2common = torch.tensor(body_order_sim2common, device=self._device, dtype=torch.long)
                 body_order_common2sim = torch.tensor(body_order_common2sim, device=self._device, dtype=torch.long)
@@ -1104,10 +1109,42 @@ class IsaacLabEngine(engine.Engine):
             self._ground_contact_sensors.append(sensor)
         return
     
-    def _build_body_order(self, obj):
+    def _derive_link_parent_indices_from_mjcf(self, link_names, asset_file):
+        assert(asset_file is not None), "link_parent_indices unavailable from PhysX and no asset_file provided to derive it from"
+        _, file_ext = os.path.splitext(asset_file)
+        assert(file_ext == ".xml"), \
+            "link_parent_indices unavailable from PhysX; MJCF fallback only supports .xml char files, got: {}".format(asset_file)
+
+        import anim.mjcf_char_model as mjcf_char_model
+        kin_model = mjcf_char_model.MJCFCharModel("cpu")
+        kin_model.load(asset_file)
+        kin_body_names = kin_model.get_body_names()
+
+        link_parent_indices = {}
+        for j in range(len(kin_body_names)):
+            parent_id = kin_model.get_parent_id(j)
+            if (parent_id == -1):
+                continue
+            child_name = kin_body_names[j]
+            parent_name = kin_body_names[parent_id]
+            if (child_name in link_names and parent_name in link_names):
+                link_parent_indices[child_name] = link_names.index(parent_name)
+        return link_parent_indices
+
+    def _build_body_order(self, obj, asset_file=None):
         meta_data = obj.root_physx_view.shared_metatype
         link_names = meta_data.link_names
-        link_parent_indices = meta_data.link_parent_indices
+
+        if (hasattr(meta_data, "link_parent_indices")):
+            link_parent_indices = meta_data.link_parent_indices
+        else:
+            # This PhysX tensor API version doesn't expose link_parent_indices, and
+            # link_paths are flat siblings (not USD-nested), so there's no hierarchy
+            # info available from PhysX at all. Fall back to re-parsing the source
+            # MJCF (same file the kinematic char model already loads) to recover the
+            # parent tree, keyed by body name to match against link_names.
+            link_parent_indices = self._derive_link_parent_indices_from_mjcf(link_names, asset_file)
+
         joint_dof_counts = meta_data.joint_dof_counts
         joint_dof_offsets = meta_data.joint_dof_offsets
 

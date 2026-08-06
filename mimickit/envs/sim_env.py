@@ -32,9 +32,11 @@ class SimEnv(base_env.BaseEnv):
         self._build_sim_tensors(env_config)
         self._build_data_buffers()
 
-        if self._visualize:
+        if (self._visualize or record_video):
             self._build_camera(env_config)
             self._play_mode = PlayMode.PLAY
+
+        if self._visualize:
             self._setup_gui()
 
         return
@@ -83,9 +85,9 @@ class SimEnv(base_env.BaseEnv):
         # compute observations, rewards, resets, ...
         self._post_physics_step()
 
-        if (self._visualize):
+        if (self._visualize or self._engine.enabled_record_video()):
             self._render()
-        
+
         return self._obs_buf, self._reward_buf, self._done_buf, self._info
     
     def get_num_envs(self):

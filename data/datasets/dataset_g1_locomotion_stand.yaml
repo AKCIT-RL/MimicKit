@@ -1,0 +1,10 @@
+# Weighted multi-clip locomotion dataset for the G1 steering/AMP task -- stand + walk + run,
+# so the policy learns the full continuum (including near-zero tar_speed) and all
+# transitions between the three regimes in one unified policy.
+motions:
+  - file: "data/motions/g1/g1_stand.pkl"
+    weight: 1.0
+  - file: "data/motions/g1/g1_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/g1/g1_run.pkl"
+    weight: 1.0

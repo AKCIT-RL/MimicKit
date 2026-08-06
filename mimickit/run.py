@@ -48,13 +48,30 @@ def train(agent, max_samples, out_dir, save_int_models, logger_type):
                       save_int_models=save_int_models, logger_type=logger_type)
     return
 
-def test(agent, test_episodes):
+def test(agent, test_episodes, env, out_dir):
     result = agent.test_model(num_episodes=test_episodes)
-    
+
     Logger.print("Mean Return: {}".format(result["mean_return"]))
     Logger.print("Mean Episode Length: {}".format(result["mean_ep_len"]))
     Logger.print("Episodes: {}".format(result["num_eps"]))
+
+    save_test_video(env, out_dir)
     return result
+
+def save_test_video(env, out_dir):
+    # --mode test never goes through the training logger, so a recording enabled via
+    # --video true would otherwise be captured (set_mode(TEST) already starts it) and
+    # then silently discarded. Save it straight to a file instead.
+    if (not mp_util.is_root_proc()):
+        return
+
+    diagnostics = env.record_diagnostics()
+    video = diagnostics.get("sim_recording", None) if diagnostics is not None else None
+    if (video is not None and video.get_num_frames() > 0):
+        video_path = os.path.join(out_dir, "test_video.mp4")
+        video.save(video_path)
+        Logger.print("Saved test video ({:d} frames) to {:s}".format(video.get_num_frames(), video_path))
+    return
 
 def save_config_files(args, out_dir):
     engine_file = args.parse_string("engine_config")
@@ -124,7 +141,7 @@ def run(rank, num_procs, device, master_port, args):
         
     elif (mode == "test"):
         test_episodes = args.parse_int("test_episodes", np.iinfo(np.int64).max)
-        test(agent=agent, test_episodes=test_episodes)
+        test(agent=agent, test_episodes=test_episodes, env=env, out_dir=out_dir)
 
     else:
         assert(False), "Unsupported mode: {}".format(mode)

@@ -1,0 +1,9 @@
+# Weighted multi-clip locomotion dataset for the G1 steering/AMP task -- walk + run
+# as the base gait pair, per the official MimicKit_Data asset package
+# (data/motions/g1/g1_walk.pkl, g1_run.pkl). Measured root speed: walk ~1.0 m/s
+# steady, run ~2.8-3.4 m/s -- see tar_speed_min/max in amp_steering_g1_env.yaml.
+motions:
+  - file: "data/motions/g1/g1_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/g1/g1_run.pkl"
+    weight: 1.0

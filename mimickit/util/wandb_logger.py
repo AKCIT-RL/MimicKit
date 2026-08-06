@@ -27,9 +27,13 @@ class WandbLogger(logger.Logger):
         super().configure_output_file(filename)
 
         if (logger.Logger.is_root()):
-            basename = os.path.basename(filename)
-            exp_name = os.path.splitext(basename)[0]
-            wandb.init(project=self._project_name, name=exp_name, config=self._param_config)
+            # filename is always "<out_dir>/log.txt", so basename alone is always "log" --
+            # use the out_dir's folder name instead so runs are distinguishable in wandb.
+            out_dir = os.path.dirname(os.path.abspath(filename))
+            exp_name = os.path.basename(out_dir)
+            # Account's API-reported default entity ("Baile") isn't where runs should
+            # land -- pin explicitly so it doesn't silently drift to the wrong org.
+            wandb.init(project=self._project_name, name=exp_name, entity="gabrielruotolo-federal-univesity-of-goias", config=self._param_config)
         
         return
 

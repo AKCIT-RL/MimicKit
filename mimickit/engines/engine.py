@@ -16,8 +16,7 @@ class ObjType(enum.Enum):
 
 class Engine:
     def __init__(self, visualize):
-        if (visualize):
-            self._prev_frame_time = 0.0
+        self._prev_frame_time = 0.0
         return
     
     @abc.abstractmethod

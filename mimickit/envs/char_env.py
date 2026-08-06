@@ -117,6 +117,14 @@ class CharEnv(sim_env.SimEnv):
         
         key_bodies = env_config.get("key_bodies", [])
         self._key_body_ids = self._build_body_ids_tensor(key_bodies)
+
+        impact_bodies = env_config.get("impact_bodies", [])
+        self._impact_body_ids = self._build_body_ids_tensor(impact_bodies)
+        self._impact_vel_max = float(env_config.get("impact_vel_max", 5.0))
+
+        num_envs = self.get_num_envs()
+        num_impact_bodies = len(impact_bodies)
+        self._prev_impact_body_vel_z = torch.zeros([num_envs, num_impact_bodies], device=self._device, dtype=torch.float)
         return
     
     def _build_action_space(self):
@@ -329,7 +337,38 @@ class CharEnv(sim_env.SimEnv):
         clip_action = torch.minimum(torch.maximum(actions, self._action_bound_low), self._action_bound_high)
         self._engine.set_cmd(char_id, clip_action)
         return
-    
+
+    def _pre_physics_step(self, actions):
+        super()._pre_physics_step(actions)
+
+        if (self._has_impact_bodies()):
+            self._record_impact_body_vel()
+        return
+
+    def _has_impact_bodies(self):
+        return len(self._impact_body_ids) > 0
+
+    def _record_impact_body_vel(self):
+        char_id = self._get_char_id()
+        body_vel = self._engine.get_body_vel(char_id)
+        self._prev_impact_body_vel_z[:] = body_vel[..., self._impact_body_ids, 2]
+        return
+
+    def _compute_impact_reduction_reward(self):
+        # "impact-reduction" reward from Olaf (arXiv:2512.16705, Table I):
+        # r = -sum_i min(dv_z_i^2, dv_max^2), where dv_z is the change in a foot's
+        # vertical velocity between consecutive sim steps. Saturating with dv_max
+        # keeps contact-resolution velocity spikes from destabilizing the critic.
+        if (not self._has_impact_bodies()):
+            return torch.zeros_like(self._reward_buf)
+
+        char_id = self._get_char_id()
+        body_vel = self._engine.get_body_vel(char_id)
+        curr_vel_z = body_vel[..., self._impact_body_ids, 2]
+
+        reward = compute_impact_reduction_reward(curr_vel_z, self._prev_impact_body_vel_z, self._impact_vel_max)
+        return reward
+
     def _build_body_ids_tensor(self, body_names):
         char_id = self._get_char_id()
         body_ids = []
@@ -450,6 +489,14 @@ def compute_reward(root_pos):
     # type: (Tensor) -> Tensor
     r = torch.ones_like(root_pos[..., 0])
     return r
+
+@torch.jit.script
+def compute_impact_reduction_reward(curr_vel_z, prev_vel_z, vel_max):
+    # type: (Tensor, Tensor, float) -> Tensor
+    dv = curr_vel_z - prev_vel_z
+    dv_sq = torch.clamp_max(dv * dv, vel_max * vel_max)
+    reward = -torch.sum(dv_sq, dim=-1)
+    return reward
 
 @torch.jit.script
 def compute_done(done_buf, time, ep_len):

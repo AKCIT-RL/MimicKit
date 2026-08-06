@@ -5,3 +5,8 @@ __pycache__/
 output/
 .vscode/
 wandb/
+MimicKit_Data/
+MimicKit_Data.zip
+*.log
+nohup.out
+MUJOCO_LOG.TXT

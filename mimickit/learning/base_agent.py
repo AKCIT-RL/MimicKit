@@ -203,7 +203,7 @@ class BaseAgent(torch.nn.Module):
         elif (logger_type == "tb"):
             log = tb_logger.TBLogger()
         elif (logger_type == "wandb"):
-            log = wandb_logger.WandbLogger("mimickit", config)
+            log = wandb_logger.WandbLogger("MimicKit", config)
         else:
             assert(False), "Unsupported logger: {:s}".format(logger_type)
 

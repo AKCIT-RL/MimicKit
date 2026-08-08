@@ -1,0 +1,13 @@
+# Same exclusions as .gitignore -- none of this belongs in the build context.
+*.pyc
+.vs/
+__pycache__/
+.vscode/
+.git/
+wandb/
+output/
+MimicKit_Data/
+MimicKit_Data.zip
+*.log
+nohup.out
+MUJOCO_LOG.TXT

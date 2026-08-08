@@ -575,7 +575,83 @@ class IsaacLabEngine(engine.Engine):
         masses = obj.root_physx_view.get_masses()[env_id]
         total_mass = masses.sum().item()
         return total_mass
-    
+
+    def randomize_physics_material(self, obj_id, static_friction_range, dynamic_friction_range,
+                                    restitution_range, num_buckets=64, make_consistent=False):
+        """Domain randomization: assigns each shape of each env a physics material sampled
+        from a small bucket of random (static_friction, dynamic_friction, restitution)
+        triples. Ported from Isaac Lab's randomize_rigid_body_material event term (the
+        "randomize all shapes" branch, since MimicKit has no per-body indexing need here) --
+        MimicKit has no EventManager, so this is called directly once at env init instead of
+        being scheduled by one."""
+        obj = self._objs[obj_id]
+        num_envs = self.get_num_envs()
+
+        range_list = [static_friction_range, dynamic_friction_range, restitution_range]
+        ranges = torch.tensor(range_list, dtype=torch.float, device="cpu")
+        material_buckets = ranges[:, 0] + (ranges[:, 1] - ranges[:, 0]) * torch.rand([num_buckets, 3], device="cpu")
+
+        if (make_consistent):
+            material_buckets[:, 1] = torch.min(material_buckets[:, 0], material_buckets[:, 1])
+
+        total_num_shapes = obj.root_physx_view.max_shapes
+        env_ids = torch.arange(num_envs, device="cpu")
+        bucket_ids = torch.randint(0, num_buckets, (num_envs, total_num_shapes), device="cpu")
+        material_samples = material_buckets[bucket_ids]
+
+        materials = obj.root_physx_view.get_material_properties()
+        materials[env_ids] = material_samples
+        obj.root_physx_view.set_material_properties(materials, env_ids)
+        return
+
+    def randomize_body_com(self, obj_id, body_ids_common, com_range):
+        """Domain randomization: offsets the center of mass of the given bodies (common
+        body-id order) by a random per-env value sampled from com_range (dict with x/y/z
+        (min,max) tuples). Ported from Isaac Lab's randomize_rigid_body_com event term."""
+        obj = self._objs[obj_id]
+        num_envs = self.get_num_envs()
+
+        body_order_common2sim = self._body_order_common2sim[obj_id].cpu()
+        sim_body_ids = body_order_common2sim[body_ids_common.cpu()]
+
+        range_list = [com_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+        ranges = torch.tensor(range_list, dtype=torch.float, device="cpu")
+        rand_samples = ranges[:, 0] + (ranges[:, 1] - ranges[:, 0]) * torch.rand([num_envs, 3], device="cpu")
+        rand_samples = rand_samples.unsqueeze(1)
+
+        env_ids = torch.arange(num_envs, device="cpu")
+        coms = obj.root_physx_view.get_coms().clone()
+        coms[env_ids[:, None], sim_body_ids, :3] += rand_samples
+        obj.root_physx_view.set_coms(coms, env_ids)
+        return
+
+    def randomize_pd_gains(self, obj_id, gain_scale_range):
+        """Domain randomization: scales each (env, joint)'s Kp/Kd by an independent random
+        factor from gain_scale_range (e.g. (0.7, 1.3) for +-30%), simulating
+        controller-simulator gain mismatch. Same scale applied to stiffness and damping per
+        (env, joint) -- physically coherent, since both are jointly derived from the same
+        armature in the underlying natural-frequency formula.
+
+        Uses Articulation.write_joint_stiffness_to_sim/write_joint_damping_to_sim rather than
+        mutating obj.actuators["actuators"].stiffness/.damping directly: that tensor is the
+        ImplicitActuator's own cached copy, and per Isaac Lab issue #128 (noted in
+        articulation.py's write_joint_stiffness_to_sim), writing through the actuator object
+        does NOT reach PhysX for implicit actuators. write_joint_stiffness_to_sim does reach
+        it -- it calls root_physx_view.set_dof_stiffnesses(...) internally."""
+        obj = self._objs[obj_id]
+        num_envs = self.get_num_envs()
+
+        base_stiffness = obj.data.joint_stiffness.clone()
+        base_damping = obj.data.joint_damping.clone()
+        num_dofs = base_stiffness.shape[-1]
+
+        low, high = gain_scale_range
+        scale = (high - low) * torch.rand([num_envs, num_dofs], device=base_stiffness.device) + low
+
+        obj.write_joint_stiffness_to_sim(base_stiffness * scale)
+        obj.write_joint_damping_to_sim(base_damping * scale)
+        return
+
     def get_control_mode(self):
         return self._control_mode
     

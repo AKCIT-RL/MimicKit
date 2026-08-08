@@ -21,6 +21,7 @@ class TaskSteeringEnv(smp_env.SMPEnv):
         self._reward_steering_vel_scale = float(env_config["reward_steering_vel_scale"])
 
         self._reward_impact_w = float(env_config.get("reward_impact_w", 0.0))
+        self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", 0.0))
 
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
@@ -243,6 +244,9 @@ class TaskSteeringEnv(smp_env.SMPEnv):
 
         if (self._reward_impact_w != 0.0):
             self._reward_buf[:] += self._reward_impact_w * self._compute_impact_reduction_reward()
+
+        if (self._reward_action_rate_w != 0.0):
+            self._reward_buf[:] += self._reward_action_rate_w * self._compute_action_rate_reward()
         return
     
     def _update_misc(self):

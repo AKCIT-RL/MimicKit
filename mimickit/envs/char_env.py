@@ -114,7 +114,12 @@ class CharEnv(sim_env.SimEnv):
         
         self._action_bound_low = torch.tensor(self._action_space.low, device=self._device)
         self._action_bound_high = torch.tensor(self._action_space.high, device=self._device)
-        
+
+        num_envs = self.get_num_envs()
+        action_dim = self._action_bound_low.shape[-1]
+        self._last_action = torch.zeros([num_envs, action_dim], device=self._device)
+        self._prev_action = torch.zeros([num_envs, action_dim], device=self._device)
+
         key_bodies = env_config.get("key_bodies", [])
         self._key_body_ids = self._build_body_ids_tensor(key_bodies)
 
@@ -125,6 +130,51 @@ class CharEnv(sim_env.SimEnv):
         num_envs = self.get_num_envs()
         num_impact_bodies = len(impact_bodies)
         self._prev_impact_body_vel_z = torch.zeros([num_envs, num_impact_bodies], device=self._device, dtype=torch.float)
+
+        self._domain_rand_cfg = env_config.get("domain_rand", None)
+        if (self._domain_rand_cfg is not None and self._domain_rand_cfg.get("enabled", True)):
+            self._build_domain_rand(self._domain_rand_cfg)
+        return
+
+    def _build_domain_rand(self, domain_rand_cfg):
+        char_id = self._get_char_id()
+
+        pd_gain_scale_range = domain_rand_cfg.get("pd_gain_scale_range", None)
+        if (pd_gain_scale_range is not None):
+            self._engine.randomize_pd_gains(char_id, pd_gain_scale_range)
+
+        self._engine.randomize_physics_material(
+            char_id,
+            static_friction_range=domain_rand_cfg["friction_static_range"],
+            dynamic_friction_range=domain_rand_cfg["friction_dynamic_range"],
+            restitution_range=domain_rand_cfg["restitution_range"],
+            num_buckets=domain_rand_cfg.get("num_friction_buckets", 64))
+
+        com_bodies = domain_rand_cfg.get("com_bodies", [])
+        if (len(com_bodies) > 0):
+            com_body_ids = self._build_body_ids_tensor(com_bodies)
+            self._engine.randomize_body_com(char_id, com_body_ids, domain_rand_cfg["com_range"])
+
+        num_envs = self.get_num_envs()
+        push_interval_range = domain_rand_cfg["push_interval_range_s"]
+        self._push_vel_range = domain_rand_cfg["push_vel_range"]
+        self._push_timer = (push_interval_range[1] - push_interval_range[0]) * torch.rand(
+            [num_envs], device=self._device) + push_interval_range[0]
+        self._push_interval_range = push_interval_range
+
+        # Not a direct port of BeyondMimic's randomize_joint_default_pos (that one perturbs
+        # the action-decode offset, a concept that doesn't exist in MimicKit's absolute-target
+        # action space). Adapted equivalent: a fixed-per-env, per-joint bias added only to the
+        # dof_pos the POLICY perceives (_compute_obs), simulating joint encoder/calibration
+        # error, without touching the true physical dof_pos used for actions/reward/termination.
+        dof_pos_obs_noise_range = domain_rand_cfg.get("dof_pos_obs_noise_range", None)
+        if (dof_pos_obs_noise_range is not None):
+            num_dof = self._kin_char_model.get_dof_size()
+            noise_low, noise_high = dof_pos_obs_noise_range
+            self._dof_pos_obs_bias = (noise_high - noise_low) * torch.rand(
+                [num_envs, num_dof], device=self._device) + noise_low
+        else:
+            self._dof_pos_obs_bias = None
         return
     
     def _build_action_space(self):
@@ -278,6 +328,10 @@ class CharEnv(sim_env.SimEnv):
             dof_vel = dof_vel[env_ids]
             body_pos = body_pos[env_ids]
 
+        if (self._domain_rand_cfg is not None and self._dof_pos_obs_bias is not None):
+            dof_pos_bias = self._dof_pos_obs_bias if (env_ids is None) else self._dof_pos_obs_bias[env_ids]
+            dof_pos = dof_pos + dof_pos_bias
+
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
 
         if (self._has_key_bodies()):
@@ -334,6 +388,8 @@ class CharEnv(sim_env.SimEnv):
 
     def _apply_action(self, actions):
         char_id = self._get_char_id()
+        self._prev_action = self._last_action
+        self._last_action = actions.clone()
         clip_action = torch.minimum(torch.maximum(actions, self._action_bound_low), self._action_bound_high)
         self._engine.set_cmd(char_id, clip_action)
         return
@@ -343,10 +399,45 @@ class CharEnv(sim_env.SimEnv):
 
         if (self._has_impact_bodies()):
             self._record_impact_body_vel()
+
+        if (self._domain_rand_cfg is not None):
+            self._apply_domain_rand_push()
         return
 
     def _has_impact_bodies(self):
         return len(self._impact_body_ids) > 0
+
+    def _apply_domain_rand_push(self):
+        # Domain randomization: every push_interval_range_s seconds (per env, independently
+        # timed), kick the root velocity by a random amount -- ported from Isaac Lab's
+        # push_by_setting_velocity event term. set_root_vel/set_root_ang_vel only update the
+        # engine's cached root state and flag the obj for reset; the actual physics write
+        # happens automatically at the start of the next engine.step() via
+        # _update_reset_objs(), same mechanism already used for RSI.
+        self._push_timer -= self._engine.get_timestep()
+        push_env_ids = (self._push_timer <= 0.0).nonzero(as_tuple=False).flatten()
+
+        if (len(push_env_ids) > 0):
+            char_id = self._get_char_id()
+            num_push = len(push_env_ids)
+
+            lin_range = [self._push_vel_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z"]]
+            lin_range = torch.tensor(lin_range, device=self._device, dtype=torch.float)
+            lin_kick = lin_range[:, 0] + (lin_range[:, 1] - lin_range[:, 0]) * torch.rand([num_push, 3], device=self._device)
+
+            ang_range = [self._push_vel_range.get(k, (0.0, 0.0)) for k in ["roll", "pitch", "yaw"]]
+            ang_range = torch.tensor(ang_range, device=self._device, dtype=torch.float)
+            ang_kick = ang_range[:, 0] + (ang_range[:, 1] - ang_range[:, 0]) * torch.rand([num_push, 3], device=self._device)
+
+            root_vel = self._engine.get_root_vel(char_id)[push_env_ids]
+            root_ang_vel = self._engine.get_root_ang_vel(char_id)[push_env_ids]
+            self._engine.set_root_vel(push_env_ids, char_id, root_vel + lin_kick)
+            self._engine.set_root_ang_vel(push_env_ids, char_id, root_ang_vel + ang_kick)
+
+            interval_low, interval_high = self._push_interval_range
+            self._push_timer[push_env_ids] = (interval_high - interval_low) * torch.rand(
+                [num_push], device=self._device) + interval_low
+        return
 
     def _record_impact_body_vel(self):
         char_id = self._get_char_id()
@@ -367,6 +458,14 @@ class CharEnv(sim_env.SimEnv):
         curr_vel_z = body_vel[..., self._impact_body_ids, 2]
 
         reward = compute_impact_reduction_reward(curr_vel_z, self._prev_impact_body_vel_z, self._impact_vel_max)
+        return reward
+
+    def _compute_action_rate_reward(self):
+        # Penalizes tick-to-tick action change: -sum((a_t - a_{t-1})^2). Targets abrupt
+        # joint-target swings directly (unlike action_reg_weight in the PPO loss, which only
+        # regularizes the raw action magnitude, not its variation over time).
+        diff = self._last_action - self._prev_action
+        reward = -torch.sum(torch.square(diff), dim=-1)
         return reward
 
     def _build_body_ids_tensor(self, body_names):

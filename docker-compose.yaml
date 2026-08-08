@@ -1,0 +1,55 @@
+services:
+  mimickit:
+    build: .
+    image: mimickit:latest
+    container_name: mimickit
+    runtime: nvidia
+    environment:
+      # Shared server: pin to one GPU instead of exposing all of them to the container --
+      # avoids accidentally claiming/interfering with GPUs other tenants are using. Set this
+      # to the index of the GPU you actually want (check `nvidia-smi` on the OVX first).
+      - NVIDIA_VISIBLE_DEVICES=0
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    volumes:
+      # Isaac Sim caches -- avoid recompiling shaders/kit resources on every run.
+      - isaac-cache-kit:/isaac-sim/kit/cache
+      - isaac-cache-ov:/root/.cache/ov
+      - isaac-cache-pip:/root/.cache/pip
+      - isaac-cache-gl:/root/.cache/nvidia/GLCache
+      - isaac-cache-compute:/root/.nv/ComputeCache
+      - isaac-logs:/root/.nvidia-omniverse/logs
+      - isaac-data:/root/.local/share/ov/data
+      # MimicKit code/configs -- bind-mounted from the host repo so edits apply without a
+      # rebuild. data/assets/g1 and data/motions/g1 are intentionally NOT mounted here: they
+      # come baked into the image (see Dockerfile), so this list must not shadow that path.
+      - ./mimickit:/workspace/MimicKit/mimickit
+      - ./args:/workspace/MimicKit/args
+      - ./data/agents:/workspace/MimicKit/data/agents
+      - ./data/datasets:/workspace/MimicKit/data/datasets
+      - ./data/engines:/workspace/MimicKit/data/engines
+      - ./data/envs:/workspace/MimicKit/data/envs
+      - ./tools:/workspace/MimicKit/tools
+      - ./docs:/workspace/MimicKit/docs
+      # Training output -- persisted on host so checkpoints/logs survive container restarts.
+      - ./output:/workspace/MimicKit/output
+    network_mode: host
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  isaac-cache-kit:
+  isaac-cache-ov:
+  isaac-cache-pip:
+  isaac-cache-gl:
+  isaac-cache-compute:
+  isaac-logs:
+  isaac-data:

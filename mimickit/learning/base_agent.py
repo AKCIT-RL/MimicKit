@@ -3,6 +3,7 @@ import enum
 import gymnasium.spaces as spaces
 import numpy as np
 import os
+import signal
 import time
 import torch
 
@@ -66,7 +67,23 @@ class BaseAgent(torch.nn.Module):
         self._curr_obs, self._curr_info = self._reset_envs()
         self._init_train()
 
+        # Slurm (or any scheduler using --signal=B:SIGUSR1@<seconds>) sends this ahead of a
+        # preemption/time-limit kill. Only set a flag here -- Python signal handlers run
+        # between bytecode instructions on the main thread, so anything heavier (like the
+        # torch.save inside _output_train_model) belongs in the main loop, not the handler
+        # itself.
+        self._pending_shutdown_save = False
+        def _handle_sigusr1(signum, frame):
+            self._pending_shutdown_save = True
+            return
+        signal.signal(signal.SIGUSR1, _handle_sigusr1)
+
         while self._sample_count < max_samples:
+            if (self._pending_shutdown_save):
+                self._output_train_model(self._iter, out_model_file, int_out_dir)
+                Logger.print("SIGUSR1 received -- saved checkpoint at iter {:d}, exiting".format(self._iter))
+                break
+
             train_info = self._train_iter()
             
             self._sample_count = self._update_sample_count()

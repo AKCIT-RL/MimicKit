@@ -5,8 +5,12 @@ import engines.engine_builder as engine_builder
 
 from util.logger import Logger
 
-def build_env(env_file, engine_file, num_envs, device, visualize, record_video=False):
+def build_env(env_file, engine_file, num_envs, device, visualize, record_video=False,
+              env_overrides=None):
     env_config, engine_config = load_configs(env_file, engine_file)
+    if (env_overrides is not None):
+        env_config = env_config.copy()
+        env_config.update(env_overrides)
 
     env_name = env_config["env_name"]
     Logger.print("Building {} env".format(env_name))

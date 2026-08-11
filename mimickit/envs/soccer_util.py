@@ -9,6 +9,7 @@ components for the arch/inside-foot kick. No simulator dependencies.
 
 import numpy as np
 import torch
+from typing import Tuple
 
 import util.torch_util as torch_util
 
@@ -146,6 +147,25 @@ def compute_ball_out_flags(ball_pos, field_length, field_width, goal_pos, goal_d
     exempt = torch.logical_and(in_corridor, crossing_band)
 
     return torch.logical_and(oob, torch.logical_not(exempt))
+
+
+@torch.jit.script
+def apply_ball_event_dones(done, goal_scored, ball_oob, null_val, succ_val, fail_val):
+    # type: (Tensor, Tensor, Tensor, int, int, int) -> Tuple[Tensor, Tensor]
+    """Paper 4.1: goal and ball-out terminate the episode (bootstrap cut).
+
+    Dones already decided by the caller (fall, timeout) take precedence;
+    only NULL envs are updated. Returns (done, soft_mask); soft envs keep
+    the robot state on reset and only the ball is repositioned.
+    """
+    undecided = done == null_val
+    goal_done = torch.logical_and(goal_scored, undecided)
+    oob_done = torch.logical_and(ball_oob, undecided)
+    done = done.clone()
+    done[goal_done] = succ_val
+    done[oob_done] = fail_val
+    soft = torch.logical_or(goal_done, oob_done)
+    return done, soft
 
 
 @torch.jit.script

@@ -287,6 +287,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._task_reward_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._goal_scored_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_oob_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        # envs whose episode ended by a ball event (goal/out): the reset
+        # keeps the robot state and only repositions the ball (paper 4.1)
+        self._soft_done_buf = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._ball_perturb_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._char_push_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         # global control-step counter driving the steering anneal (samples
@@ -544,12 +547,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cache_task_reward(ball_pos, ball_vel, rolling)
         self._cache_aux_reward(ball_pos)
 
-        # 3. goal or out of bounds resets ONLY the ball; the robot and the
-        #    episode clock keep going (soft reset, per the paper)
-        soft_reset_mask = torch.logical_or(self._goal_scored_buf, self._ball_oob_buf)
-        soft_reset_ids = soft_reset_mask.nonzero(as_tuple=False).flatten()
-        if (len(soft_reset_ids) > 0):
-            self._reset_ball(soft_reset_ids, near=not self._ball_soft_reset_far)
+        # 3. goal / out of bounds terminate the episode (paper 4.1); the
+        #    flags become dones in _update_done and the reset keeps the
+        #    robot in place (see _reset_envs)
 
         # 4. random ball perturbations + robot pushes
         self._update_ball_perturb()
@@ -732,9 +732,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _update_done(self):
         super()._update_done()
-        # fall termination penalty joins the aux stream once dones are known
-        fail_mask = (self._done_buf == base_env.DoneFlags.FAIL.value)
-        self._aux_reward_buf += self._reward_termination_w * fail_mask.float()
+        # fall termination penalty joins the aux stream once dones are known;
+        # gated BEFORE ball events also become FAIL (out-of-bounds ends the
+        # episode but pays no fall penalty)
+        fall_mask = (self._done_buf == base_env.DoneFlags.FAIL.value)
+        self._aux_reward_buf += self._reward_termination_w * fall_mask.float()
+
+        done, soft = soccer_util.apply_ball_event_dones(
+            self._done_buf, self._goal_scored_buf, self._ball_oob_buf,
+            base_env.DoneFlags.NULL.value, base_env.DoneFlags.SUCC.value,
+            base_env.DoneFlags.FAIL.value)
+        self._done_buf[:] = done
+        self._soft_done_buf[:] = soft
         return
 
     def _update_info(self, env_ids=None):
@@ -825,6 +834,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     def _reset_envs(self, env_ids):
+        if (len(env_ids) > 0):
+            # ball-event dones keep the robot: split them off the full path
+            soft_mask = self._soft_done_buf[env_ids]
+            soft_ids = env_ids[soft_mask]
+            env_ids = env_ids[~soft_mask]
+            self._soft_done_buf[soft_ids] = False
+            if (len(soft_ids) > 0):
+                self._soft_reset_envs(soft_ids)
+
         super()._reset_envs(env_ids)
 
         if (len(env_ids) > 0):
@@ -857,6 +875,102 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
             self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
             self._resample_char_push_times(env_ids)
+        return
+
+    def reset_to_spatial_benchmark(self, env_ids, ball_local_xy):
+        """Reset trials to a fixed center pose and caller-provided ball cells."""
+        if (env_ids.ndim != 1 or ball_local_xy.shape != (len(env_ids), 2)):
+            raise ValueError("expected env_ids [N] and ball_local_xy [N, 2]")
+
+        half_x = 0.5 * self._field_length
+        half_y = 0.5 * self._field_width
+        if (torch.any(torch.abs(ball_local_xy[:, 0]) >= half_x)
+                or torch.any(torch.abs(ball_local_xy[:, 1]) >= half_y)):
+            raise ValueError("benchmark ball positions must be strictly inside the field")
+
+        # Goal/OOB normally use a soft reset. Every benchmark trial instead
+        # starts from the same complete robot state.
+        self._soft_done_buf[env_ids] = False
+        self._reset_envs(env_ids)
+
+        n = len(env_ids)
+        char_id = self._get_char_id()
+        root_pos = self._init_root_pos.unsqueeze(0).repeat(n, 1)
+        root_pos[:, 0:2] = self._field_offset[env_ids]
+        root_pos[:, 2] += self._ground_z_offset
+        root_rot = self._init_root_rot.unsqueeze(0).repeat(n, 1)
+        dof_pos = self._init_dof_pos.unsqueeze(0).repeat(n, 1)
+        zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        self._engine.set_root_pos(env_ids, char_id, root_pos)
+        self._engine.set_root_rot(env_ids, char_id, root_rot)
+        self._engine.set_root_vel(env_ids, char_id, zero_vel)
+        self._engine.set_root_ang_vel(env_ids, char_id, zero_vel)
+        self._engine.set_dof_pos(env_ids, char_id, dof_pos)
+        self._engine.set_dof_vel(env_ids, char_id, 0.0)
+        self._engine.set_body_vel(env_ids, char_id, 0.0)
+        self._engine.set_body_ang_vel(env_ids, char_id, 0.0)
+        self._reset_char_rigid_body_state(env_ids)
+
+        ball_id = self._get_ball_id()
+        ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        ball_pos[:, 0:2] = ball_local_xy + self._field_offset[env_ids]
+        ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
+        ball_rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
+        ball_rot[:, 3] = 1.0
+        self._engine.set_root_pos(env_ids, ball_id, ball_pos)
+        self._engine.set_root_rot(env_ids, ball_id, ball_rot)
+        self._engine.set_root_vel(env_ids, ball_id, zero_vel)
+        self._engine.set_root_ang_vel(env_ids, ball_id, zero_vel)
+
+        self._prev_ball_pos[env_ids] = ball_pos
+        self._ball_moving_time[env_ids] = 0.0
+        self._ball_still_time[env_ids] = 0.0
+        if (self._virtual_perception):
+            self._reset_perception(env_ids)
+        if (self._task_hist_steps > 0):
+            self._task_hist_buf[env_ids] = self._compute_task_block(env_ids).unsqueeze(1)
+            if (self._virtual_perception):
+                self._critic_task_hist_buf[env_ids] = \
+                    self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
+        self._record_reset_prev_states(env_ids)
+        self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
+        self._stagnation_anchor_pos[env_ids] = root_pos
+        self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
+        self._ball_perturb_times[env_ids] = 1.0e9
+        self._char_push_times[env_ids] = 1.0e9
+
+        self._update_observations(env_ids)
+        self._update_info(env_ids)
+        return self._obs_buf, self._info
+
+    def _soft_reset_envs(self, env_ids):
+        """New episode after a goal / ball-out done (paper 4.1): the robot
+        keeps its physical state, only the ball is repositioned and the
+        episode clock and reward state restart."""
+        # zero the clock FIRST: every resampled event time is time_buf-based.
+        # _time_buf is recomputed from _timestep_buf each step, so both must
+        # be cleared (mirrors sim_env._reset_envs without touching the char)
+        self._timestep_buf[env_ids] = 0
+        self._time_buf[env_ids] = 0.0
+        self._done_buf[env_ids] = base_env.DoneFlags.NULL.value
+        self._reset_ball(env_ids, near=not self._ball_soft_reset_far)
+        if (self._virtual_perception):
+            self._reset_perception(env_ids)
+        if (self._task_hist_steps > 0):
+            self._task_hist_buf[env_ids] = self._compute_task_block(env_ids).unsqueeze(1)
+            if (self._virtual_perception):
+                self._critic_task_hist_buf[env_ids] = \
+                    self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
+        self._record_reset_prev_states(env_ids)
+        self._task_reward_buf[env_ids] = 0.0
+        self._goal_scored_buf[env_ids] = False
+        self._ball_oob_buf[env_ids] = False
+        self._aux_reward_buf[env_ids] = 0.0
+        char_id = self._get_char_id()
+        self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
+        self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
+        self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
+        self._resample_char_push_times(env_ids)
         return
 
     def _reset_char_placement(self, env_ids):

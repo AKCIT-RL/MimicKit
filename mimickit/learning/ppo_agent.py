@@ -4,6 +4,7 @@ import torch
 import envs.base_env as base_env
 import learning.adaptive_lr_util as adaptive_lr_util
 import learning.base_agent as base_agent
+import learning.mirror_util as mirror_util
 import learning.mp_optimizer as mp_optimizer
 import learning.ppo_model as ppo_model
 import learning.rl_util as rl_util
@@ -45,7 +46,74 @@ class PPOAgent(base_agent.BaseAgent):
         self._lr_max = float(config.get("lr_max", 1e-2))
         self._lr_adapt_factor = float(config.get("lr_adapt_factor", 1.5))
         self._adapt_critic_lr = bool(config.get("adapt_critic_lr", True))
+
+        # Mirror symmetry loss (arXiv:2511.03996 Table 1). Weight 0 keeps every
+        # existing config bit-identical; log_sym_residual measures the asymmetry
+        # without penalising it, which is how a baseline number is obtained.
+        self._mirror_sym_weight = float(config.get("mirror_sym_weight", 0.0))
+        self._log_sym_residual = bool(config.get("log_sym_residual", False))
+        self._mirror_ops = None
         return
+
+    def _get_mirror_ops(self):
+        """(obs_perm, obs_signs, act_perm, act_signs), built once from the env.
+
+        Built lazily because it needs both the environment's kinematic model and
+        this agent's action normalizer, which are ready only after __init__.
+        Everything is read from the live env: deriving the layout from a copy of
+        the config instead would let the two drift apart silently.
+        """
+        if (self._mirror_ops is not None):
+            return self._mirror_ops
+
+        env = self._env
+        char_model = env._kin_char_model
+        key_body_ids = getattr(env, "_key_body_ids", [])
+        key_body_names = [char_model.get_body_name(int(i)) for i in key_body_ids]
+
+        obs_perm, obs_signs = mirror_util.build_obs_mirror(
+            task_key=type(env).__name__,
+            char_model=char_model,
+            key_body_names=key_body_names,
+            root_height_obs=env._root_height_obs,
+            obs_size=int(np.prod(env.get_obs_space().shape)))
+        act_perm, act_signs = mirror_util.build_dof_mirror(char_model)
+
+        assert(mirror_util.check_involution(obs_perm, obs_signs)), \
+            "observation mirror is not an involution"
+        assert(mirror_util.check_involution(act_perm, act_signs)), \
+            "action mirror is not an involution"
+
+        # The loss mirrors actions in NORMALIZED space, which is only the same
+        # map as mirroring raw actions when the normalizer commutes with it.
+        ok, mean_err, std_err = mirror_util.check_normalizer_equivariance(
+            self._a_norm.get_mean(), self._a_norm.get_std(), act_perm, act_signs)
+        assert(ok), ("action normalizer does not commute with the mirror "
+                     "(mean err {:.3e}, std err {:.3e}); the asset's joint limits are "
+                     "not exact mirror images".format(mean_err, std_err))
+
+        device = self._device
+        self._mirror_ops = (mirror_util.to_tensors(obs_perm, obs_signs, device) +
+                            mirror_util.to_tensors(act_perm, act_signs, device))
+        return self._mirror_ops
+
+    def _compute_sym_residual(self, raw_obs, a_dist):
+        """Mean squared distance between the policy and its own mirror.
+
+        The observation is mirrored BEFORE normalization: the observation
+        normalizer tracks running statistics of an asymmetric policy, so it does
+        not commute with the mirror. The action side does commute (checked in
+        _get_mirror_ops), so actions are mirrored in normalized space directly.
+        """
+        obs_perm, obs_signs, act_perm, act_signs = self._get_mirror_ops()
+
+        mirror_obs = mirror_util.mirror(raw_obs, obs_perm, obs_signs)
+        norm_mirror_obs = self._obs_norm.normalize(mirror_obs)
+        mirror_dist = self._model.eval_actor(norm_mirror_obs)
+
+        mirror_a = mirror_util.mirror(mirror_dist.mode, act_perm, act_signs)
+        diff = a_dist.mode - mirror_a
+        return torch.mean(torch.sum(torch.square(diff), dim=-1))
 
     def _build_model(self, config):
         model_config = config["model"]
@@ -328,7 +396,17 @@ class PPOAgent(base_agent.BaseAgent):
             action_reg_loss = torch.mean(action_reg_loss)
             actor_loss += self._action_reg_weight * action_reg_loss
             info["action_reg_loss"] = action_reg_loss.detach()
-        
+
+        if (self._mirror_sym_weight != 0 or self._log_sym_residual):
+            # same masked subset as the loss above, so the regularizer does not
+            # change the effective batch
+            raw_obs = batch["obs"][rand_action_mask]
+            sym_residual = self._compute_sym_residual(raw_obs, a_dist)
+            info["sym_residual"] = sym_residual.detach()
+
+            if (self._mirror_sym_weight != 0):
+                actor_loss += self._mirror_sym_weight * sym_residual
+
         return info
 
     def _log_train_info(self, train_info, test_info, env_diag_info, start_time):

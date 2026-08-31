@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 import envs.base_env as base_env
+import learning.adaptive_lr_util as adaptive_lr_util
 import learning.base_agent as base_agent
 import learning.mp_optimizer as mp_optimizer
 import learning.ppo_model as ppo_model
@@ -35,6 +36,15 @@ class PPOAgent(base_agent.BaseAgent):
         self._exp_anneal_samples = config.get("exp_anneal_samples", np.inf)
         self._exp_prob_beg = config.get("exp_prob_beg", 1.0)
         self._exp_prob_end = config.get("exp_prob_end", 1.0)
+
+        # KL-adaptive learning rate (arXiv:2511.03996 Table 1, rsl_rl convention).
+        # desired_kl None keeps the fixed-lr behaviour of every existing config.
+        desired_kl = config.get("desired_kl", None)
+        self._desired_kl = None if (desired_kl is None) else float(desired_kl)
+        self._lr_min = float(config.get("lr_min", 1e-5))
+        self._lr_max = float(config.get("lr_max", 1e-2))
+        self._lr_adapt_factor = float(config.get("lr_adapt_factor", 1.5))
+        self._adapt_critic_lr = bool(config.get("adapt_critic_lr", True))
         return
 
     def _build_model(self, config):
@@ -212,10 +222,41 @@ class PPOAgent(base_agent.BaseAgent):
 
             self._actor_optimizer.step(loss)
 
+            # ASEAgent reimplements _compute_actor_loss instead of extending it,
+            # so it reports no KL. Absent key => fixed lr, which is what every
+            # config without desired_kl expects anyway.
+            approx_kl = loss_info.get("approx_kl", None)
+            self._update_lr(approx_kl)
+
+            loss_info["actor_lr"] = torch.tensor(self._actor_optimizer.get_lr(), device=self._device)
             torch_util.add_torch_dict(loss_info, info)
-        
+
         torch_util.scale_torch_dict(1.0 / num_steps, info)
+
+        # after the scaling, so this stays the lr the next iteration starts from
+        # rather than the mean over the minibatches
+        info["actor_lr_final"] = torch.tensor(self._actor_optimizer.get_lr(), device=self._device)
         return info
+
+    def _update_lr(self, kl):
+        if (self._desired_kl is None):
+            return
+
+        assert(kl is not None), \
+            "desired_kl is set but {} does not report approx_kl from _compute_actor_loss".format(
+                type(self).__name__)
+
+        lr = adaptive_lr_util.adapt_lr(self._actor_optimizer.get_lr(), kl.item(), self._desired_kl,
+                                       lr_min=self._lr_min, lr_max=self._lr_max,
+                                       factor=self._lr_adapt_factor)
+        self._actor_optimizer.set_lr(lr)
+
+        # rsl_rl drives one optimizer for actor+critic; here they are separate,
+        # so the critic mirrors the actor lr. The disc optimizer is left alone:
+        # its dynamics are not governed by the policy KL.
+        if (self._adapt_critic_lr):
+            self._critic_optimizer.set_lr(lr)
+        return
     
     def _compute_critic_loss(self, batch):
         norm_obs = self._obs_norm.normalize(batch["obs"])
@@ -258,10 +299,15 @@ class PPOAgent(base_agent.BaseAgent):
         clip_frac = torch.mean(clip_frac)
         imp_ratio = torch.mean(a_ratio)
         
+        # computed on the same masked subset as the loss, so the lr controller
+        # reacts to the samples that actually produced the gradient
+        approx_kl = adaptive_lr_util.compute_approx_kl(a_logp, old_a_logp)
+
         info = {
             "actor_loss": actor_loss,
             "clip_frac": clip_frac.detach(),
-            "imp_ratio": imp_ratio.detach()
+            "imp_ratio": imp_ratio.detach(),
+            "approx_kl": approx_kl.detach()
         }
 
         if (self._action_bound_weight != 0):

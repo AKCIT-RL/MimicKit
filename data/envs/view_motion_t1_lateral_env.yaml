@@ -1,0 +1,12 @@
+env_name: "view_motion"
+
+char_file: "data/assets/booster_t1/t1.xml"
+camera_mode: "track"
+
+episode_length: 19.0
+global_obs: false
+root_height_obs: true
+
+key_bodies: ["left_foot_link", "right_foot_link", "H2", "left_hand_link", "right_hand_link"]
+
+motion_file: "data/motions/booster_t1/caminhada-lateral.pkl"

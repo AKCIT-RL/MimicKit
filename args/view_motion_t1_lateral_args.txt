@@ -1,7 +1,0 @@
---mode test
---num_envs 1
-
---engine_config data/engines/isaac_gym_engine.yaml
---env_config data/envs/view_motion_t1_lateral_env.yaml
-
---out_dir output/t1_lateral_view/

@@ -81,12 +81,14 @@ class CharEnv(sim_env.SimEnv):
     
     def _build_character(self, env_id, env_config, color=None):
         char_file = env_config["char_file"]
+        enable_self_collisions = env_config.get("enable_self_collisions", True)
         char_id = self._engine.create_obj(env_id=env_id, 
                                           obj_type=engine.ObjType.articulated,
                                           asset_file=char_file, 
                                           name="character",
                                           start_pos=self._init_root_pos.cpu().numpy(),
                                           start_rot=self._init_root_rot.cpu().numpy(),
+                                          enable_self_collisions=enable_self_collisions,
                                           color=color)
         return char_id
     

@@ -84,8 +84,12 @@ class IsaacGymEngine(engine.Engine):
         if ((self._position_stiffness is None) != (self._position_damping is None)):
             raise ValueError("position_stiffness and position_damping must be configured together")
         if (self._position_stiffness is not None):
-            if (self._position_stiffness <= 0 or self._position_damping <= 0):
+            self._position_stiffness = np.asarray(self._position_stiffness, dtype=np.float32)
+            self._position_damping = np.asarray(self._position_damping, dtype=np.float32)
+            if (np.any(self._position_stiffness <= 0) or np.any(self._position_damping <= 0)):
                 raise ValueError("Position stiffness and damping overrides must be positive")
+            if self._position_stiffness.shape != self._position_damping.shape:
+                raise ValueError("Position stiffness and damping overrides must have matching shapes")
 
         self._obj_kp = [[] for i in range(num_envs)]
         self._obj_kd = [[] for i in range(num_envs)]
@@ -188,6 +192,12 @@ class IsaacGymEngine(engine.Engine):
 
         dof_props = self._gym.get_actor_dof_properties(env_ptr, obj_id)
         if (control_mode == engine.ControlMode.pos and self._position_stiffness is not None):
+            if self._position_stiffness.ndim > 0 and self._position_stiffness.shape != dof_props["stiffness"].shape:
+                raise ValueError(
+                    "PD override shape {} does not match asset DOFs {}".format(
+                        self._position_stiffness.shape, dof_props["stiffness"].shape
+                    )
+                )
             dof_props["stiffness"][:] = self._position_stiffness
             dof_props["damping"][:] = self._position_damping
 

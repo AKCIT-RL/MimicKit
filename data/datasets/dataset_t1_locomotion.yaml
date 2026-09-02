@@ -1,0 +1,8 @@
+# Booster T1 locomotion, retargeted from ACCAD mocap with GMR.
+# Source: accad_bvh/Male2_B3_Walk.bvh, accad_bvh/Male2_C3_Run.bvh
+# Weights mirror dataset_g1_locomotion.yaml so the T1 baseline is comparable.
+motions:
+  - file: "data/motions/t1/t1_walk.pkl"
+    weight: 2.0
+  - file: "data/motions/t1/t1_run.pkl"
+    weight: 1.0

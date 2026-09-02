@@ -5,8 +5,12 @@ import engines.engine_builder as engine_builder
 
 from util.logger import Logger
 
-def build_env(env_file, engine_file, num_envs, device, visualize, record_video=False):
+def build_env(env_file, engine_file, num_envs, device, visualize, record_video=False,
+              env_overrides=None):
     env_config, engine_config = load_configs(env_file, engine_file)
+    if (env_overrides is not None):
+        env_config = env_config.copy()
+        env_config.update(env_overrides)
 
     env_name = env_config["env_name"]
     Logger.print("Building {} env".format(env_name))
@@ -44,6 +48,9 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
     elif (env_name == "task_dodgeball"):
         import envs.task_dodgeball_env as task_dodgeball_env
         env = task_dodgeball_env.TaskDodgeballEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+    elif (env_name == "task_soccer"):
+        import envs.task_soccer_env as task_soccer_env
+        env = task_soccer_env.TaskSoccerEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
     elif (env_name == "static_objects"):
         import envs.static_objects_env as static_objects_env
         env = static_objects_env.StaticObjectsEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)

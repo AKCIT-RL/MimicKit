@@ -164,6 +164,12 @@ class Logger:
             val = entry.val
         return val
 
+    def log_model(self, filename):
+        return
+
+    def finish(self):
+        return
+
     def _build_str_template(self):
         template = ""
         for key in self.log_headers:

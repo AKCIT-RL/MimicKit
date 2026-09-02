@@ -1,0 +1,10 @@
+# v2: paper proportions (arXiv:2511.03996 §4.2 — 76.28 s walking + 30 s
+# kicking, no running clips): ~72% walk / ~28% kick, split evenly between
+# the CMU kick and its mirror.
+motions:
+  - file: "data/motions/g1/g1_walk.pkl"
+    weight: 0.72
+  - file: "data/motions/g1/g1_kick_cmu.pkl"
+    weight: 0.14
+  - file: "data/motions/g1/g1_kick_cmu_mirror.pkl"
+    weight: 0.14

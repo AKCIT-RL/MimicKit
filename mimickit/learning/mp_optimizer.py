@@ -90,3 +90,11 @@ class MPOptimizer():
     def _clip_grads(self, max_norm):
         torch.nn.utils.clip_grad_norm_(self._param_list, max_norm)
         return
+
+    def get_lr(self):
+        return self._optimizer.param_groups[0]["lr"]
+
+    def set_lr(self, lr):
+        for group in self._optimizer.param_groups:
+            group["lr"] = lr
+        return

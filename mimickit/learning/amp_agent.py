@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 import learning.amp_model as amp_model
+import learning.base_agent as base_agent
 import learning.experience_buffer as experience_buffer
 import learning.mp_optimizer as mp_optimizer
 import learning.normalizer as normalizer
@@ -72,6 +73,18 @@ class AMPAgent(ppo_agent.PPOAgent):
         if (self._need_normalizer_update()):
             self._disc_obs_norm.record(disc_obs)
         return
+
+    def _step_env(self, action):
+        obs, task_r, done, info = super()._step_env(action)
+
+        if (self._mode == base_agent.AgentMode.TEST):
+            norm_disc_obs = self._disc_obs_norm.normalize(info["disc_obs"])
+            disc_r = self._calc_disc_rewards(norm_disc_obs)
+            r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
+        else:
+            r = task_r
+
+        return obs, r, done, info
     
     def _update_normalizers(self):
         super()._update_normalizers()
@@ -94,7 +107,8 @@ class AMPAgent(ppo_agent.PPOAgent):
 
         disc_obs_demo = self._env.fetch_disc_obs_demo(n)
         self._exp_buffer.set_data_flat("disc_obs_demo", disc_obs_demo)
-        self._disc_obs_norm.record(disc_obs_demo)
+        if (self._need_normalizer_update()):
+            self._disc_obs_norm.record(disc_obs_demo)
         return
 
     def _store_disc_replay_data(self):

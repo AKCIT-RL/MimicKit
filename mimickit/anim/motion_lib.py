@@ -37,6 +37,12 @@ class MotionLib():
         motion_len = self._motion_lengths[motion_ids]
         if (truncate_time is not None):
             assert(truncate_time >= 0.0)
+            if (torch.any(motion_len < truncate_time)):
+                min_len = torch.min(motion_len).item()
+                raise ValueError(
+                    f"Cannot truncate motion sampling by {truncate_time:.3f}s: "
+                    f"shortest sampled motion is {min_len:.3f}s."
+                )
             motion_len -= truncate_time
 
         motion_time = phase * motion_len

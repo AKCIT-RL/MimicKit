@@ -1,0 +1,12 @@
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_uneven.yaml
+--env_config data/envs/mcwamp_g1_soccer_env_s5.yaml
+--agent_config data/agents/mcwamp_g1_soccer_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 30000000
+--model_file output/soccer_kick_warmstart/model_init.pt
+--out_dir output/mcwamp_g1_soccer_kick_s5_30m_seed1/

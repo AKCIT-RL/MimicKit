@@ -27,9 +27,23 @@ class WandbLogger(logger.Logger):
         super().configure_output_file(filename)
 
         if (logger.Logger.is_root()):
-            basename = os.path.basename(filename)
-            exp_name = os.path.splitext(basename)[0]
-            wandb.init(project=self._project_name, name=exp_name, config=self._param_config)
+            out_dir = os.path.dirname(os.path.abspath(filename))
+            exp_name = os.environ.get("WANDB_NAME", os.path.basename(out_dir))
+            project_name = os.environ.get("WANDB_PROJECT", self._project_name)
+            entity = os.environ.get("WANDB_ENTITY")
+            group = os.environ.get("WANDB_GROUP")
+            mode = os.environ.get("WANDB_MODE")
+            tags = [tag.strip() for tag in os.environ.get("WANDB_TAGS", "").split(",") if tag.strip()]
+            wandb.init(project=project_name,
+                       entity=entity,
+                       name=exp_name,
+                       group=group,
+                       tags=tags,
+                       mode=mode,
+                       dir=out_dir,
+                       config=self._param_config)
+            wandb.define_metric("1_Info/Samples")
+            wandb.define_metric("*", step_metric="1_Info/Samples")
         
         return
 
@@ -53,17 +67,16 @@ class WandbLogger(logger.Logger):
             out_videos = dict()
 
             for i, key in enumerate(self.log_headers):
-                if (key != self._step_key):
-                    entry = self.log_current_row.get(key, "")
-                    val = entry.val
-                    tag = self._key_tags[i]
-                    
-                    if (isinstance(val, video.Video)):
-                        out_videos[tag] = val
-                    elif (isinstance(entry.val, numbers.Number)):
-                        out_dict[tag] = val
-                    else:
-                        assert(False), "Unsupported WandB value type: {}".format(type(val))
+                entry = self.log_current_row.get(key, "")
+                val = entry.val
+                tag = self._key_tags[i]
+                
+                if (isinstance(val, video.Video)):
+                    out_videos[tag] = val
+                elif (isinstance(entry.val, numbers.Number)):
+                    out_dict[tag] = val
+                else:
+                    assert(False), "Unsupported WandB value type: {}".format(type(val))
 
             step_val = self._get_step_val()
             wandb.log(out_dict, step=int(step_val))
@@ -110,4 +123,16 @@ class WandbLogger(logger.Logger):
                 video.save(tmp.name)
                 vid_name = os.path.basename(key)
                 wandb.log({vid_name: wandb.Video(tmp.name, format="mp4")}, step=step_val)
+        return
+
+    def log_model(self, filename):
+        if (logger.Logger.is_root() and wandb.run is not None and os.path.isfile(filename)):
+            artifact = wandb.Artifact(name="{}-model".format(wandb.run.id), type="model")
+            artifact.add_file(filename, name="model.pt")
+            wandb.log_artifact(artifact, aliases=["final"])
+        return
+
+    def finish(self):
+        if (logger.Logger.is_root() and wandb.run is not None):
+            wandb.finish()
         return

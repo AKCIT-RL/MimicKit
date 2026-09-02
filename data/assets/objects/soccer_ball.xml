@@ -1,0 +1,9 @@
+<mujoco model="soccer_ball">
+	<compiler angle="radian"/>
+	<worldbody>
+		<body name="ball" pos="0 0 0">
+		<freejoint name="root"/>
+			<geom name="ball" type="sphere" size="0.11" density="80.0" friction="0.8 0.02 0.002"/>
+		</body>
+	</worldbody>
+</mujoco>

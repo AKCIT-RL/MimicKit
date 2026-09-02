@@ -1,0 +1,11 @@
+# v3: kick upweighted vs paper (v2 was 72/28 like §4.2). With only 5.2 s of
+# total demo data the disc treats kick poses as off-manifold and suppresses
+# kicking late in training (style kick coverage <1% at 100M in s4-s6);
+# 50/50 walk/kick keeps kick frames demo-like in every disc batch.
+motions:
+  - file: "data/motions/g1/g1_walk.pkl"
+    weight: 0.50
+  - file: "data/motions/g1/g1_kick_cmu.pkl"
+    weight: 0.25
+  - file: "data/motions/g1/g1_kick_cmu_mirror.pkl"
+    weight: 0.25

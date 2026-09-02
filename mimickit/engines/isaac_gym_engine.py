@@ -11,6 +11,7 @@ import time
 import engines.engine as engine
 import engines.isaac_gym_recorder as isaac_gym_recorder
 from util.logger import Logger
+import util.terrain_util as terrain_util
 import util.torch_util as torch_util
 
 def str_to_key_code(key_str):
@@ -68,6 +69,7 @@ class IsaacGymEngine(engine.Engine):
         self._sim = self._create_simulator(sim_timestep, visualize, record_video)
 
         self._ground_contact_height = config.get("ground_contact_height", 0.3)
+        self._ground_config = config.get("ground", None)
         self._env_spacing = config["env_spacing"]
         self._envs = []
         self._obj_types = []
@@ -76,6 +78,14 @@ class IsaacGymEngine(engine.Engine):
             self._control_mode = engine.ControlMode[config["control_mode"]]
         else:
             self._control_mode = engine.ControlMode.none
+
+        self._position_stiffness = config.get("position_stiffness", None)
+        self._position_damping = config.get("position_damping", None)
+        if ((self._position_stiffness is None) != (self._position_damping is None)):
+            raise ValueError("position_stiffness and position_damping must be configured together")
+        if (self._position_stiffness is not None):
+            if (self._position_stiffness <= 0 or self._position_damping <= 0):
+                raise ValueError("Position stiffness and damping overrides must be positive")
 
         self._obj_kp = [[] for i in range(num_envs)]
         self._obj_kd = [[] for i in range(num_envs)]
@@ -177,6 +187,10 @@ class IsaacGymEngine(engine.Engine):
             control_mode = self.get_control_mode()
 
         dof_props = self._gym.get_actor_dof_properties(env_ptr, obj_id)
+        if (control_mode == engine.ControlMode.pos and self._position_stiffness is not None):
+            dof_props["stiffness"][:] = self._position_stiffness
+            dof_props["damping"][:] = self._position_damping
+
         kp = dof_props["stiffness"]
         kd = dof_props["damping"]
         
@@ -546,15 +560,97 @@ class IsaacGymEngine(engine.Engine):
         return asset
     
     def _build_ground(self):
+        config = self._ground_config if (self._ground_config is not None) else dict()
+        ground_type = config.get("type", "plane")
+        static_friction = float(config.get("static_friction", 1.0))
+        dynamic_friction = float(config.get("dynamic_friction", 1.0))
+        restitution = float(config.get("restitution", 0.0))
+
+        if (ground_type == "plane"):
+            plane_params = gymapi.PlaneParams()
+            plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
+            plane_params.static_friction = static_friction
+            plane_params.dynamic_friction = dynamic_friction
+            plane_params.restitution = restitution
+            self._gym.add_ground(self._sim, plane_params)
+        elif (ground_type == "uneven"):
+            self._build_uneven_ground(config, static_friction, dynamic_friction, restitution)
+        else:
+            raise ValueError("Unsupported ground type: {}".format(ground_type))
+        return
+
+    def _build_uneven_ground(self, config, static_friction, dynamic_friction, restitution):
+        tile_centers = config.get("tile_centers", None)
+        tile_size = config.get("tile_size", None)
+        assert (tile_centers is not None and tile_size is not None), \
+            "ground.tile_centers [N, 2] and ground.tile_size [2] (m) are required for " \
+            "uneven ground; the soccer env injects them from its field grid"
+        horizontal_scale = float(config.get("horizontal_scale", 0.5))
+        amplitude = float(config.get("random_height", 0.02))
+
+        # safety-net plane just below the deepest dip so nothing falls into
+        # the void outside the tiled region
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.static_friction = 1.0
-        plane_params.dynamic_friction = 1.0
-        plane_params.restitution = 0.0
-
+        plane_params.distance = amplitude  # plane at z = -amplitude
+        plane_params.static_friction = static_friction
+        plane_params.dynamic_friction = dynamic_friction
+        plane_params.restitution = restitution
         self._gym.add_ground(self._sim, plane_params)
+
+        # one small bumpy tile per env (border ring flattened to z = 0 so
+        # seams are continuous); per-tile meshes keep the broadphase pair
+        # count local instead of pairing one world-sized mesh with everything
+        total_tris = 0
+        for tile_center in tile_centers:
+            heights = terrain_util.build_uneven_tile(float(tile_size[0]), float(tile_size[1]),
+                                                     horizontal_scale, amplitude)
+            nx, ny = heights.shape
+            x_offset = float(tile_center[0]) - 0.5 * (nx - 1) * horizontal_scale
+            y_offset = float(tile_center[1]) - 0.5 * (ny - 1) * horizontal_scale
+            verts, tris = terrain_util.heightfield_to_trimesh(heights, horizontal_scale,
+                                                              x_offset=x_offset,
+                                                              y_offset=y_offset)
+            tm_params = gymapi.TriangleMeshParams()
+            tm_params.nb_vertices = verts.shape[0]
+            tm_params.nb_triangles = tris.shape[0]
+            tm_params.static_friction = static_friction
+            tm_params.dynamic_friction = dynamic_friction
+            tm_params.restitution = restitution
+            self._gym.add_triangle_mesh(self._sim, verts.flatten(), tris.flatten(), tm_params)
+            total_tris += tris.shape[0]
+
+        Logger.print("Built uneven ground: {:d} tiles of {:.0f}x{:.0f} m, +-{:.3f} m bumps, "
+                     "{:d} triangles total".format(len(tile_centers), float(tile_size[0]),
+                                                   float(tile_size[1]), amplitude, total_tris))
         return
-    
+
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None):
+        env_ptr = self.get_env(env_id)
+        props = self._gym.get_actor_rigid_shape_properties(env_ptr, obj_id)
+        for p in props:
+            if (friction is not None):
+                p.friction = float(friction)
+            if (restitution is not None):
+                p.restitution = float(restitution)
+        self._gym.set_actor_rigid_shape_properties(env_ptr, obj_id, props)
+        return
+
+    def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
+        env_ptr = self.get_env(env_id)
+        props = self._gym.get_actor_rigid_body_properties(env_ptr, obj_id)
+        assert (len(props) == len(mass_scales)), \
+            "mass_scales has {:d} entries but obj {:d} has {:d} bodies".format(
+                len(mass_scales), obj_id, len(props))
+        for i in range(len(props)):
+            props[i].mass *= float(mass_scales[i])
+            if (com_offsets is not None):
+                props[i].com.x += float(com_offsets[i][0])
+                props[i].com.y += float(com_offsets[i][1])
+                props[i].com.z += float(com_offsets[i][2])
+        self._gym.set_actor_rigid_body_properties(env_ptr, obj_id, props, True)
+        return
+
     def _create_simulator(self, sim_timestep, visualize, record_video):
         physics_engine = gymapi.SimType.SIM_PHYSX
         sim_params = self._build_sim_params(sim_timestep)

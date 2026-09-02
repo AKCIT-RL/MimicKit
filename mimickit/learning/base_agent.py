@@ -88,6 +88,9 @@ class BaseAgent(torch.nn.Module):
             
             self._iter += 1
 
+        self._logger.log_model(out_model_file)
+        self._logger.finish()
+
         return
 
     def test_model(self, num_episodes):

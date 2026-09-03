@@ -22,9 +22,9 @@ import os
 
 import torch
 
-# char obs (237) + steering task obs (5); the new soccer dims are appended
-# after this prefix
-PREFIX_OBS_DIM = 242
+# char obs + steering task obs; the new soccer dims are appended after this
+# prefix. G1: 237 + 5 = 242. T1: 195 + 5 = 200.
+DEFAULT_PREFIX_OBS_DIM = 242
 
 
 def main():
@@ -32,7 +32,10 @@ def main():
     parser.add_argument("--src", required=True, help="steering checkpoint (donor)")
     parser.add_argument("--dst", required=True, help="soccer checkpoint (layout template)")
     parser.add_argument("--out", required=True, help="output warm-start checkpoint")
+    parser.add_argument("--prefix_obs_dim", type=int, default=DEFAULT_PREFIX_OBS_DIM,
+                        help="shared [char obs | steering obs] prefix width")
     args = parser.parse_args()
+    prefix_obs_dim = args.prefix_obs_dim
 
     src = torch.load(args.src, map_location="cpu")
     dst = torch.load(args.dst, map_location="cpu")
@@ -60,11 +63,11 @@ def main():
             # obs-dependent tensors: last dim is the obs dim
             assert s.shape[:-1] == d.shape[:-1], \
                 "unexpected mismatch {}: {} vs {}".format(k, s.shape, d.shape)
-            assert s.shape[-1] >= PREFIX_OBS_DIM and d.shape[-1] >= PREFIX_OBS_DIM, \
+            assert s.shape[-1] >= prefix_obs_dim and d.shape[-1] >= prefix_obs_dim, \
                 "obs dim smaller than shared prefix for {}".format(k)
-            d[..., :PREFIX_OBS_DIM] = s[..., :PREFIX_OBS_DIM]
+            d[..., :prefix_obs_dim] = s[..., :prefix_obs_dim]
             print("prefix-copied {}: {} -> {} (first {} dims)".format(
-                k, tuple(s.shape), tuple(d.shape), PREFIX_OBS_DIM))
+                k, tuple(s.shape), tuple(d.shape), prefix_obs_dim))
             n_prefix += 1
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)

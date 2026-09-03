@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+import gymnasium.spaces as spaces
 import engines.engine as engine
 import envs.base_env as base_env
 import envs.smp_env as smp_env
@@ -105,6 +106,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # through an encoder; 10 frames (~333 ms) cover latency (~3.5 steps)
         # + velocity estimation.
         self._task_hist_steps = int(env_config.get("task_obs_history_steps", 0))
+
+        # measurable actor obs (Frente F, paper Table 2): the actor obs become
+        # [measurable frame | H past frames] where a frame is projected
+        # gravity + base angular velocity + joint offsets + joint velocities +
+        # previous action + the 12-dim task block. The full-state char obs
+        # move to the privileged critic_obs. CONTRACT BREAK: no warm start
+        # from full-state checkpoints. Default 30 frames = 1 s at 30 Hz
+        # (paper: 50 frames at 50 Hz).
+        self._measurable_obs = bool(env_config.get("measurable_obs", False))
+        self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
+        assert not (self._measurable_obs and self._task_hist_steps > 0), \
+            "measurable_obs already carries the task block in its history; " \
+            "task_obs_history_steps must be 0"
+        assert (not self._measurable_obs) or self._meas_hist_steps > 0, \
+            "measurable_obs requires measurable_hist_steps > 0 (the encoder " \
+            "needs a history)"
 
         # steering-crutch anneal (Frente D): the steering obs block is scaled
         # 1 -> 0 between start and end samples (the paper's actor receives no
@@ -346,6 +363,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
         self._action_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
+        # measurable-frame history (Frente F): 6 proprio + 3 * D + 12 task
+        if (self._measurable_obs):
+            self._meas_frame_dim = 6 + 3 * action_dim + 12
+            self._meas_hist_buf = torch.zeros(
+                [num_envs, self._meas_hist_steps, self._meas_frame_dim],
+                device=self._device, dtype=torch.float)
+
         char_id = self._get_char_id()
         dof_low, dof_high = self._engine.get_obj_dof_limits(0, char_id)
         self._dof_limits_low = torch.tensor(np.asarray(dof_low), device=self._device,
@@ -516,7 +540,42 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # perception pipeline is enabled, constant 1 otherwise
         return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
 
+    def _compute_measurable_frame(self, env_ids=None):
+        """One measurable frame: [proprio (6 + 3D) | task block (12)]."""
+        char_id = self._get_char_id()
+        root_rot = self._engine.get_root_rot(char_id)
+        root_ang_vel = self._engine.get_root_ang_vel(char_id)
+        dof_pos = self._engine.get_dof_pos(char_id)
+        dof_vel = self._engine.get_dof_vel(char_id)
+        prev_action = self._prev_action
+        if (env_ids is not None):
+            root_rot = root_rot[env_ids]
+            root_ang_vel = root_ang_vel[env_ids]
+            dof_pos = dof_pos[env_ids]
+            dof_vel = dof_vel[env_ids]
+            prev_action = prev_action[env_ids]
+        proprio = soccer_util.compute_proprio_frame(root_rot, root_ang_vel, dof_pos,
+                                                    dof_vel, prev_action,
+                                                    self._init_dof_pos)
+        block = self._compute_task_block(env_ids)
+        return torch.cat([proprio, block], dim=-1)
+
+    def get_measurable_frame_dim(self):
+        assert self._measurable_obs
+        return self._meas_frame_dim
+
+    def get_measurable_hist_steps(self):
+        assert self._measurable_obs
+        return self._meas_hist_steps
+
     def _compute_obs(self, env_ids=None):
+        if (self._measurable_obs):
+            # history is mutated once per step in _update_task (and refilled
+            # on reset), NEVER here: _compute_obs is also used as a shape
+            # probe by get_obs_space()
+            frame = self._compute_measurable_frame(env_ids)
+            hist = self._meas_hist_buf if env_ids is None else self._meas_hist_buf[env_ids]
+            return torch.cat([frame, hist.flatten(start_dim=1)], dim=-1)
         obs = super()._compute_obs(env_ids)
         block = self._compute_task_block(env_ids)
         obs = torch.cat([obs, block], dim=-1)
@@ -579,6 +638,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._virtual_perception):
                 self._critic_task_hist_buf[:, :-1] = self._critic_task_hist_buf[:, 1:].clone()
                 self._critic_task_hist_buf[:, -1] = self._compute_task_block(privileged=True)
+        if (self._measurable_obs):
+            self._meas_hist_buf[:, :-1] = self._meas_hist_buf[:, 1:].clone()
+            self._meas_hist_buf[:, -1] = self._compute_measurable_frame()
         return
 
     def _update_perception(self):
@@ -779,26 +841,60 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
         self._info["aux_reward"] = self._aux_reward_buf
-        if (self._virtual_perception):
+        if (self.has_critic_obs()):
             # asymmetric critic (paper Table 2): the critic trains on the
             # TRUE ball state while the actor only ever sees the perceived
             # one. Fresh tensor every call: no aliasing with later mutations.
             self._info["critic_obs"] = self._compute_critic_obs()
+        if (self._measurable_obs):
+            self._info["recon_tar"] = self._compute_recon_tar()
         return
 
     def has_critic_obs(self):
         """Whether this env publishes a privileged critic_obs in the info."""
-        return self._virtual_perception
+        return self._virtual_perception or self._measurable_obs
 
     def _compute_critic_obs(self):
-        """Actor-layout obs with the perceived ball slots replaced by the
-        true ball state (current block + history). Same shape as the obs."""
+        """Privileged critic obs (asymmetric critic, paper Table 2).
+
+        measurable_obs mode: full-state char obs + privileged task block +
+        true planar ball velocity (heading frame). DIFFERENT SHAPE from the
+        actor obs; consumers must size the critic from get_critic_obs_space().
+        Otherwise: actor-layout obs with the perceived ball slots replaced by
+        the true ball state (current block + history), same shape as the obs."""
         obs = super()._compute_obs()
         block = self._compute_task_block(privileged=True)
         obs = torch.cat([obs, block], dim=-1)
+        if (self._measurable_obs):
+            char_id = self._get_char_id()
+            ball_state = soccer_util.compute_ball_state_local(
+                self._engine.get_root_pos(char_id),
+                self._engine.get_root_rot(char_id),
+                self._get_ball_pos(),
+                self._engine.get_root_vel(self._get_ball_id()))
+            return torch.cat([obs, ball_state[..., 2:4]], dim=-1)
         if (self._task_hist_steps > 0):
             obs = torch.cat([obs, self._critic_task_hist_buf.flatten(start_dim=1)], dim=-1)
         return obs
+
+    def get_critic_obs_space(self):
+        obs = self._compute_critic_obs()
+        return spaces.Box(low=-np.inf, high=np.inf, shape=list(obs.shape[1:]),
+                          dtype=torch_util.torch_dtype_to_numpy(obs.dtype))
+
+    def _compute_recon_tar(self):
+        """Decoder target (paper Fig. 4B): true planar ball position and
+        velocity in the heading frame. Training-only; never enters the actor."""
+        char_id = self._get_char_id()
+        return soccer_util.compute_ball_state_local(
+            self._engine.get_root_pos(char_id),
+            self._engine.get_root_rot(char_id),
+            self._get_ball_pos(),
+            self._engine.get_root_vel(self._get_ball_id()))
+
+    def get_recon_tar_size(self):
+        assert self._measurable_obs
+        return 4
 
     def _update_ball_perturb(self):
         trigger_mask = self._time_buf >= self._ball_perturb_times
@@ -898,6 +994,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._aux_reward_buf[env_ids] = 0.0
             self._action_rate_buf[env_ids] = 0.0
             self._prev_action[env_ids] = 0.0
+            if (self._measurable_obs):
+                # after prev_action is zeroed: the refilled history must match
+                # the frame the actor sees on its first post-reset step
+                self._meas_hist_buf[env_ids] = \
+                    self._compute_measurable_frame(env_ids).unsqueeze(1)
             self._ball_moving_time[env_ids] = 0.0
             self._ball_still_time[env_ids] = 0.0
             char_id = self._get_char_id()
@@ -962,6 +1063,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._virtual_perception):
                 self._critic_task_hist_buf[env_ids] = \
                     self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
+        if (self._measurable_obs):
+            self._meas_hist_buf[env_ids] = \
+                self._compute_measurable_frame(env_ids).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
         self._stagnation_anchor_pos[env_ids] = root_pos
@@ -991,6 +1095,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._virtual_perception):
                 self._critic_task_hist_buf[env_ids] = \
                     self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
+        if (self._measurable_obs):
+            self._meas_hist_buf[env_ids] = \
+                self._compute_measurable_frame(env_ids).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._task_reward_buf[env_ids] = 0.0
         self._goal_scored_buf[env_ids] = False

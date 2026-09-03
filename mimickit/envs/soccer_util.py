@@ -44,6 +44,42 @@ def compute_soccer_observations(root_pos, root_rot, ball_pos, goal_pos, goal_dir
 
 
 @torch.jit.script
+def compute_proprio_frame(root_rot, root_ang_vel, dof_pos, dof_vel, prev_action, init_dof_pos):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) -> Tensor
+    """Measurable proprioceptive frame (paper Table 2 actor obs).
+
+    Only quantities readable from the onboard IMU + joint encoders + the
+    policy's own output: projected gravity (base frame), base angular
+    velocity (base frame), joint position offsets from the default pose,
+    joint velocities and the previous action. No linear velocity, no base
+    height, no key-body positions (those stay critic-only).
+    Returns [N, 6 + 3 * D].
+    """
+    inv_rot = torch_util.quat_conjugate(root_rot)
+    gravity = torch.zeros_like(root_ang_vel)
+    gravity[..., 2] = -1.0
+    proj_gravity = torch_util.quat_rotate(inv_rot, gravity)
+    local_ang_vel = torch_util.quat_rotate(inv_rot, root_ang_vel)
+    dof_offset = dof_pos - init_dof_pos
+    return torch.cat([proj_gravity, local_ang_vel, dof_offset, dof_vel, prev_action], dim=-1)
+
+
+@torch.jit.script
+def compute_ball_state_local(root_pos, root_rot, ball_pos, ball_vel):
+    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
+    """True planar ball position and velocity in the robot's heading frame.
+
+    Decoder reconstruction target (paper Fig. 4B) and the extra dynamics the
+    privileged critic sees. Returns [N, 4]: local ball (x, y), local ball
+    velocity (x, y).
+    """
+    heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
+    local_ball = torch_util.quat_rotate(heading_inv_rot, ball_pos - root_pos)
+    local_ball_vel = torch_util.quat_rotate(heading_inv_rot, ball_vel)
+    return torch.cat([local_ball[..., 0:2], local_ball_vel[..., 0:2]], dim=-1)
+
+
+@torch.jit.script
 def compute_ball_steer_command(root_pos, ball_pos, stop_dist, speed_max):
     # type: (Tensor, Tensor, float, float) -> Tensor
     """Auto steering command toward the ball (T1 kicking-env style).

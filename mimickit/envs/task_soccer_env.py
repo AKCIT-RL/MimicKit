@@ -93,6 +93,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # full FOV angle in deg; <= 0 disables the FOV check. G1 has no
         # actuated neck (Frente G pending), so the FOV is fixed to the heading.
         self._percep_fov_deg = float(env_config.get("percep_fov_deg", 120.0))
+        # camera body for the FOV (Frente G): when set, the FOV cone follows
+        # this body's +x axis (T1 actuated head) instead of the root heading;
+        # empty string keeps the G1 heading-fixed behaviour
+        self._percep_fov_body = str(env_config.get("percep_fov_body", ""))
 
         # task-obs history (Frente F-lite): the actor also receives the last
         # H task blocks (steer 5 + soccer 6 + mask 1 = 12 dims) it saw, so it
@@ -164,6 +168,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", -1.0))
         self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", -100.0))
         self._reward_base_accel_w = float(env_config.get("reward_base_accel_w", -0.001))
+        # head gaze reward (Frente G, paper Table 3 head term): cosine of the
+        # angle between the camera body boresight and the ball; requires
+        # percep_fov_body. 0 disables (G1 baseline parity).
+        self._reward_head_gaze_w = float(env_config.get("reward_head_gaze_w", 0.0))
 
         self._stagnation_window = float(env_config.get("stagnation_window", 1.0))
         self._stagnation_move_threshold = float(env_config.get("stagnation_move_threshold", 0.1))
@@ -346,6 +354,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                              dtype=torch.float)
 
         self._foot_body_ids = self._build_body_ids_tensor(self._kick_feet_bodies)
+        if (self._percep_fov_body != ""):
+            self._fov_body_id = int(self._build_body_ids_tensor([self._percep_fov_body])[0].item())
+        else:
+            self._fov_body_id = None
+        assert (self._reward_head_gaze_w == 0.0 or self._fov_body_id is not None), \
+            "reward_head_gaze_w requires percep_fov_body (the gaze is measured " \
+            "about the camera body's boresight)"
         return
 
     def _get_ball_id(self):
@@ -597,9 +612,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_pos = self._get_ball_pos()[env_ids]
 
             dist = torch.linalg.norm(ball_pos[:, 0:2] - root_pos[:, 0:2], dim=-1)
-            in_fov = soccer_util.compute_ball_in_fov(
-                root_pos, root_rot, ball_pos,
-                0.5 * self._percep_fov_deg * np.pi / 180.0)
+            if (self._fov_body_id is not None):
+                head_pos = self._engine.get_body_pos(char_id)[env_ids, self._fov_body_id]
+                head_rot = self._engine.get_body_rot(char_id)[env_ids, self._fov_body_id]
+                in_fov = soccer_util.compute_ball_in_fov_body(
+                    head_pos, head_rot, ball_pos,
+                    0.5 * self._percep_fov_deg * np.pi / 180.0)
+            else:
+                in_fov = soccer_util.compute_ball_in_fov(
+                    root_pos, root_rot, ball_pos,
+                    0.5 * self._percep_fov_deg * np.pi / 180.0)
             detect_prob = soccer_util.compute_ball_detection_prob(
                 dist, in_fov, self._percep_detect_prob,
                 self._percep_detect_full_range, self._percep_detect_decay_range)
@@ -710,6 +732,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         foot_prox = soccer_util.compute_foot_proximity_penalty(left_foot_pos, right_foot_pos,
                                                                self._foot_min_dist)
         aux_r += self._reward_foot_proximity_w * foot_prox
+
+        # head gaze (Frente G): true ball state, like every other reward term
+        if (self._reward_head_gaze_w != 0.0):
+            body_rot = self._engine.get_body_rot(char_id)
+            head_pos = body_pos[:, self._fov_body_id, :]
+            head_rot = body_rot[:, self._fov_body_id, :]
+            gaze_r = soccer_util.compute_head_gaze_reward(head_pos, head_rot, ball_pos)
+            aux_r += self._reward_head_gaze_w * gaze_r
 
         aux_r += self._reward_action_rate_w * self._action_rate_buf
 

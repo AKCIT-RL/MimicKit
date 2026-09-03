@@ -7,6 +7,8 @@ distance) for robot->ball and ball->goal, a terminal goal reward, and shaping
 components for the arch/inside-foot kick. No simulator dependencies.
 """
 
+import math
+
 import numpy as np
 import torch
 from typing import Tuple
@@ -393,3 +395,34 @@ def compute_ball_in_fov(root_pos, root_rot, ball_pos, fov_half_rad: float):
     local_ball = torch_util.quat_rotate(heading_inv_rot, ball_rel)
     bearing = torch.atan2(local_ball[..., 1], local_ball[..., 0])
     return torch.abs(bearing) <= fov_half_rad
+
+
+@torch.jit.script
+def compute_ball_in_fov_body(body_pos, body_rot, ball_pos, fov_half_rad: float):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Whether the ball lies inside the cone of half-angle fov_half_rad about
+    the +x (boresight) axis of a camera body (Frente G: actuated head).
+
+    Full 3D check, unlike the planar heading-frame compute_ball_in_fov.
+    fov_half_rad <= 0 disables the check (always True). Returns [N] bool.
+    """
+    if (fov_half_rad <= 0.0):
+        return torch.ones_like(body_pos[..., 0], dtype=torch.bool)
+    ball_rel = ball_pos - body_pos
+    local_ball = torch_util.quat_rotate(torch_util.quat_conjugate(body_rot), ball_rel)
+    dist = torch.clamp(torch.linalg.norm(local_ball, dim=-1), min=1e-6)
+    cos_ang = local_ball[..., 0] / dist
+    return cos_ang >= math.cos(fov_half_rad)
+
+
+@torch.jit.script
+def compute_head_gaze_reward(head_pos, head_rot, ball_pos):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Cosine of the angle between the head boresight (+x) and the ball
+    direction, clamped to [0, 1]: 1 looking straight at the ball, 0 from
+    90 deg off-axis (paper Table 3: keep the ball centered in the FOV).
+    """
+    ball_rel = ball_pos - head_pos
+    local_ball = torch_util.quat_rotate(torch_util.quat_conjugate(head_rot), ball_rel)
+    dist = torch.clamp(torch.linalg.norm(local_ball, dim=-1), min=1e-6)
+    return torch.clamp(local_ball[..., 0] / dist, min=0.0, max=1.0)

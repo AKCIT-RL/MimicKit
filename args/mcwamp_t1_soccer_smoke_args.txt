@@ -1,0 +1,11 @@
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine.yaml
+--env_config data/envs/mcwamp_t1_soccer_env.yaml
+--agent_config data/agents/mcwamp_g1_soccer_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 20000000
+--out_dir output/mcwamp_t1_soccer_smoke/

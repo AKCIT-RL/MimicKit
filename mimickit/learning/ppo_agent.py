@@ -10,6 +10,7 @@ import learning.ppo_model as ppo_model
 import learning.rl_util as rl_util
 import util.mp_util as mp_util
 import util.torch_util as torch_util
+from util.logger import Logger
 
 class PPOAgent(base_agent.BaseAgent):
     def __init__(self, config, env, device):
@@ -84,13 +85,18 @@ class PPOAgent(base_agent.BaseAgent):
         assert(mirror_util.check_involution(act_perm, act_signs)), \
             "action mirror is not an involution"
 
-        # The loss mirrors actions in NORMALIZED space, which is only the same
-        # map as mirroring raw actions when the normalizer commutes with it.
+        # The loss mirrors actions in NORMALIZED space when the normalizer
+        # commutes with the mirror (exact for assets with mirror-image joint
+        # limits, e.g. the G1). Otherwise (T1: left/right_hip_yaw share the
+        # same asymmetric range) actions are mirrored in RAW space, which is
+        # exact for any asset at the cost of two extra normalizer hops.
         ok, mean_err, std_err = mirror_util.check_normalizer_equivariance(
             self._a_norm.get_mean(), self._a_norm.get_std(), act_perm, act_signs)
-        assert(ok), ("action normalizer does not commute with the mirror "
-                     "(mean err {:.3e}, std err {:.3e}); the asset's joint limits are "
-                     "not exact mirror images".format(mean_err, std_err))
+        self._mirror_act_raw = not ok
+        if (self._mirror_act_raw):
+            Logger.print("Mirror loss: action normalizer does not commute with "
+                         "the mirror (mean err {:.3e}, std err {:.3e}); mirroring "
+                         "actions in raw space instead".format(mean_err, std_err))
 
         device = self._device
         self._mirror_ops = (mirror_util.to_tensors(obs_perm, obs_signs, device) +
@@ -102,8 +108,9 @@ class PPOAgent(base_agent.BaseAgent):
 
         The observation is mirrored BEFORE normalization: the observation
         normalizer tracks running statistics of an asymmetric policy, so it does
-        not commute with the mirror. The action side does commute (checked in
-        _get_mirror_ops), so actions are mirrored in normalized space directly.
+        not commute with the mirror. Actions are mirrored in normalized space
+        when that commutes (checked in _get_mirror_ops) and in raw space
+        otherwise.
         """
         obs_perm, obs_signs, act_perm, act_signs = self._get_mirror_ops()
 
@@ -111,7 +118,12 @@ class PPOAgent(base_agent.BaseAgent):
         norm_mirror_obs = self._obs_norm.normalize(mirror_obs)
         mirror_dist = self._model.eval_actor(norm_mirror_obs)
 
-        mirror_a = mirror_util.mirror(mirror_dist.mode, act_perm, act_signs)
+        if (self._mirror_act_raw):
+            raw_mode = self._a_norm.unnormalize(mirror_dist.mode)
+            mirror_a = self._a_norm.normalize(
+                mirror_util.mirror(raw_mode, act_perm, act_signs))
+        else:
+            mirror_a = mirror_util.mirror(mirror_dist.mode, act_perm, act_signs)
         diff = a_dist.mode - mirror_a
         return torch.mean(torch.sum(torch.square(diff), dim=-1))
 

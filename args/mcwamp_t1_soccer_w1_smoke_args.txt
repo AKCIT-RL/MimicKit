@@ -1,0 +1,12 @@
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_uneven.yaml
+--env_config data/envs/mcwamp_t1_soccer_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 20000000
+--model_file output/t1_soccer_warmstart/model_init_steering.pt
+--out_dir output/mcwamp_t1_soccer_w1_smoke/

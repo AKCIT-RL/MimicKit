@@ -69,6 +69,8 @@ OBS_NORM_PREFIX = "_obs_norm."
 A_NORM_PREFIX = "_a_norm."
 ACTOR_LAYERS_PREFIX = "_model._actor_layers."
 MEAN_NET_PREFIX = "_model._action_dist._mean_net."
+ENC_LAYERS_PREFIX = "_model._enc_layers."
+ENC_OUT_PREFIX = "_model._enc_out."
 
 # base_agent._build_normalizers hardcodes clip=10.0 on the observation
 # normalizer. It is not stored in the checkpoint, so it is mirrored here.
@@ -121,6 +123,56 @@ class ExportedPolicy(torch.nn.Module):
         pass
 
 
+class ExportedEncPolicy(torch.nn.Module):
+    """Deterministic encoder-decoder policy (Frente F), STATELESS by design.
+
+    forward(obs) where obs = [current frame | H past frames, oldest first]
+    flattened, in RAW units. The consumer owns the frame ring buffer (newest
+    last) and, after a reset, refills it with the first measured frame
+    repeated - exactly like the training env (no zero transient). The encoder
+    and the split are baked in; the decoder is training-only and not exported.
+    """
+
+    def __init__(self, obs_mean, obs_std, obs_clip, enc_layers, enc_out,
+                 actor_layers, mean_net, a_mean, a_std, frame_dim,
+                 clip_action=True):
+        super().__init__()
+
+        self.register_buffer("_obs_mean", obs_mean.detach().clone())
+        self.register_buffer("_obs_std", obs_std.detach().clone())
+        self.register_buffer("_a_mean", a_mean.detach().clone())
+        self.register_buffer("_a_std", a_std.detach().clone())
+
+        self._enc_layers = enc_layers
+        self._enc_out = enc_out
+        self._actor_layers = actor_layers
+        self._mean_net = mean_net
+        self._frame_dim = int(frame_dim)
+        self._obs_clip = float(obs_clip)
+        self._clip_action = bool(clip_action)
+        return
+
+    def forward(self, obs):
+        norm_obs = (obs - self._obs_mean) / self._obs_std
+        norm_obs = torch.clamp(norm_obs, -self._obs_clip, self._obs_clip)
+
+        frame = norm_obs[..., :self._frame_dim]
+        hist = norm_obs[..., self._frame_dim:]
+        z = self._enc_out(self._enc_layers(hist))
+        norm_a = self._mean_net(self._actor_layers(torch.cat([frame, z], dim=-1)))
+
+        if (self._clip_action):
+            norm_a = torch.clamp(norm_a, -1.0, 1.0)
+
+        return norm_a * self._a_std + self._a_mean
+
+    @torch.jit.export
+    def reset(self):
+        # stateless on purpose: the frame history is an INPUT, owned by the
+        # consumer, so there is no hidden state to clear
+        pass
+
+
 def load_checkpoint(path, device="cpu"):
     state_dict = torch.load(path, map_location=device, weights_only=False)
     for key in (OBS_NORM_PREFIX + "_mean", A_NORM_PREFIX + "_mean",
@@ -135,6 +187,22 @@ def get_sizes(state_dict):
     obs_size = state_dict[OBS_NORM_PREFIX + "_mean"].shape[0]
     a_size = state_dict[A_NORM_PREFIX + "_mean"].shape[0]
     return int(obs_size), int(a_size)
+
+
+def has_encoder(state_dict):
+    return (ENC_LAYERS_PREFIX + "0.weight") in state_dict
+
+
+def get_enc_sizes(state_dict):
+    """(frame_dim, hist_size, latent_dim), all derived from the weights."""
+    obs_size, _ = get_sizes(state_dict)
+    hist_size = int(state_dict[ENC_LAYERS_PREFIX + "0.weight"].shape[1])
+    latent_dim = int(state_dict[ENC_OUT_PREFIX + "weight"].shape[0])
+    frame_dim = obs_size - hist_size
+    if (frame_dim <= 0 or hist_size % frame_dim != 0):
+        raise ValueError("encoder input {} is not a whole number of {}-dim "
+                         "frames".format(hist_size, frame_dim))
+    return frame_dim, hist_size, latent_dim
 
 
 def _sub_state_dict(state_dict, prefix):
@@ -199,6 +267,38 @@ def build_actor(state_dict, actor_net, device="cpu", activation=torch.nn.ReLU):
     return actor_layers, dist_builder
 
 
+def build_enc_actor(state_dict, actor_net, enc_net, device="cpu",
+                    activation=torch.nn.ReLU):
+    """Rebuild encoder + actor with MimicKit's own builders (strict load)."""
+    _, a_size = get_sizes(state_dict)
+    frame_dim, hist_size, latent_dim = get_enc_sizes(state_dict)
+
+    hist_spec = types.SimpleNamespace(shape=(hist_size,))
+    enc_layers, _ = net_builder.build_net(enc_net, {"hist": hist_spec},
+                                          activation=activation)
+    enc_out = torch.nn.Linear(torch_util.calc_layers_out_size(enc_layers), latent_dim)
+
+    actor_spec = types.SimpleNamespace(shape=(frame_dim + latent_dim,))
+    actor_layers, _ = net_builder.build_net(actor_net, {"obs": actor_spec},
+                                            activation=activation)
+
+    in_size = torch_util.calc_layers_out_size(actor_layers)
+    dist_builder = distribution_gaussian_diag.DistributionGaussianDiagBuilder(
+        in_size, a_size,
+        std_type=distribution_gaussian_diag.StdType.FIXED,
+        init_std=1.0, init_output_scale=0.01)
+
+    enc_layers.load_state_dict(_sub_state_dict(state_dict, ENC_LAYERS_PREFIX))
+    enc_out.load_state_dict(_sub_state_dict(state_dict, ENC_OUT_PREFIX))
+    actor_layers.load_state_dict(_sub_state_dict(state_dict, ACTOR_LAYERS_PREFIX))
+    dist_builder._mean_net.load_state_dict(_sub_state_dict(state_dict, MEAN_NET_PREFIX))
+
+    for module in (enc_layers, enc_out, actor_layers, dist_builder):
+        _sanitize_for_script(module)
+        module.to(device).eval()
+    return enc_layers, enc_out, actor_layers, dist_builder
+
+
 def build_normalizers(state_dict, device="cpu", obs_clip=OBS_NORM_CLIP):
     """Rebuild the two normalizers as real Normalizer objects."""
     obs_size, a_size = get_sizes(state_dict)
@@ -249,6 +349,57 @@ def build_reference_policy(state_dict, actor_net, device="cpu",
         with torch.no_grad():
             norm_obs = obs_norm.normalize(obs)
             a_dist = dist_builder(actor_layers(norm_obs))
+            a = a_norm.unnormalize(a_dist.mode)
+            if (clip_action):
+                a = torch.minimum(torch.maximum(a, bound_low), bound_high)
+        return a
+
+    return policy
+
+
+def build_exported_enc_policy(state_dict, actor_net, enc_net, device="cpu",
+                              clip_action=True, obs_clip=OBS_NORM_CLIP):
+    """The encoder-policy module that gets scripted and shipped."""
+    enc_layers, enc_out, actor_layers, dist_builder = build_enc_actor(
+        state_dict, actor_net, enc_net, device=device)
+    frame_dim, _, _ = get_enc_sizes(state_dict)
+
+    policy = ExportedEncPolicy(
+        obs_mean=state_dict[OBS_NORM_PREFIX + "_mean"],
+        obs_std=state_dict[OBS_NORM_PREFIX + "_std"],
+        obs_clip=obs_clip,
+        enc_layers=enc_layers,
+        enc_out=enc_out,
+        actor_layers=actor_layers,
+        mean_net=dist_builder._mean_net,
+        a_mean=state_dict[A_NORM_PREFIX + "_mean"],
+        a_std=state_dict[A_NORM_PREFIX + "_std"],
+        frame_dim=frame_dim,
+        clip_action=clip_action)
+    policy.to(device).eval()
+    return policy
+
+
+def build_reference_enc_policy(state_dict, actor_net, enc_net, device="cpu",
+                               clip_action=True, obs_clip=OBS_NORM_CLIP):
+    """Reference side of the encoder-export equivalence test, assembled from
+    MimicKit's own classes and following MCWAMPEncModel.eval_actor +
+    ppo_agent._decide_action + char_env._apply_action step for step."""
+    obs_norm, a_norm = build_normalizers(state_dict, device=device, obs_clip=obs_clip)
+    enc_layers, enc_out, actor_layers, dist_builder = build_enc_actor(
+        state_dict, actor_net, enc_net, device=device)
+    frame_dim, _, _ = get_enc_sizes(state_dict)
+
+    bound_low = a_norm.get_mean() - a_norm.get_std()
+    bound_high = a_norm.get_mean() + a_norm.get_std()
+
+    def policy(obs):
+        with torch.no_grad():
+            norm_obs = obs_norm.normalize(obs)
+            frame = norm_obs[..., :frame_dim]
+            hist = norm_obs[..., frame_dim:]
+            z = enc_out(enc_layers(hist))
+            a_dist = dist_builder(actor_layers(torch.cat([frame, z], dim=-1)))
             a = a_norm.unnormalize(a_dist.mode)
             if (clip_action):
                 a = torch.minimum(torch.maximum(a, bound_low), bound_high)

@@ -230,6 +230,61 @@ def build_obs_mirror(task_key, char_model, key_body_names, root_height_obs, obs_
     return perm, signs
 
 
+def build_measurable_frame_mirror(task_key, char_model):
+    """Mirror map over one measurable frame (Frente F, paper Table 2).
+
+    Layout (soccer_util.compute_proprio_frame + the task block): projected
+    gravity (3, true vector: y flips), base angular velocity (3, pseudovector:
+    x and z flip), joint offsets / joint velocities / previous action (three
+    DOF blocks), then the registered task signs.
+    """
+    perm, signs = [], []
+
+    def add(block_perm, block_signs):
+        offset = len(perm)
+        perm.extend([offset + p for p in block_perm])
+        signs.extend(block_signs)
+
+    add(list(range(3)), [1.0, -1.0, 1.0])       # projected gravity
+    add(list(range(3)), [-1.0, 1.0, -1.0])      # base angular velocity
+
+    dof_perm, dof_signs = build_dof_mirror(char_model)
+    add(dof_perm, dof_signs)                    # joint offsets
+    add(dof_perm, dof_signs)                    # joint velocities
+    add(dof_perm, dof_signs)                    # previous action
+
+    if (task_key not in TASK_OBS_MIRROR):
+        raise KeyError("no task observation mirror registered for '{}'. Add its "
+                       "block to mirror_util.TASK_OBS_MIRROR.".format(task_key))
+    task_signs = TASK_OBS_MIRROR[task_key]
+    offset = len(perm)
+    perm.extend(range(offset, offset + len(task_signs)))
+    signs.extend(task_signs)
+    return perm, signs
+
+
+def build_measurable_obs_mirror(task_key, char_model, num_frames, obs_size):
+    """Full mirror for the measurable obs: the frame map tiled over
+    [current frame | history]. Latents never appear here: the encoder input
+    is mirrored, not its output."""
+    frame_perm, frame_signs = build_measurable_frame_mirror(task_key, char_model)
+    frame_dim = len(frame_perm)
+
+    perm, signs = [], []
+    for f in range(num_frames):
+        base = f * frame_dim
+        perm.extend([base + p for p in frame_perm])
+        signs.extend(frame_signs)
+
+    if (len(perm) != obs_size):
+        raise ValueError(
+            "measurable mirror covers {} dims ({} frames x {}) but the "
+            "environment observation is {}. The layout changed; fix "
+            "mirror_util before training.".format(len(perm), num_frames,
+                                                  frame_dim, obs_size))
+    return perm, signs
+
+
 def to_tensors(perm, signs, device, dtype=torch.float32):
     perm_t = torch.as_tensor(perm, dtype=torch.long, device=device)
     signs_t = torch.as_tensor(signs, dtype=dtype, device=device)

@@ -72,12 +72,21 @@ class PPOAgent(base_agent.BaseAgent):
         key_body_ids = getattr(env, "_key_body_ids", [])
         key_body_names = [char_model.get_body_name(int(i)) for i in key_body_ids]
 
-        obs_perm, obs_signs = mirror_util.build_obs_mirror(
-            task_key=type(env).__name__,
-            char_model=char_model,
-            key_body_names=key_body_names,
-            root_height_obs=env._root_height_obs,
-            obs_size=int(np.prod(env.get_obs_space().shape)))
+        obs_size = int(np.prod(env.get_obs_space().shape))
+        if (getattr(env, "_measurable_obs", False)):
+            # Frente F: [current frame | history], the frame map tiled
+            obs_perm, obs_signs = mirror_util.build_measurable_obs_mirror(
+                task_key=type(env).__name__,
+                char_model=char_model,
+                num_frames=1 + env.get_measurable_hist_steps(),
+                obs_size=obs_size)
+        else:
+            obs_perm, obs_signs = mirror_util.build_obs_mirror(
+                task_key=type(env).__name__,
+                char_model=char_model,
+                key_body_names=key_body_names,
+                root_height_obs=env._root_height_obs,
+                obs_size=obs_size)
         act_perm, act_signs = mirror_util.build_dof_mirror(char_model)
 
         assert(mirror_util.check_involution(obs_perm, obs_signs)), \

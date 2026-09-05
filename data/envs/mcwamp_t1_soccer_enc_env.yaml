@@ -49,16 +49,31 @@ steer_speed_max: 1.5 # m/s (steering policy trained on 0.5-2.5)
 steer_stop_dist: 0.45 # m (command zeroed near the ball)
 
 # steering-crutch anneal (Frente D): the paper's actor receives no steering
-# command; the block fades 1 -> 0 over the middle of the 300M run. Negative
-# start disables.
-steer_anneal_start_samples: 90000000 # 90M
-steer_anneal_end_samples: 240000000 # 240M
+# command; the block fades 1 -> 0 inside the 100M experiment budget so the
+# checkpoint at the end is command-free. Negative start disables.
+steer_anneal_start_samples: 40000000 # 40M
+steer_anneal_end_samples: 90000000 # 90M
 
 # ball spawn in front of the robot (T1-style curriculum)
 ball_spawn_near: true
 ball_spawn_front_min: 0.5 # m
 ball_spawn_front_max: 2.0 # m
 ball_spawn_lateral: 0.5 # m
+
+# perception curriculum (A): perfect camera (360 deg FOV, no misses/latency/
+# noise) until 10M, linear ramp to the realistic parameters by 60M
+percep_curriculum_start_samples: 10000000 # 10M
+percep_curriculum_end_samples: 60000000 # 60M
+
+# ball-spawn curriculum (C): share of uniform field-wide spawns grows from 0
+# at 30M to 50% at 100M (the rest stays near frontal)
+ball_curriculum_start_samples: 30000000 # 30M
+ball_curriculum_end_samples: 100000000 # 100M
+ball_curriculum_far_prob: 0.5
+
+# samples consumed by the run this one resumes from (0 for a fresh run);
+# shifts every schedule above so a 100M continuation picks up where it was
+curriculum_sample_offset: 0
 
 # random ball perturbations (teleport or planar velocity push)
 ball_perturb_time_min: 4.0 # s

@@ -390,6 +390,23 @@ def compute_anneal_scale(samples, start_samples, end_samples):
     return float(np.clip(1.0 - frac, 0.0, 1.0))
 
 
+def compute_curriculum_progress(samples, start_samples, end_samples):
+    """Linear 0 -> 1 difficulty ramp over a sample budget.
+
+    start_samples < 0 disables the curriculum (always 1: full difficulty,
+    baseline behavior). Before start: 0 (easy). end_samples <= start_samples
+    makes it a step at start.
+    """
+    if (start_samples < 0):
+        return 1.0
+    if (samples < start_samples):
+        return 0.0
+    if (end_samples <= start_samples):
+        return 1.0
+    frac = (samples - start_samples) / float(end_samples - start_samples)
+    return float(np.clip(frac, 0.0, 1.0))
+
+
 @torch.jit.script
 def compute_perception_noise_std(dist, dist_coef: float, base_std: float):
     # type: (Tensor, float, float) -> Tensor

@@ -131,6 +131,27 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._steer_anneal_start_samples = float(env_config.get("steer_anneal_start_samples", -1.0))
         self._steer_anneal_end_samples = float(env_config.get("steer_anneal_end_samples", -1.0))
 
+        # perception curriculum (A): ramp from perfect perception (360 deg
+        # FOV, no misses/latency/noise) to the configured realistic camera
+        # over a sample budget. start < 0 disables (realistic from step 0).
+        self._percep_curriculum_start_samples = \
+            float(env_config.get("percep_curriculum_start_samples", -1.0))
+        self._percep_curriculum_end_samples = \
+            float(env_config.get("percep_curriculum_end_samples", -1.0))
+
+        # ball-spawn curriculum (C): ramp the probability of a uniform
+        # field-wide spawn from 0 to ball_curriculum_far_prob, keeping the
+        # near frontal spawn as the base. start < 0 disables.
+        self._ball_curriculum_start_samples = \
+            float(env_config.get("ball_curriculum_start_samples", -1.0))
+        self._ball_curriculum_end_samples = \
+            float(env_config.get("ball_curriculum_end_samples", -1.0))
+        self._ball_curriculum_far_prob = float(env_config.get("ball_curriculum_far_prob", 0.5))
+
+        # schedule clock offset: samples already consumed by a run this one
+        # resumes from, so steer anneal and curricula continue where they were
+        self._curriculum_sample_offset = float(env_config.get("curriculum_sample_offset", 0.0))
+
         # uneven ground (engine-side): inject one tile per field so the
         # engine's ground meshes and the env's field grid cannot diverge;
         # spawns are raised by the bump amplitude
@@ -538,7 +559,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # steering-crutch anneal (Frente D): fade the whole steering block to
         # zeros so the final policy matches the paper's command-free actor
         steer_scale = soccer_util.compute_anneal_scale(
-            self._total_env_steps * self.get_num_envs(),
+            self._get_schedule_samples(),
             self._steer_anneal_start_samples, self._steer_anneal_end_samples)
         if (steer_scale < 1.0):
             steer_obs = steer_obs * steer_scale
@@ -676,6 +697,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # capture
         capture = self._time_buf >= self._percep_next_capture
         if (capture.any()):
+            # perception curriculum (A): interpolate easy -> configured camera
+            p = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(),
+                self._percep_curriculum_start_samples, self._percep_curriculum_end_samples)
+            fov_deg = 360.0 + p * (self._percep_fov_deg - 360.0)
+            detect_prob = 1.0 + p * (self._percep_detect_prob - 1.0)
+            latency_mean = p * self._percep_latency_mean
+            latency_std = p * self._percep_latency_std
+            noise_dist_coef = p * self._percep_noise_dist_coef
+            noise_base = p * self._percep_noise_base
+
             env_ids = capture.nonzero(as_tuple=False).flatten()
             char_id = self._get_char_id()
             root_pos = self._engine.get_root_pos(char_id)[env_ids]
@@ -688,22 +720,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 head_rot = self._engine.get_body_rot(char_id)[env_ids, self._fov_body_id]
                 in_fov = soccer_util.compute_ball_in_fov_body(
                     head_pos, head_rot, ball_pos,
-                    0.5 * self._percep_fov_deg * np.pi / 180.0)
+                    0.5 * fov_deg * np.pi / 180.0)
             else:
                 in_fov = soccer_util.compute_ball_in_fov(
                     root_pos, root_rot, ball_pos,
-                    0.5 * self._percep_fov_deg * np.pi / 180.0)
-            detect_prob = soccer_util.compute_ball_detection_prob(
-                dist, in_fov, self._percep_detect_prob,
+                    0.5 * fov_deg * np.pi / 180.0)
+            detect_prob_t = soccer_util.compute_ball_detection_prob(
+                dist, in_fov, detect_prob,
                 self._percep_detect_full_range, self._percep_detect_decay_range)
-            detected = torch.rand_like(dist) < detect_prob
+            detected = torch.rand_like(dist) < detect_prob_t
 
             noise_std = soccer_util.compute_perception_noise_std(
-                dist, self._percep_noise_dist_coef, self._percep_noise_base)
+                dist, noise_dist_coef, noise_base)
             noisy_pos = ball_pos[:, 0:2] + noise_std.unsqueeze(-1) * torch.randn_like(ball_pos[:, 0:2])
 
-            latency = self._percep_latency_mean \
-                + self._percep_latency_std * torch.randn_like(dist)
+            latency = latency_mean \
+                + latency_std * torch.randn_like(dist)
             latency = torch.clamp(latency, min=0.0)
 
             head = self._percep_buf_head[env_ids]
@@ -936,7 +968,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         diags["goal_time_mean"] = sums.get("goal_time", 0.0) / goals if goals > 0.0 else 0.0
         diags["ball_reacquire_time"] = \
             sums.get("reacq_time", 0.0) / reacq_count if reacq_count > 0.0 else 0.0
+
+        samples = self._get_schedule_samples()
+        diags["percep_curriculum"] = soccer_util.compute_curriculum_progress(
+            samples, self._percep_curriculum_start_samples, self._percep_curriculum_end_samples)
+        diags["ball_curriculum"] = soccer_util.compute_curriculum_progress(
+            samples, self._ball_curriculum_start_samples, self._ball_curriculum_end_samples)
+        diags["steer_scale"] = soccer_util.compute_anneal_scale(
+            samples, self._steer_anneal_start_samples, self._steer_anneal_end_samples)
         return diags
+
+    def _get_schedule_samples(self):
+        """Sample clock shared by the steer anneal and the curricula."""
+        return self._total_env_steps * self.get_num_envs() + self._curriculum_sample_offset
 
     def has_critic_obs(self):
         """Whether this env publishes a privileged critic_obs in the info."""
@@ -1249,7 +1293,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos = self._engine.get_root_pos(char_id)[env_ids]
 
         ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
-        if (self._ball_spawn_near and near):
+        near_mask = torch.full([n], self._ball_spawn_near and near,
+                               device=self._device, dtype=torch.bool)
+        if (near_mask.any() and self._ball_curriculum_start_samples >= 0):
+            # ball-spawn curriculum (C): growing share of field-wide spawns
+            p = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(),
+                self._ball_curriculum_start_samples, self._ball_curriculum_end_samples)
+            far_prob = p * self._ball_curriculum_far_prob
+            far = torch.rand(n, device=self._device) < far_prob
+            near_mask &= ~far
+        if (near_mask.any()):
             # in front of the robot in its heading frame, then clamped into
             # the field so border spawns stay in bounds
             root_rot = self._engine.get_root_rot(char_id)[env_ids]
@@ -1265,10 +1319,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_local[:, 0] = torch.clamp(ball_local[:, 0], -half_x, half_x)
             ball_local[:, 1] = torch.clamp(ball_local[:, 1], -half_y, half_y)
             ball_pos[:, 0:2] = ball_local + self._field_offset[env_ids]
-        else:
-            ball_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
-            ball_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
-            ball_pos[:, 0:2] += self._field_offset[env_ids]
+        if (not near_mask.all()):
+            uni = torch.zeros([n, 2], device=self._device, dtype=torch.float)
+            uni[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            uni += self._field_offset[env_ids]
+            ball_pos[~near_mask, 0:2] = uni[~near_mask]
         ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
 
         # keep the ball from spawning inside the robot

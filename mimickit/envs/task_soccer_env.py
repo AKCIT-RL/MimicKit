@@ -4,6 +4,7 @@ import torch
 import gymnasium.spaces as spaces
 import engines.engine as engine
 import envs.base_env as base_env
+import envs.diag_util as diag_util
 import envs.smp_env as smp_env
 import envs.soccer_util as soccer_util
 import envs.task_steering_env as task_steering_env
@@ -348,6 +349,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_buf_head = torch.zeros([num_envs], device=self._device, dtype=torch.long)
         self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
+
+        # per-iteration diagnostics window (reward-term decomposition +
+        # episode event rates); popped and reset by record_diagnostics()
+        self._diag = diag_util.DiagWindow(self._device)
+        self._prev_ball_touch = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._prev_percep_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
+        self._percep_lost_since = torch.full([num_envs], -1.0, device=self._device,
+                                             dtype=torch.float)
 
         # task-obs history buffer (Frente F-lite); 12 = steer 5 + soccer 6 + mask 1
         if (self._task_hist_steps > 0):
@@ -704,6 +713,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._percep_buf_head[env_ids] = (head + 1) % self._percep_buf_slots
             self._percep_next_capture[env_ids] = self._percep_next_capture[env_ids] \
                 + self._percep_period[env_ids]
+
+        # diagnostics: perception availability + reacquisition time
+        d = self._diag
+        d.add_mean("ball_visible_frac", self._percep_ball_valid.float())
+        self._percep_lost_since, reacq_sum, reacq_count = diag_util.update_reacquisition(
+            self._prev_percep_valid, self._percep_ball_valid,
+            self._percep_lost_since, self._time_buf)
+        d.add_sum("reacq_time", reacq_sum)
+        d.add_sum("reacq_count", reacq_count)
+        self._prev_percep_valid[:] = self._percep_ball_valid
         return
 
     def _reset_perception(self, env_ids):
@@ -723,6 +742,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_buf_head[env_ids] = 0
         self._percep_ball_pos[env_ids] = self._get_ball_pos()[env_ids][:, 0:2]
         self._percep_ball_valid[env_ids] = True
+        self._prev_percep_valid[env_ids] = True
+        self._percep_lost_since[env_ids] = -1.0
         return
 
     def _cache_task_reward(self, ball_pos, ball_vel, rolling):
@@ -750,6 +771,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                    + self._reward_goal_progress_w * progress_r
                                                    + self._reward_kick_direction_w * dir_r) \
             + self._reward_goal_scored_w * goal_r
+
+        # diagnostics: weighted per-term means (goal stream decomposition)
+        d = self._diag
+        d.add_mean("reward_ball_approach", shaping_mask * self._reward_ball_approach_w * approach_r)
+        d.add_mean("reward_goal_progress", shaping_mask * self._reward_goal_progress_w * progress_r)
+        d.add_mean("reward_kick_direction", shaping_mask * self._reward_kick_direction_w * dir_r)
+        d.add_mean("reward_goal_scored", self._reward_goal_scored_w * goal_r)
         return
 
     def _cache_aux_reward(self, ball_pos):
@@ -778,15 +806,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # frontal (toe-poke) motion is penalized
         body_pos = self._engine.get_body_pos(char_id)
         body_vel = self._engine.get_body_vel(char_id)
+        kick_side_r = torch.zeros_like(aux_r)
+        kick_fwd_r = torch.zeros_like(aux_r)
+        touch_any = torch.zeros_like(self._prev_ball_touch)
         for i in range(len(self._foot_body_ids)):
             foot_id = self._foot_body_ids[i]
             foot_pos = body_pos[:, foot_id, :]
             foot_vel = body_vel[:, foot_id, :]
             contact = soccer_util.compute_ball_contact_flags(foot_pos, ball_pos,
                                                              self._ball_contact_dist)
+            touch_any = torch.logical_or(touch_any, contact)
             kick = soccer_util.compute_kick_components(root_rot, foot_vel, contact)
-            aux_r += self._reward_kick_sideways_w * kick[:, 0] \
-                + self._reward_kick_forward_w * kick[:, 1]
+            kick_side_r += self._reward_kick_sideways_w * kick[:, 0]
+            kick_fwd_r += self._reward_kick_forward_w * kick[:, 1]
+        aux_r += kick_side_r + kick_fwd_r
 
         # regularizations
         left_foot_pos = body_pos[:, self._foot_body_ids[0], :]
@@ -817,9 +850,33 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # waiting penalty (T1): grows quadratically with ball-still time,
         # saturating at waiting_time_max; zero while the ball rolls
         wait_frac = torch.clamp(self._ball_still_time / self._waiting_time_max, max=1.0)
-        aux_r += self._reward_waiting_w * wait_frac * wait_frac
+        waiting_r = self._reward_waiting_w * wait_frac * wait_frac
+        aux_r += waiting_r
 
         self._aux_reward_buf[:] = aux_r
+
+        # diagnostics: weighted per-term means (env part of the aux stream;
+        # the AMP style reward is logged by the agent, termination in
+        # _update_done). One step() per control step lives here.
+        d = self._diag
+        d.step()
+        d.add_mean("reward_survival", self._reward_survival_w)
+        d.add_mean("reward_stagnation", self._reward_stagnation_w * stagnant.float())
+        d.add_mean("reward_kick_sideways", kick_side_r)
+        d.add_mean("reward_kick_forward", kick_fwd_r)
+        d.add_mean("reward_foot_proximity", self._reward_foot_proximity_w * foot_prox)
+        if (self._reward_head_gaze_w != 0.0):
+            d.add_mean("reward_head_gaze", self._reward_head_gaze_w * gaze_r)
+        d.add_mean("reward_action_rate", self._reward_action_rate_w * self._action_rate_buf)
+        d.add_mean("reward_joint_limit", self._reward_joint_limit_w * joint_limit)
+        d.add_mean("reward_base_accel", self._reward_base_accel_w * base_accel)
+        d.add_mean("reward_waiting", waiting_r)
+
+        # ball-touch events: fraction of steps in contact + rising edges
+        d.add_mean("ball_touch_frac", touch_any.float())
+        new_touch = torch.logical_and(touch_any, ~self._prev_ball_touch)
+        d.add_sum("touch_events", new_touch.float())
+        self._prev_ball_touch[:] = touch_any
         return
 
     def _update_done(self):
@@ -830,12 +887,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         fall_mask = (self._done_buf == base_env.DoneFlags.FAIL.value)
         self._aux_reward_buf += self._reward_termination_w * fall_mask.float()
 
+        # diagnostics: termination term + per-episode event counters
+        d = self._diag
+        d.add_mean("reward_termination", self._reward_termination_w * fall_mask.float())
+        d.add_sum("ep_falls", fall_mask.float())
+        d.add_sum("ep_goals", self._goal_scored_buf.float())
+        d.add_sum("ep_oob", self._ball_oob_buf.float())
+        d.add_sum("goal_time", self._time_buf * self._goal_scored_buf.float())
+
         done, soft = soccer_util.apply_ball_event_dones(
             self._done_buf, self._goal_scored_buf, self._ball_oob_buf,
             base_env.DoneFlags.NULL.value, base_env.DoneFlags.SUCC.value,
             base_env.DoneFlags.FAIL.value)
         self._done_buf[:] = done
         self._soft_done_buf[:] = soft
+        d.add_sum("ep_done", (done != base_env.DoneFlags.NULL.value).float())
         return
 
     def _update_info(self, env_ids=None):
@@ -849,6 +915,28 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._measurable_obs):
             self._info["recon_tar"] = self._compute_recon_tar()
         return
+
+    def record_diagnostics(self):
+        """Per-iteration diagnostics: windowed means of every weighted reward
+        term plus episode event rates. The window covers every env step since
+        the previous call (train + test rollouts of one iteration) and resets
+        on read. Keys are stable across iterations; rate/time entries report
+        0.0 when the window saw no matching events."""
+        diags = dict(super().record_diagnostics())
+        means, sums = self._diag.pop()
+        diags.update(means)
+
+        eps = sums.get("ep_done", 0.0)
+        goals = sums.get("ep_goals", 0.0)
+        reacq_count = sums.get("reacq_count", 0.0)
+        diags["ep_goal_rate"] = goals / eps if eps > 0.0 else 0.0
+        diags["ep_fall_rate"] = sums.get("ep_falls", 0.0) / eps if eps > 0.0 else 0.0
+        diags["ep_oob_rate"] = sums.get("ep_oob", 0.0) / eps if eps > 0.0 else 0.0
+        diags["ep_touches"] = sums.get("touch_events", 0.0) / eps if eps > 0.0 else 0.0
+        diags["goal_time_mean"] = sums.get("goal_time", 0.0) / goals if goals > 0.0 else 0.0
+        diags["ball_reacquire_time"] = \
+            sums.get("reacq_time", 0.0) / reacq_count if reacq_count > 0.0 else 0.0
+        return diags
 
     def has_critic_obs(self):
         """Whether this env publishes a privileged critic_obs in the info."""
@@ -994,6 +1082,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._aux_reward_buf[env_ids] = 0.0
             self._action_rate_buf[env_ids] = 0.0
             self._prev_action[env_ids] = 0.0
+            self._prev_ball_touch[env_ids] = False
             if (self._measurable_obs):
                 # after prev_action is zeroed: the refilled history must match
                 # the frame the actor sees on its first post-reset step

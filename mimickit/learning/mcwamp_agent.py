@@ -155,6 +155,10 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         if (self._has_aux_env_reward):
             aux_r = aux_r + self._exp_buffer.get_data("aux_env_reward")
 
+        # per-stream reward means (pre critic scaling) for diagnostics
+        task_reward_mean = task_r.mean().detach()
+        aux_reward_mean = aux_r.mean().detach()
+
         goal_scale = self._critic_reward_scales[0]
         aux_scale = self._critic_reward_scales[1]
         task_r = goal_scale * task_r
@@ -203,7 +207,9 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
             "adv_mean": adv_info["adv_mean"],
             "adv_std": adv_info["adv_std"],
             "adv_goal_std": adv_info["adv0_std"],
-            "adv_aux_std": adv_info["adv1_std"]
+            "adv_aux_std": adv_info["adv1_std"],
+            "task_reward_mean": task_reward_mean,
+            "aux_reward_mean": aux_reward_mean
         }
         return info
 
@@ -218,7 +224,15 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         diff = tar_val - pred
         loss = torch.mean(torch.square(diff))
 
+        # per-stream decomposition (diagnostics only; gradients flow through
+        # the combined loss above)
+        sq = torch.square(diff.detach())
+        loss_goal = torch.mean(sq[..., 0])
+        loss_aux = torch.mean(sq[..., 1])
+
         info = {
-            "critic_loss": loss
+            "critic_loss": loss,
+            "critic_loss_goal": loss_goal,
+            "critic_loss_aux": loss_aux
         }
         return info

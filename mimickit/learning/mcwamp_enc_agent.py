@@ -61,7 +61,19 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
             # target, no rand-action mask needed
             norm_obs = self._obs_norm.normalize(batch["obs"])
             pred = self._model.eval_recon(norm_obs)
-            recon_loss = torch.mean(torch.square(pred - batch["recon_tar"]))
+            sq_err = torch.square(pred - batch["recon_tar"])
+            recon_loss = torch.mean(sq_err)
             info["actor_loss"] = info["actor_loss"] + self._enc_recon_weight * recon_loss
             info["recon_loss"] = recon_loss.detach()
+
+            # split by the raw perception mask (last entry of the current
+            # measurable frame): does the decoder fail on visible or on
+            # occluded balls?
+            frame_dim = self._env.get_measurable_frame_dim()
+            visible = batch["obs"][..., frame_dim - 1] > 0.5
+            per_sample = sq_err.detach().mean(dim=-1)
+            n_vis = visible.sum()
+            n_hid = visible.numel() - n_vis
+            info["recon_loss_visible"] = per_sample[visible].sum() / torch.clamp(n_vis, min=1)
+            info["recon_loss_hidden"] = per_sample[~visible].sum() / torch.clamp(n_hid, min=1)
         return info

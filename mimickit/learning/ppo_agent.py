@@ -430,7 +430,7 @@ class PPOAgent(base_agent.BaseAgent):
 
         return info
 
-    def _log_train_info(self, train_info, test_info, env_diag_info, start_time):
-        super()._log_train_info(train_info, test_info, env_diag_info, start_time)
+    def _log_train_info(self, train_info, test_info, train_diag_info, env_diag_info, start_time):
+        super()._log_train_info(train_info, test_info, train_diag_info, env_diag_info, start_time)
         self._logger.log("Exp_Prob", self._get_exp_prob())
         return

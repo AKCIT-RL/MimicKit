@@ -68,6 +68,12 @@ class BaseAgent(torch.nn.Module):
 
         while self._sample_count < max_samples:
             train_info = self._train_iter()
+            # pop the window now so the test rollout below does not mix into
+            # the train diagnostics (envs without the override report the
+            # mixed window under train_diag, as before)
+            train_diag_fn = getattr(self._env, "record_train_diagnostics",
+                                    self._env.record_diagnostics)
+            train_diag_info = train_diag_fn()
             
             self._sample_count = self._update_sample_count()
             output_iter = (self._iter % self._iters_per_output == 0) or (self._sample_count >= max_samples)
@@ -76,7 +82,7 @@ class BaseAgent(torch.nn.Module):
                 test_info = self.test_model(self._test_episodes)
             
             env_diag_info = self._env.record_diagnostics()
-            self._log_train_info(train_info, test_info, env_diag_info, start_time) 
+            self._log_train_info(train_info, test_info, train_diag_info, env_diag_info, start_time) 
             self._logger.print_log()
 
             if (output_iter):
@@ -352,7 +358,7 @@ class BaseAgent(torch.nn.Module):
         val_fail = r_fail / (1.0 - self._discount)
         return val_fail
 
-    def _log_train_info(self, train_info, test_info, env_diag_info, start_time):
+    def _log_train_info(self, train_info, test_info, train_diag_info, env_diag_info, start_time):
         wall_time_secs = time.time() - start_time
         wall_time_hrs = wall_time_secs / (60 * 60) # store time in hours
         
@@ -385,11 +391,17 @@ class BaseAgent(torch.nn.Module):
                 v = v.item()
             self._logger.log(val_name, v)
 
-        for k, v in env_diag_info.items():
-            val_name = k.title()
+        for k, v in train_diag_info.items():
+            val_name = "Train_" + k.title()
             if torch.is_tensor(v):
                 v = v.item()
-            self._logger.log(val_name, v, collection="2_Env", quiet=True)
+            self._logger.log(val_name, v, collection="2_Env_Train", quiet=True)
+
+        for k, v in env_diag_info.items():
+            val_name = "Test_" + k.title()
+            if torch.is_tensor(v):
+                v = v.item()
+            self._logger.log(val_name, v, collection="3_Env_Test", quiet=True)
         
         obs_norm_mean = self._obs_norm.get_mean()
         obs_norm_std = self._obs_norm.get_std()

@@ -56,6 +56,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_perturb_speed_min = float(env_config.get("ball_perturb_speed_min", 1.0))
         self._ball_perturb_speed_max = float(env_config.get("ball_perturb_speed_max", 4.0))
 
+        # ball-event Gaussian curriculum (c4): probability that a random ball
+        # event (perturbation, goal/OOB soft respawn) draws a Gaussian near the
+        # robot (sigma = ball_event_gauss_sigma) instead of the baseline draw.
+        # Ramps 0 -> ball_event_gauss_prob over the sample clock. Only the
+        # spawn distribution of random events changes; falls never relocate
+        # the ball, so there is no free-return loop across hard resets.
+        self._ball_event_gauss_start_samples = \
+            float(env_config.get("ball_event_gauss_start_samples", -1.0))
+        self._ball_event_gauss_end_samples = \
+            float(env_config.get("ball_event_gauss_end_samples", -1.0))
+        self._ball_event_gauss_prob = float(env_config.get("ball_event_gauss_prob", 0.0))
+        self._ball_event_gauss_sigma = float(env_config.get("ball_event_gauss_sigma", 1.0))
+
+
         # per-env static domain randomization (Frente C; ranges follow the
         # HTWK T1 deploy stack, which is validated on real hardware)
         self._rand_ball_props = bool(env_config.get("rand_ball_props", False))
@@ -342,6 +356,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # global control-step counter driving the steering anneal (samples
         # seen by the agent ~= steps * num_envs)
         self._total_env_steps = 0
+
+        # c4 free-return probe: reward collected on continuation steps where
+        # the ball just respawned via a random event but perception has not
+        # seen it yet (see _update_done)
+        self._diag_free_ep_time = torch.zeros([1], device=self._device, dtype=torch.float)
+        self._diag_free_ep_count = torch.zeros([1], device=self._device, dtype=torch.float)
+        # goal-then-wait probe: reward on the last step before a goal (usually
+        # ~0) vs the first steps of the continuation after the soft respawn;
+        # if the latter catches up, the policy idles through goals
+        self._diag_pre_goal_time = torch.zeros([1], device=self._device, dtype=torch.float)
+        self._diag_pre_goal_count = torch.zeros([1], device=self._device, dtype=torch.float)
+        self._diag_post_goal_time = torch.zeros([1], device=self._device, dtype=torch.float)
+        self._diag_post_goal_count = torch.zeros([1], device=self._device, dtype=torch.float)
+        self._prev_ep_free = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._prev_ball_event_step = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._post_goal_steps_left = torch.zeros([num_envs], device=self._device, dtype=torch.long)
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -660,6 +690,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._update_char_push()
         if (self._virtual_perception):
             self._update_perception()
+        self._post_goal_steps_left = torch.clamp(self._post_goal_steps_left - 1, min=0)
         if (self._task_hist_steps > 0):
             # exactly one roll per physics step, after the perception tick so
             # the newest history entry matches what the actor sees this step
@@ -934,6 +965,29 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._done_buf[:] = done
         self._soft_done_buf[:] = soft
         d.add_sum("ep_done", (done != base_env.DoneFlags.NULL.value).float())
+
+        # free-return hack probe: robot sits on the respawn spot between a
+        # random ball event (perturb/soft respawn, NOT a fall or episode
+        # reset) and the first perception of the new position; the cycle then
+        # pays approach/progress without locomotion. Only relevant while the
+        # Gaussian event curriculum is active; the robot sees the result only
+        # via the virtual camera (zero-order hold at the last valid fix).
+        soft_now = torch.logical_and(self._soft_done_buf,
+                                     self._done_buf != base_env.DoneFlags.NULL.value)
+        event_now = torch.logical_or(soft_now, self._prev_ball_event_step)
+        self._diag_free_ep_time += (
+            self._prev_ep_free * (self._task_reward_buf + self._aux_reward_buf)).sum()
+        self._diag_free_ep_count += self._prev_ep_free.float().sum()
+        self._prev_ep_free = torch.logical_and(event_now, ~self._percep_ball_valid)
+        self._prev_ball_event_step[:] = False
+
+        step_r = self._task_reward_buf + self._aux_reward_buf
+        self._diag_pre_goal_time += (self._goal_scored_buf.float() * step_r).sum()
+        self._diag_pre_goal_count += self._goal_scored_buf.float().sum()
+        pg = self._post_goal_steps_left > 0
+        if (pg.any()):
+            self._diag_post_goal_time += (pg.float() * step_r).sum()
+            self._diag_post_goal_count += pg.float().sum()
         return
 
     def _update_info(self, env_ids=None):
@@ -968,6 +1022,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         diags["goal_time_mean"] = sums.get("goal_time", 0.0) / goals if goals > 0.0 else 0.0
         diags["ball_reacquire_time"] = \
             sums.get("reacq_time", 0.0) / reacq_count if reacq_count > 0.0 else 0.0
+        diags["free_return_step_mean"] = \
+            (self._diag_free_ep_time / torch.clamp(self._diag_free_ep_count, min=1.0)).item()
+        diags["free_return_steps"] = self._diag_free_ep_count.item()
+        diags["pre_goal_reward"] = \
+            (self._diag_pre_goal_time / torch.clamp(self._diag_pre_goal_count, min=1.0)).item()
+        diags["post_goal_reward"] = \
+            (self._diag_post_goal_time / torch.clamp(self._diag_post_goal_count, min=1.0)).item()
+        diags["post_goal_steps"] = self._diag_post_goal_count.item()
+        self._diag_free_ep_time[:] = 0.0
+        self._diag_free_ep_count[:] = 0.0
+        self._diag_pre_goal_time[:] = 0.0
+        self._diag_pre_goal_count[:] = 0.0
+        self._diag_post_goal_time[:] = 0.0
+        self._diag_post_goal_count[:] = 0.0
 
         samples = self._get_schedule_samples()
         diags["percep_curriculum"] = soccer_util.compute_curriculum_progress(
@@ -977,6 +1045,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         diags["steer_scale"] = soccer_util.compute_anneal_scale(
             samples, self._steer_anneal_start_samples, self._steer_anneal_end_samples)
         return diags
+
+    def record_train_diagnostics(self):
+        """Like record_diagnostics(), but the window only spans the train
+        rollout of the iteration. Called by the agent after _update_model()."""
+        return self.record_diagnostics()
 
     def _get_schedule_samples(self):
         """Sample clock shared by the steer anneal and the curricula."""
@@ -1038,7 +1111,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
             teleport_ids = env_ids[teleport_mask]
             if (len(teleport_ids) > 0):
-                self._reset_ball(teleport_ids, near=not self._ball_soft_reset_far)
+                self._reset_ball(teleport_ids, near=not self._ball_soft_reset_far,
+                                 gauss=self._ball_event_gauss())
+                self._prev_ball_event_step[teleport_ids] = True
 
             push_ids = env_ids[~teleport_mask]
             m = len(push_ids)
@@ -1127,6 +1202,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._action_rate_buf[env_ids] = 0.0
             self._prev_action[env_ids] = 0.0
             self._prev_ball_touch[env_ids] = False
+            self._post_goal_steps_left[env_ids] = 0
             if (self._measurable_obs):
                 # after prev_action is zeroed: the refilled history must match
                 # the frame the actor sees on its first post-reset step
@@ -1220,7 +1296,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._timestep_buf[env_ids] = 0
         self._time_buf[env_ids] = 0.0
         self._done_buf[env_ids] = base_env.DoneFlags.NULL.value
-        self._reset_ball(env_ids, near=not self._ball_soft_reset_far)
+        self._reset_ball(env_ids, near=not self._ball_soft_reset_far,
+                         gauss=self._ball_event_gauss())
+        self._post_goal_steps_left[:] = 0
+        self._post_goal_steps_left[env_ids] = 16  # ~0.5 s at 30 Hz
         if (self._virtual_perception):
             self._reset_perception(env_ids)
         if (self._task_hist_steps > 0):
@@ -1284,7 +1363,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_pos[env_ids] = self._get_ball_pos()[env_ids]
         return
 
-    def _sample_ball_pos(self, env_ids, near=True):
+    def _sample_ball_pos(self, env_ids, near=True, gauss=None):
         n = env_ids.shape[0]
         half_x = 0.5 * self._field_length - self._spawn_margin
         half_y = 0.5 * self._field_width - self._spawn_margin
@@ -1325,6 +1404,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
             uni += self._field_offset[env_ids]
             ball_pos[~near_mask, 0:2] = uni[~near_mask]
+        if (gauss is not None and gauss[env_ids].any()):
+            # c4: close-range event spawns; clamped into the field and kept
+            # off the robot by the min-distance check below. g_mask/g are
+            # LOCAL indices into this call's env_ids subset (gauss is a
+            # global [num_envs] mask, so indexing by env_ids alone would
+            # select the wrong slots and leak out-of-range entries)
+            g_mask = gauss[env_ids]
+            g_local = g_mask.nonzero(as_tuple=False).flatten()
+            g = env_ids[g_local]
+            gn = len(g)
+            gp = root_pos[g_local, 0:2] \
+                + self._ball_event_gauss_sigma * torch.randn([gn, 2], device=self._device)
+            gp[:, 0] = torch.clamp(gp[:, 0] - self._field_offset[g, 0], -half_x, half_x)
+            gp[:, 1] = torch.clamp(gp[:, 1] - self._field_offset[g, 1], -half_y, half_y)
+            ball_pos[g_local, 0:2] = gp + self._field_offset[g]
         ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
 
         # keep the ball from spawning inside the robot
@@ -1337,11 +1431,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         return ball_pos
 
-    def _reset_ball(self, env_ids, near=True):
+    def _ball_event_gauss(self):
+        """Per-event draw: Gaussian near the robot vs the baseline spawn."""
+        p = soccer_util.compute_curriculum_progress(
+            self._get_schedule_samples(),
+            self._ball_event_gauss_start_samples, self._ball_event_gauss_end_samples)
+        return torch.rand(self.get_num_envs(), device=self._device) \
+            < p * self._ball_event_gauss_prob
+
+    def _reset_ball(self, env_ids, near=True, gauss=None):
         n = env_ids.shape[0]
         ball_id = self._get_ball_id()
 
-        ball_pos = self._sample_ball_pos(env_ids, near=near)
+        ball_pos = self._sample_ball_pos(env_ids, near=near, gauss=gauss)
         ball_rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
         ball_rot[:, 3] = 1.0
         zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)

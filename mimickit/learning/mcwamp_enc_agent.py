@@ -7,6 +7,7 @@ from scratch: the measurable actor obs share no layout with the full-state
 checkpoints, so there is no warm start in this mode.
 """
 
+import numpy as np
 import torch
 
 import learning.mcwamp_agent as mcwamp_agent
@@ -20,6 +21,9 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
     def _load_params(self, config):
         super()._load_params(config)
         self._enc_recon_weight = float(config.get("enc_recon_weight", 1.0))
+        # recon gating: exponential decay of the per-sample weight by frames
+        # since the ball was last seen; <= 0 disables (c5 behavior)
+        self._enc_recon_gate_halflife = float(config.get("enc_recon_gate_halflife", 0.0))
         return
 
     def _build_model(self, config):
@@ -54,6 +58,25 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
         self._exp_buffer.record("recon_tar", info["recon_tar"])
         return
 
+    def _recon_gate_weights(self, obs):
+        """Per-sample weight by how long ago the ball was last seen, derived
+        from the perception mask history in the actor obs (frame_dim-th entry
+        of each 87-dim frame; current frame + H history frames, oldest first).
+        Ball never seen inside the window -> weight 0 (unrecoverable target,
+        pure gradient noise)."""
+        frame_dim = self._env.get_measurable_frame_dim()
+        n_frames = 1 + self._env.get_measurable_hist_steps()
+        mask_idx = torch.arange(0, n_frames, device=obs.device) * frame_dim + frame_dim - 1
+        masks = obs[..., mask_idx] > 0.5  # [T, B, F] oldest -> newest
+        # age = number of frames since the newest visible frame
+        any_vis = masks.any(dim=-1)
+        newest_vis = (masks.float() * torch.arange(1, n_frames + 1, device=obs.device)).argmax(dim=-1)
+        age = (n_frames - 1 - newest_vis).float()  # 0 = visible now
+        half_life = self._enc_recon_gate_halflife
+        w = torch.exp(-age * (np.log(2.0) / half_life))
+        w = torch.where(any_vis, w, torch.zeros_like(w))
+        return w
+
     def _compute_actor_loss(self, batch):
         info = super()._compute_actor_loss(batch)
         if (self._enc_recon_weight != 0.0):
@@ -61,8 +84,12 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
             # target, no rand-action mask needed
             norm_obs = self._obs_norm.normalize(batch["obs"])
             pred = self._model.eval_recon(norm_obs)
-            sq_err = torch.square(pred - batch["recon_tar"])
-            recon_loss = torch.mean(sq_err)
+            sq_err = torch.square(pred - batch["recon_tar"])  # [T, B, 4]
+            if (self._enc_recon_gate_halflife > 0):
+                w = self._recon_gate_weights(batch["obs"]).unsqueeze(-1)
+                recon_loss = (w * sq_err).sum() / torch.clamp(w.sum() * sq_err.shape[-1], min=1.0)
+            else:
+                recon_loss = torch.mean(sq_err)
             info["actor_loss"] = info["actor_loss"] + self._enc_recon_weight * recon_loss
             info["recon_loss"] = recon_loss.detach()
 

@@ -69,6 +69,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_event_gauss_prob = float(env_config.get("ball_event_gauss_prob", 0.0))
         self._ball_event_gauss_sigma = float(env_config.get("ball_event_gauss_sigma", 1.0))
 
+        # c5: freeze the approach/progress potentials while the ball is
+        # unperceived. A hidden teleport paid the potential gap for free in
+        # c3/c4 (free_return_step_mean +2.7/step): the robot idled on respawn
+        # spots instead of searching. With the potential frozen, a hidden
+        # teleport moves the ANCHOR, so no reward is collected until the ball
+        # is seen again; the only way to profit is to look at the new ball.
+        # prev_ball_pos always tracks the TRUE ball so reacquisition is
+        # reward-neutral (no spike from the anchor jump).
+        self._percep_potential_freeze = bool(env_config.get("percep_potential_freeze", False))
+        # perturbations off entirely (evals already override the times)
+        self._ball_perturb_enable = bool(env_config.get("ball_perturb_enable", True))
+
 
         # per-env static domain randomization (Frente C; ranges follow the
         # HTWK T1 deploy stack, which is validated on real hardware)
@@ -820,6 +832,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             approach_r = approach_r * (~rolling).float()
         progress_r = soccer_util.compute_goal_progress_reward(ball_pos, self._prev_ball_pos,
                                                               self._goal_pos)
+        if (self._percep_potential_freeze and self._virtual_perception):
+            # no potential change while the ball is hidden: a teleport is
+            # free distance otherwise, and idling on respawn spots pays
+            hidden = ~self._percep_ball_valid
+            approach_r = approach_r * (~hidden).float()
+            progress_r = progress_r * (~hidden).float()
         dir_r = soccer_util.compute_kick_direction_reward(
             ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
             self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
@@ -1102,6 +1120,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return 4
 
     def _update_ball_perturb(self):
+        if (not self._ball_perturb_enable):
+            return
         trigger_mask = self._time_buf >= self._ball_perturb_times
         env_ids = trigger_mask.nonzero(as_tuple=False).flatten()
         n = len(env_ids)

@@ -81,6 +81,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # perturbations off entirely (evals already override the times)
         self._ball_perturb_enable = bool(env_config.get("ball_perturb_enable", True))
 
+        # c7 active search: while the ball is unperceived, reward yaw sweep
+        # rate of the head (finite difference of heading angle). No
+        # privileged state: the bonus is earned by moving the head, which the
+        # policy measures. Paper fig. 4D/E: turn toward where the ball left
+        # the FOV and re-acquire it.
+        self._search_sweep_w = float(env_config.get("search_sweep_w", 0.0))
+        self._search_sweep_cap = float(env_config.get("search_sweep_cap", 1.5))  # rad/s
+
 
         # per-env static domain randomization (Frente C; ranges follow the
         # HTWK T1 deploy stack, which is validated on real hardware)
@@ -384,6 +392,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ep_free = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._prev_ball_event_step = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._post_goal_steps_left = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._head_yaw_prev = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -917,6 +926,23 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             gaze_r = soccer_util.compute_head_gaze_reward(head_pos, head_rot, ball_pos)
             aux_r += self._reward_head_gaze_w * gaze_r
 
+        # c7 active search: while the ball is unperceived, reward head yaw
+        # sweep rate (finite difference of the heading angle). No privileged
+        # state: the bonus is earned by moving the head, which the policy
+        # measures; the true ball position never enters. Paper fig. 4D/E.
+        if (self._search_sweep_w != 0.0 and self._virtual_perception):
+            if (self._reward_head_gaze_w == 0.0):
+                body_rot = self._engine.get_body_rot(char_id)
+            hidden = ~self._percep_ball_valid
+            head_yaw = torch_util.calc_heading(body_rot[:, self._fov_body_id, :])
+            dyaw = torch.atan2(torch.sin(head_yaw - self._head_yaw_prev),
+                               torch.cos(head_yaw - self._head_yaw_prev))
+            dt = self._engine.get_timestep()
+            sweep = torch.clamp(torch.abs(dyaw) / dt, max=self._search_sweep_cap) \
+                / self._search_sweep_cap
+            aux_r += hidden.float() * (self._search_sweep_w * sweep)
+            self._head_yaw_prev[:] = head_yaw
+
         aux_r += self._reward_action_rate_w * self._action_rate_buf
 
         dof_pos = self._engine.get_dof_pos(char_id)
@@ -941,6 +967,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # _update_done). One step() per control step lives here.
         d = self._diag
         d.step()
+        if (self._search_sweep_w != 0.0 and self._virtual_perception):
+            d.add_mean("reward_search_sweep", hidden.float() * (self._search_sweep_w * sweep))
         d.add_mean("reward_survival", self._reward_survival_w)
         d.add_mean("reward_stagnation", self._reward_stagnation_w * stagnant.float())
         d.add_mean("reward_kick_sideways", kick_side_r)
@@ -1222,6 +1250,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._action_rate_buf[env_ids] = 0.0
             self._prev_action[env_ids] = 0.0
             self._prev_ball_touch[env_ids] = False
+            if (self._search_sweep_w != 0.0):
+                # first post-reset step must not read a stale yaw from the
+                # previous episode (would pay a fake sweep spike)
+                char_id = self._get_char_id()
+                head_rot = self._engine.get_body_rot(char_id)[env_ids, self._fov_body_id, :]
+                self._head_yaw_prev[env_ids] = torch_util.calc_heading(head_rot)
             self._post_goal_steps_left[env_ids] = 0
             if (self._measurable_obs):
                 # after prev_action is zeroed: the refilled history must match

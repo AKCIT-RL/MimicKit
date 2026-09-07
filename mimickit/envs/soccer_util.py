@@ -237,6 +237,25 @@ def compute_kick_components(root_rot, foot_vel, ball_contact):
 
 
 @torch.jit.script
+def compute_kick_alignment_reward(foot_vel, ball_pos, goal_pos, ball_contact):
+    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
+    """Alignment of the foot's planar velocity with the ball->goal direction
+    at ball contact (c8 aiming). cos^4 concentrates the credit on tight
+    alignment: 30 deg pays ~0.56, 60 deg pays ~0.06. Returns [N], zeroed
+    without contact. Unlike kick_direction (speed toward goal), this only
+    scores the IMPACT GEOMETRY: the foot must move where the goal is.
+    """
+    to_goal = goal_pos - ball_pos[..., 0:2]
+    to_goal = to_goal / torch.clamp_min(torch.norm(to_goal, dim=-1, keepdim=True), 1e-6)
+    fv = foot_vel[..., 0:2]
+    speed = torch.norm(fv, dim=-1)
+    cos_ang = torch.sum(fv * to_goal, dim=-1) / torch.clamp_min(speed, 1e-6)
+    cos_ang = torch.clamp(cos_ang, min=0.0)
+    align = cos_ang * cos_ang * cos_ang * cos_ang
+    return align * ball_contact.type_as(align) * (speed > 0.5).type_as(align)
+
+
+@torch.jit.script
 def compute_foot_proximity_penalty(left_foot_pos, right_foot_pos, min_dist):
     # type: (Tensor, Tensor, float) -> Tensor
     """Positive magnitude when the feet are closer than min_dist (planar)."""

@@ -237,6 +237,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_stagnation_w = float(env_config.get("reward_stagnation_w", -100.0))
         self._reward_kick_sideways_w = float(env_config.get("reward_kick_sideways_w", 20.0))
         self._reward_kick_forward_w = float(env_config.get("reward_kick_forward_w", -20.0))
+        self._reward_kick_alignment_w = float(env_config.get("reward_kick_alignment_w", 0.0))
         self._reward_foot_proximity_w = float(env_config.get("reward_foot_proximity_w", -5.0))
         self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", -1.0))
         self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", -100.0))
@@ -898,6 +899,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         body_vel = self._engine.get_body_vel(char_id)
         kick_side_r = torch.zeros_like(aux_r)
         kick_fwd_r = torch.zeros_like(aux_r)
+        kick_align_r = torch.zeros_like(aux_r)
         touch_any = torch.zeros_like(self._prev_ball_touch)
         for i in range(len(self._foot_body_ids)):
             foot_id = self._foot_body_ids[i]
@@ -909,7 +911,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             kick = soccer_util.compute_kick_components(root_rot, foot_vel, contact)
             kick_side_r += self._reward_kick_sideways_w * kick[:, 0]
             kick_fwd_r += self._reward_kick_forward_w * kick[:, 1]
-        aux_r += kick_side_r + kick_fwd_r
+            if (self._reward_kick_alignment_w != 0.0):
+                kick_align_r += self._reward_kick_alignment_w * \
+                    soccer_util.compute_kick_alignment_reward(foot_vel, ball_pos,
+                                                              self._goal_pos, contact)
+        aux_r += kick_side_r + kick_fwd_r + kick_align_r
 
         # regularizations
         left_foot_pos = body_pos[:, self._foot_body_ids[0], :]
@@ -973,6 +979,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("reward_stagnation", self._reward_stagnation_w * stagnant.float())
         d.add_mean("reward_kick_sideways", kick_side_r)
         d.add_mean("reward_kick_forward", kick_fwd_r)
+        d.add_mean("reward_kick_alignment", kick_align_r)
         d.add_mean("reward_foot_proximity", self._reward_foot_proximity_w * foot_prox)
         if (self._reward_head_gaze_w != 0.0):
             d.add_mean("reward_head_gaze", self._reward_head_gaze_w * gaze_r)

@@ -252,6 +252,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_kick_sideways_w = float(env_config.get("reward_kick_sideways_w", 20.0))
         self._reward_kick_forward_w = float(env_config.get("reward_kick_forward_w", -20.0))
         self._reward_kick_alignment_w = float(env_config.get("reward_kick_alignment_w", 0.0))
+        self._kick_alignment_power = float(env_config.get("kick_alignment_power", 4.0))
         # c9: dense shaping for setting up behind the ball (the aiming
         # bottleneck is WHERE the kick starts, not the impact)
         self._reward_kick_position_w = float(env_config.get("reward_kick_position_w", 0.0))
@@ -938,7 +939,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._reward_kick_alignment_w != 0.0):
                 kick_align_r += self._reward_kick_alignment_w * \
                     soccer_util.compute_kick_alignment_reward(foot_vel, ball_pos,
-                                                              self._goal_pos, contact)
+                                                              self._goal_pos, contact,
+                                                              self._kick_alignment_power)
         aux_r += kick_side_r + kick_fwd_r + kick_align_r
 
         # regularizations

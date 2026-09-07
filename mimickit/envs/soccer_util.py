@@ -270,13 +270,15 @@ def compute_behind_spawn_offsets(n: int, dist_min: float, dist_max: float,
 
 
 @torch.jit.script
-def compute_kick_alignment_reward(foot_vel, ball_pos, goal_pos, ball_contact):
-    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
+def compute_kick_alignment_reward(foot_vel, ball_pos, goal_pos, ball_contact,
+                                  power: float = 4.0):
+    # type: (Tensor, Tensor, Tensor, Tensor, float) -> Tensor
     """Alignment of the foot's planar velocity with the ball->goal direction
-    at ball contact (c8 aiming). cos^4 concentrates the credit on tight
-    alignment: 30 deg pays ~0.56, 60 deg pays ~0.06. Returns [N], zeroed
-    without contact. Unlike kick_direction (speed toward goal), this only
-    scores the IMPACT GEOMETRY: the foot must move where the goal is.
+    at ball contact (c8 aiming). cos^power concentrates the credit on tight
+    alignment: power 4 pays 0.56 at 30 deg, power 8 pays 0.31 (c11 sharper).
+    Returns [N], zeroed without contact. Unlike kick_direction (speed toward
+    goal), this only scores the IMPACT GEOMETRY: the foot must move where
+    the goal is.
     """
     to_goal = goal_pos - ball_pos[..., 0:2]
     to_goal = to_goal / torch.clamp_min(torch.norm(to_goal, dim=-1, keepdim=True), 1e-6)
@@ -284,7 +286,7 @@ def compute_kick_alignment_reward(foot_vel, ball_pos, goal_pos, ball_contact):
     speed = torch.norm(fv, dim=-1)
     cos_ang = torch.sum(fv * to_goal, dim=-1) / torch.clamp_min(speed, 1e-6)
     cos_ang = torch.clamp(cos_ang, min=0.0)
-    align = cos_ang * cos_ang * cos_ang * cos_ang
+    align = torch.pow(cos_ang, power)
     return align * ball_contact.type_as(align) * (speed > 0.5).type_as(align)
 
 

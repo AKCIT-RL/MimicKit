@@ -89,6 +89,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._search_sweep_w = float(env_config.get("search_sweep_w", 0.0))
         self._search_sweep_cap = float(env_config.get("search_sweep_cap", 1.5))  # rad/s
 
+        # c10 search curriculum: growing share of spawns in the REAR cone of
+        # the robot (starts outside the camera FOV). Head-only sweeps cannot
+        # find a ball behind the robot; this forces the body-turn search the
+        # paper shows in fig. 3B/C. Distribution change, not reward.
+        self._ball_behind_prob = float(env_config.get("ball_behind_prob", 0.0))
+        self._ball_behind_start_samples = \
+            float(env_config.get("ball_behind_start_samples", -1.0))
+        self._ball_behind_end_samples = \
+            float(env_config.get("ball_behind_end_samples", -1.0))
+        self._ball_behind_dist_min = float(env_config.get("ball_behind_dist_min", 1.0))
+        self._ball_behind_dist_max = float(env_config.get("ball_behind_dist_max", 4.0))
+        self._ball_behind_half_cone = \
+            float(env_config.get("ball_behind_half_cone_deg", 60.0)) * np.pi / 180.0
+
 
         # per-env static domain randomization (Frente C; ranges follow the
         # HTWK T1 deploy stack, which is validated on real hardware)
@@ -1107,6 +1121,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             samples, self._ball_curriculum_start_samples, self._ball_curriculum_end_samples)
         diags["steer_scale"] = soccer_util.compute_anneal_scale(
             samples, self._steer_anneal_start_samples, self._steer_anneal_end_samples)
+        diags["ball_behind_curriculum"] = soccer_util.compute_curriculum_progress(
+            samples, self._ball_behind_start_samples, self._ball_behind_end_samples)
         return diags
 
     def record_train_diagnostics(self):
@@ -1453,6 +1469,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             far_prob = p * self._ball_curriculum_far_prob
             far = torch.rand(n, device=self._device) < far_prob
             near_mask &= ~far
+        behind_mask = torch.zeros([n], device=self._device, dtype=torch.bool)
+        if (self._ball_behind_start_samples >= 0):
+            # c10: growing share of rear-cone spawns (out of the FOV)
+            p = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(),
+                self._ball_behind_start_samples, self._ball_behind_end_samples)
+            behind_mask = torch.rand(n, device=self._device) \
+                < p * self._ball_behind_prob
+            near_mask &= ~behind_mask
         if (near_mask.any()):
             # in front of the robot in its heading frame, then clamped into
             # the field so border spawns stay in bounds
@@ -1469,12 +1494,27 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_local[:, 0] = torch.clamp(ball_local[:, 0], -half_x, half_x)
             ball_local[:, 1] = torch.clamp(ball_local[:, 1], -half_y, half_y)
             ball_pos[:, 0:2] = ball_local + self._field_offset[env_ids]
+        if (behind_mask.any()):
+            # rear cone in the heading frame: starts outside the FOV
+            root_rot_b = self._engine.get_root_rot(char_id)[env_ids]
+            heading_rot_b = torch_util.calc_heading_quat(root_rot_b)
+            off2 = soccer_util.compute_behind_spawn_offsets(
+                n, self._ball_behind_dist_min, self._ball_behind_dist_max,
+                self._ball_behind_half_cone, self._device)
+            offset_b = torch_util.quat_rotate(heading_rot_b,
+                                              torch.cat([off2, torch.zeros([n, 1], device=self._device)], dim=-1))
+            ball_local_b = root_pos[:, 0:2] + offset_b[:, 0:2] - self._field_offset[env_ids]
+            ball_local_b[:, 0] = torch.clamp(ball_local_b[:, 0], -half_x, half_x)
+            ball_local_b[:, 1] = torch.clamp(ball_local_b[:, 1], -half_y, half_y)
+            ball_pos[behind_mask, 0:2] = (ball_local_b + self._field_offset[env_ids])[behind_mask]
         if (not near_mask.all()):
-            uni = torch.zeros([n, 2], device=self._device, dtype=torch.float)
-            uni[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
-            uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
-            uni += self._field_offset[env_ids]
-            ball_pos[~near_mask, 0:2] = uni[~near_mask]
+            uni_mask = ~(near_mask | behind_mask)
+            if (uni_mask.any()):
+                uni = torch.zeros([n, 2], device=self._device, dtype=torch.float)
+                uni[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
+                uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+                uni += self._field_offset[env_ids]
+                ball_pos[uni_mask, 0:2] = uni[uni_mask]
         if (gauss is not None and gauss[env_ids].any()):
             # c4: close-range event spawns; clamped into the field and kept
             # off the robot by the min-distance check below. g_mask/g are

@@ -257,6 +257,19 @@ def compute_kick_components(root_rot, foot_vel, ball_contact):
 
 
 @torch.jit.script
+def compute_behind_spawn_offsets(n: int, dist_min: float, dist_max: float,
+                                 half_cone_rad: float, device: torch.device):
+    """Planar offsets in the robot heading frame, sampled in the REAR cone
+    (c10 search curriculum): distance U(dist_min, dist_max), angle U(pi -
+    half_cone, pi + half_cone) measured from the +x (forward) axis. A spawn
+    behind the robot starts outside the camera FOV, forcing a body-turn
+    search instead of a head-only sweep. Returns [n, 2]."""
+    d = dist_min + (dist_max - dist_min) * torch.rand(n, device=device)
+    theta = np.pi + (2.0 * torch.rand(n, device=device) - 1.0) * half_cone_rad
+    return torch.stack([d * torch.cos(theta), d * torch.sin(theta)], dim=-1)
+
+
+@torch.jit.script
 def compute_kick_alignment_reward(foot_vel, ball_pos, goal_pos, ball_contact):
     # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     """Alignment of the foot's planar velocity with the ball->goal direction

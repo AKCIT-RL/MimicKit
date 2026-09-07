@@ -128,6 +128,26 @@ def compute_ball_approach_reward(root_pos, prev_root_pos, ball_pos, prev_ball_po
 
 
 @torch.jit.script
+def compute_kick_position_reward(root_pos, ball_pos, goal_pos, near_dist: float):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Robot behind the ball (ball->goal side) while close to it (c9 aim).
+
+    alignment = cos(robot->ball, ball->goal) in the plane: 1 when the robot
+    sits between the ball and its own goal side, facing the goal through the
+    ball. Paid only within ``near_dist`` of the ball so it is a setup term,
+    not a chase term. Returns [N] in [0, 1].
+    """
+    rb = ball_pos[..., 0:2] - root_pos[..., 0:2]
+    bg = goal_pos - ball_pos[..., 0:2]
+    dist = torch.linalg.norm(rb, dim=-1)
+    cos_ang = torch.sum(rb * bg, dim=-1) / torch.clamp_min(
+        torch.linalg.norm(rb, dim=-1) * torch.linalg.norm(bg, dim=-1), 1e-6)
+    align = torch.clamp(cos_ang, min=0.0)
+    near = torch.clamp(1.0 - dist / near_dist, min=0.0)
+    return align * align * near
+
+
+@torch.jit.script
 def compute_goal_progress_reward(ball_pos, prev_ball_pos, goal_pos):
     # type: (Tensor, Tensor, Tensor) -> Tensor
     """Potential-based ball->goal shaping: r = d_prev - d_curr (planar)."""

@@ -238,6 +238,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_kick_sideways_w = float(env_config.get("reward_kick_sideways_w", 20.0))
         self._reward_kick_forward_w = float(env_config.get("reward_kick_forward_w", -20.0))
         self._reward_kick_alignment_w = float(env_config.get("reward_kick_alignment_w", 0.0))
+        # c9: dense shaping for setting up behind the ball (the aiming
+        # bottleneck is WHERE the kick starts, not the impact)
+        self._reward_kick_position_w = float(env_config.get("reward_kick_position_w", 0.0))
+        self._kick_position_near_dist = float(env_config.get("kick_position_near_dist", 1.5))  # m
         self._reward_foot_proximity_w = float(env_config.get("reward_foot_proximity_w", -5.0))
         self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", -1.0))
         self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", -100.0))
@@ -852,6 +856,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
             self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
         goal_r = self._goal_scored_buf.float()
+        position_r = torch.zeros_like(goal_r)
+        if (self._reward_kick_position_w != 0.0):
+            position_r = soccer_util.compute_kick_position_reward(
+                root_pos, ball_pos, self._goal_pos, self._kick_position_near_dist)
 
         # on the goal step the ball crosses past the potential's minimum, so
         # the shaping terms would fire a large negative spike that cancels the
@@ -860,7 +868,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         self._task_reward_buf[:] = shaping_mask * (self._reward_ball_approach_w * approach_r
                                                    + self._reward_goal_progress_w * progress_r
-                                                   + self._reward_kick_direction_w * dir_r) \
+                                                   + self._reward_kick_direction_w * dir_r
+                                                   + self._reward_kick_position_w * position_r) \
             + self._reward_goal_scored_w * goal_r
 
         # diagnostics: weighted per-term means (goal stream decomposition)
@@ -868,6 +877,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("reward_ball_approach", shaping_mask * self._reward_ball_approach_w * approach_r)
         d.add_mean("reward_goal_progress", shaping_mask * self._reward_goal_progress_w * progress_r)
         d.add_mean("reward_kick_direction", shaping_mask * self._reward_kick_direction_w * dir_r)
+        d.add_mean("reward_kick_position", shaping_mask * self._reward_kick_position_w * position_r)
         d.add_mean("reward_goal_scored", self._reward_goal_scored_w * goal_r)
         return
 

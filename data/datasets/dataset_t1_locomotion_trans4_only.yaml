@@ -1,0 +1,13 @@
+# Booster T1: SOMENTE transicoes - sem walk, sem run, sem stand.
+# Ablacao do dataset_t1_locomotion_trans4_nostand.yaml: remove os dois clipes ciclicos
+# de locomocao, deixando so os arcos de transicao. Todos entram como CLAMP, ou
+# seja este dataset nao tem nenhum ciclo de marcha sustentada.
+motions:
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_stand.pkl"
+    weight: 1.0

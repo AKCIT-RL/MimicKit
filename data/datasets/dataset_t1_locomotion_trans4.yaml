@@ -1,0 +1,21 @@
+# Booster T1: locomocao + parado + transicoes, retargetado do ACCAD com GMR.
+# Walk/run/stand com os mesmos pesos do dataset_t1_locomotion_stand.yaml, para a
+# unica variavel deste experimento ser o conjunto de transicoes adicionado.
+# As transicoes usam loop_mode CLAMP: nao sao ciclicas, e com WRAP o
+# discriminador veria um teleporte de pose por ciclo (seam medida 6.8-9.9,
+# contra 0.98 do walk e 3.82 do run).
+motions:
+  - file: "data/motions/t1/t1_walk.pkl"
+    weight: 2.0
+  - file: "data/motions/t1/t1_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_stand.pkl"
+    weight: 1.0

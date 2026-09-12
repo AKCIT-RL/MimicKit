@@ -1,0 +1,11 @@
+# Booster T1 locomotion + standing, retargeted from ACCAD mocap with GMR.
+# Source: accad_bvh/Male2_B3_Walk.bvh, Male2_C3_Run.bvh, Male2_A1_Stand.bvh
+# Walk/run weights identical to dataset_t1_locomotion.yaml so the only
+# difference against the t1_fixed baseline is the added standing clip.
+motions:
+  - file: "data/motions/t1/t1_walk.pkl"
+    weight: 2.0
+  - file: "data/motions/t1/t1_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand.pkl"
+    weight: 1.0

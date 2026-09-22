@@ -27,6 +27,7 @@ import torch
 
 import envs.steering_dr as steering_dr
 import envs.steering_disc as steering_disc
+import envs.steering_reward as steering_reward
 import envs.steering_util as steering_util
 import envs.task_steering_env as task_steering_env
 import util.torch_util as torch_util
@@ -61,6 +62,12 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._disc_table3 = bool(env_config.get("disc_obs_table3", False))
         self._disc_foot_bodies = list(env_config.get(
             "disc_foot_bodies", ["left_ankle_roll_link", "right_ankle_roll_link"]))
+
+        # regularization rewards (Table 4). Weight 0 keeps the env bit-identical
+        # to the runs that came before, so this is inert unless a config asks.
+        self._reward_foot_proximity_w = float(env_config.get("reward_foot_proximity_w", 0.0))
+        self._foot_proximity_min_dist = float(env_config.get("foot_proximity_min_dist", 0.2))
+        self._aux_reward_enabled = (self._reward_foot_proximity_w != 0.0)
 
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
@@ -150,6 +157,14 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._meas_hist_buf = torch.zeros(
             [num_envs, self._meas_hist_steps, self._meas_frame_dim],
             device=self._device, dtype=torch.float)
+
+        if (self._aux_reward_enabled):
+            self._aux_reward_buf = torch.zeros([num_envs], device=self._device,
+                                               dtype=torch.float)
+            char_id = self._get_char_id()
+            self._reward_foot_body_ids = [
+                self._engine.find_obj_body_id(char_id, name)
+                for name in self._disc_foot_bodies]
 
         if (self._disc_table3):
             # before _build_data_buffers, which sizes the disc obs from a demo
@@ -273,12 +288,45 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
     def get_recon_tar_size(self):
         return RECON_TAR_DIM
 
+    def _update_reward(self):
+        super()._update_reward()
+        if (self._aux_reward_enabled):
+            self._cache_aux_reward()
+        return
+
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
+        if (self._aux_reward_enabled):
+            # _update_info runs BEFORE _update_reward (sim_env._post_physics_step),
+            # so this publishes the buffer before _cache_aux_reward fills it.
+            # That is safe ONLY because _cache_aux_reward mutates in place
+            # (buf[:] = ...): the agent reads this reference after step() has
+            # returned, by which point the values are current. Rebinding the
+            # buffer there instead would leave stale zeros here, silently.
+            self._info["aux_reward"] = self._aux_reward_buf
         # always full-N regardless of env_ids: the agent records these straight
         # into a [num_envs, ...] buffer, on reset as well as on step
         self._info["critic_obs"] = self._compute_critic_obs()
         self._info["recon_tar"] = self._compute_recon_tar()
+        return
+
+    # --------------------------------------------------- regularization reward
+
+    def _cache_aux_reward(self):
+        """Table 4 regularization terms, published as info["aux_reward"].
+
+        mcwamp_agent picks this up on its own (it checks for the key and adds
+        it to the auxiliary critic stream), so nothing changes agent-side. The
+        goal critic keeps seeing only the steering task reward."""
+        char_id = self._get_char_id()
+        body_pos = self._engine.get_body_pos(char_id)
+        left = body_pos[:, self._reward_foot_body_ids[0], :]
+        right = body_pos[:, self._reward_foot_body_ids[1], :]
+
+        foot_prox = steering_reward.compute_foot_proximity_penalty(
+            left, right, self._foot_proximity_min_dist)
+        self._foot_prox_last = foot_prox
+        self._aux_reward_buf[:] = self._reward_foot_proximity_w * foot_prox
         return
 
     # -------------------------------------------------------- discriminator

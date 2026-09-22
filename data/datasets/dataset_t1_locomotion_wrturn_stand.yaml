@@ -1,0 +1,47 @@
+# Booster T1 - wrturn + t1_stand.pkl (postura parada sustentada).
+# Identico a dataset_t1_locomotion_wrturn.yaml mais UM clipe: a motion estatica.
+#
+# Motivo: o wrturn tem 16 clipes, todos de caminhada/corrida/giro, e o unico com
+# "stand" no nome e t1_stand_to_walk.pkl - uma TRANSICAO curta, nao uma pose
+# parada sustentada. O discriminador nunca ve como e ficar parado de verdade,
+# entao o reward de estilo nao tem referencia para moldar uma postura quieta -
+# a hipotese para os micro-passos com comando zero no deploy.
+#
+# Peso 1.0, igual aos outros 16 (5,9% da amostragem). Os datasets _stand/_trans*
+# usam 2.0 no clipe estatico; aqui a variavel testada e "a motion existe ou
+# nao", nao "quanto ela domina" - justamente o regime que ja atrapalhou antes.
+motions:
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_around.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_around.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand.pkl"
+    weight: 1.0

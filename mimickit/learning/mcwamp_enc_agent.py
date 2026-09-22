@@ -58,15 +58,25 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
         self._exp_buffer.record("recon_tar", info["recon_tar"])
         return
 
+    def _ball_mask_frame_index(self):
+        """Index of the ball detection mask inside one measurable frame. The
+        env owns the layout (robot slots may follow the mask); envs without
+        the hook keep the v1 convention (last entry of the frame)."""
+        fn = getattr(self._env, "get_ball_mask_frame_index", None)
+        if (fn is not None):
+            return int(fn())
+        return self._env.get_measurable_frame_dim() - 1
+
     def _recon_gate_weights(self, obs):
         """Per-sample weight by how long ago the ball was last seen, derived
-        from the perception mask history in the actor obs (frame_dim-th entry
-        of each 87-dim frame; current frame + H history frames, oldest first).
-        Ball never seen inside the window -> weight 0 (unrecoverable target,
-        pure gradient noise)."""
+        from the perception mask history in the actor obs (ball-mask entry of
+        each measurable frame; current frame + H history frames, oldest
+        first). Ball never seen inside the window -> weight 0 (unrecoverable
+        target, pure gradient noise)."""
         frame_dim = self._env.get_measurable_frame_dim()
         n_frames = 1 + self._env.get_measurable_hist_steps()
-        mask_idx = torch.arange(0, n_frames, device=obs.device) * frame_dim + frame_dim - 1
+        mask_idx = torch.arange(0, n_frames, device=obs.device) * frame_dim \
+            + self._ball_mask_frame_index()
         masks = obs[..., mask_idx] > 0.5  # [T, B, F] oldest -> newest
         # age = number of frames since the newest visible frame
         any_vis = masks.any(dim=-1)
@@ -93,11 +103,10 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
             info["actor_loss"] = info["actor_loss"] + self._enc_recon_weight * recon_loss
             info["recon_loss"] = recon_loss.detach()
 
-            # split by the raw perception mask (last entry of the current
-            # measurable frame): does the decoder fail on visible or on
-            # occluded balls?
-            frame_dim = self._env.get_measurable_frame_dim()
-            visible = batch["obs"][..., frame_dim - 1] > 0.5
+            # split by the raw perception mask (ball-mask entry of the
+            # current measurable frame): does the decoder fail on visible or
+            # on occluded balls?
+            visible = batch["obs"][..., self._ball_mask_frame_index()] > 0.5
             per_sample = sq_err.detach().mean(dim=-1)
             n_vis = visible.sum()
             n_hid = visible.numel() - n_vis

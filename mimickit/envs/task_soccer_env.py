@@ -278,6 +278,56 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._visualize_field = bool(env_config.get("visualize_field", False))
         self._visualize_debug_arrows = bool(env_config.get("visualize_debug_arrows", False))
 
+        # ---- Fase 1: other robots on the field (obstacle-aware skill) ----
+        # Physical stand-ins are heavy capsules held kinematically (pose
+        # rewritten every control step). Obstacle 0 is the goalkeeper slot,
+        # obstacle 1 the field obstacle. Scenario ids: 0 none, 1 keeper,
+        # 2 field obstacle, 3 both. Defaults (0 slots, 0 obstacles) keep the
+        # v1 obs/critic/recon contracts bit-identical.
+        self._num_robot_slots = int(env_config.get("num_robot_slots", 0))
+        self._num_obstacles = int(env_config.get("num_obstacles", 0))
+        assert self._num_robot_slots >= 0 and self._num_obstacles >= 0
+        assert self._num_obstacles <= 2, "scenario table supports at most 2 obstacles (keeper + field)"
+        self._obstacle_radius = float(env_config.get("obstacle_radius", 0.2))
+        self._obstacle_height = float(env_config.get("obstacle_height", 0.6))  # capsule center z
+        self._obstacle_park_z = float(env_config.get("obstacle_park_z", 30.0))
+        self._obstacle_collision_dist = float(env_config.get("obstacle_collision_dist", 0.45))
+        self._reward_obstacle_collision_w = float(env_config.get("reward_obstacle_collision_w", 0.0))
+        # scenario mixture schedule: piecewise-constant weights over the
+        # sample clock (see soccer_util.compute_stage_weights)
+        self._obstacle_stage_samples = list(env_config.get("obstacle_stage_samples", [0.0]))
+        self._obstacle_stage_weights = list(env_config.get("obstacle_stage_weights",
+                                                           [[1.0, 0.0, 0.0, 0.0]]))
+        for w in self._obstacle_stage_weights:
+            assert len(w) == 4, "obstacle_stage_weights rows are [none, keeper, field, both]"
+        if (self._num_obstacles == 0):
+            for w in self._obstacle_stage_weights:
+                assert float(w[1]) == 0.0 and float(w[2]) == 0.0 and float(w[3]) == 0.0, \
+                    "obstacle scenarios need num_obstacles > 0"
+        # scripted goalkeeper (obstacle 0)
+        self._keeper_depth = float(env_config.get("keeper_depth", 0.35))
+        self._keeper_lateral_range = float(env_config.get(
+            "keeper_lateral_range", 0.5 * self._goal_width - self._obstacle_radius))
+        self._keeper_speed_max = float(env_config.get("keeper_speed_max", 0.6))
+        self._keeper_track_prob = float(env_config.get("keeper_track_prob", 0.7))
+        self._keeper_reaction_period = float(env_config.get("keeper_reaction_period", 0.3))
+        # field obstacle (obstacle 1) spawn: [uniform, robot->ball line, ball->goal line]
+        self._obstacle_spawn_mode_probs = list(env_config.get("obstacle_spawn_mode_probs",
+                                                              [0.3, 0.3, 0.4]))
+        assert len(self._obstacle_spawn_mode_probs) == 3
+        self._obstacle_min_dist_robot = float(env_config.get("obstacle_min_dist_robot", 1.0))
+        self._obstacle_min_dist_ball = float(env_config.get("obstacle_min_dist_ball", 0.6))
+        # robot detection through the same virtual camera as the ball
+        self._percep_robot_detect_prob = float(env_config.get("percep_robot_detect_prob", 0.85))
+        self._percep_robot_detect_full_range = float(env_config.get("percep_robot_detect_full_range", 6.0))
+        self._percep_robot_detect_decay_range = float(env_config.get("percep_robot_detect_decay_range", 3.0))
+        self._percep_robot_noise_dist_coef = float(env_config.get("percep_robot_noise_dist_coef", 0.15))
+        self._percep_robot_noise_base = float(env_config.get("percep_robot_noise_base", 0.2))
+        # kick-direction reward aimed at the open goal MOUTH (velocity ray
+        # hitting anywhere between the posts is flat) instead of the center
+        self._kick_direction_mouth = bool(env_config.get("kick_direction_mouth", False))
+        self._kick_direction_half_mouth = 0.5 * self._goal_width - self._ball_radius
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
@@ -288,6 +338,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _build_envs(self, config, num_envs):
         self._ball_id = None
+        self._obstacle_ids = None
         super()._build_envs(config, num_envs)
         return
 
@@ -313,6 +364,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._ball_id = ball_id
         else:
             assert(ball_id == self._ball_id)
+
+        obstacle_ids = self._build_obstacles(env_id)
+        if (env_id == 0):
+            self._obstacle_ids = obstacle_ids
+        else:
+            assert(obstacle_ids == self._obstacle_ids)
 
         self._randomize_env_props(env_id, ball_id)
         return
@@ -364,6 +421,27 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                           start_rot=start_rot,
                                           color=[0.9, 0.9, 0.9])
         return ball_id
+
+    def _build_obstacles(self, env_id):
+        """Rigid capsule stand-ins for other robots (Fase 1); created parked
+        above the field, placed by _reset_obstacles. Returns the obj ids."""
+        asset_file = "data/assets/objects/robot_obstacle.xml"
+        colors = [[0.95, 0.85, 0.1], [0.9, 0.2, 0.2]]  # keeper yellow, field red
+        start_rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        ids = []
+        for m in range(self._num_obstacles):
+            start_pos = np.array([1.0 * m, 0.0, self._obstacle_park_z], dtype=np.float32)
+            if (self._build_field_offsets is not None):
+                start_pos[0:2] += self._build_field_offsets[env_id]
+            obj_id = self._engine.create_obj(env_id=env_id,
+                                             obj_type=engine.ObjType.rigid,
+                                             asset_file=asset_file,
+                                             name="obstacle{:d}".format(m),
+                                             start_pos=start_pos,
+                                             start_rot=start_rot,
+                                             color=colors[m % len(colors)])
+            ids.append(obj_id)
+        return ids
 
     def _build_sim_tensors(self, config):
         super()._build_sim_tensors(config)
@@ -442,6 +520,28 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
 
+        # Fase 1 obstacle state (M physical obstacles; commanded pose == true
+        # pose since they are held kinematically) + scenario per env
+        M = self._num_obstacles
+        self._obs_active = torch.zeros([num_envs, M], device=self._device, dtype=torch.bool)
+        self._obs_pos = torch.zeros([num_envs, M, 2], device=self._device, dtype=torch.float)
+        self._obs_vel = torch.zeros([num_envs, M, 2], device=self._device, dtype=torch.float)
+        self._scenario = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._keeper_tracks = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._keeper_target = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._keeper_next_react = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._prev_obs_contact = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._prev_ball_blocked = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        # robots go through the same camera ring buffer as the ball
+        self._percep_buf_rob_pos = torch.zeros([num_envs, K, M, 2], device=self._device,
+                                               dtype=torch.float)
+        self._percep_buf_rob_valid = torch.zeros([num_envs, K, M], device=self._device,
+                                                 dtype=torch.bool)
+        self._percep_rob_pos = torch.zeros([num_envs, M, 2], device=self._device, dtype=torch.float)
+        self._percep_rob_valid = torch.zeros([num_envs, M], device=self._device, dtype=torch.bool)
+        self._robot_team = torch.zeros([num_envs, self._num_robot_slots], device=self._device,
+                                       dtype=torch.float)
+
         # per-iteration diagnostics window (reward-term decomposition +
         # episode event rates); popped and reset by record_diagnostics()
         self._diag = diag_util.DiagWindow(self._device)
@@ -451,22 +551,25 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                              dtype=torch.float)
 
         # task-obs history buffer (Frente F-lite); 12 = steer 5 + soccer 6 + mask 1
+        # (+ 4 per robot slot)
+        task_block_dim = self.get_task_block_dim()
         if (self._task_hist_steps > 0):
-            self._task_hist_buf = torch.zeros([num_envs, self._task_hist_steps, 12],
+            self._task_hist_buf = torch.zeros([num_envs, self._task_hist_steps, task_block_dim],
                                               device=self._device, dtype=torch.float)
             if (self._virtual_perception):
                 # privileged twin (true ball) for the asymmetric critic
                 self._critic_task_hist_buf = torch.zeros(
-                    [num_envs, self._task_hist_steps, 12],
+                    [num_envs, self._task_hist_steps, task_block_dim],
                     device=self._device, dtype=torch.float)
 
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
         self._action_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
-        # measurable-frame history (Frente F): 6 proprio + 3 * D + 12 task
+        # measurable-frame history (Frente F): 6 proprio + 3 * D + task block
+        # (12 + 4 per robot slot)
         if (self._measurable_obs):
-            self._meas_frame_dim = 6 + 3 * action_dim + 12
+            self._meas_frame_dim = 6 + 3 * action_dim + task_block_dim
             self._meas_hist_buf = torch.zeros(
                 [num_envs, self._meas_hist_steps, self._meas_frame_dim],
                 device=self._device, dtype=torch.float)
@@ -639,7 +742,52 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                            goal_pos, goal_dir)
         # ball detection mask (Table 2); real dropout when the virtual
         # perception pipeline is enabled, constant 1 otherwise
-        return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
+        block = torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
+        if (self._num_robot_slots > 0):
+            # Fase 1: K nearest robots [x, y, team, mask] after the ball mask
+            slots = self._compute_robot_slots(root_pos, root_rot, env_ids, privileged)
+            block = torch.cat([block, slots], dim=-1)
+        return block
+
+    def _compute_robot_slots(self, root_pos, root_rot, env_ids=None, privileged=False):
+        """Actor robot slots from the perceived robot state (true state when
+        privileged or when the virtual perception is off)."""
+        if (self._virtual_perception and not privileged):
+            rob_pos = self._percep_rob_pos
+            rob_valid = self._percep_rob_valid
+        else:
+            rob_pos = self._obs_pos
+            rob_valid = self._obs_active
+        team = self._robot_team
+        if (env_ids is not None):
+            rob_pos = rob_pos[env_ids]
+            rob_valid = rob_valid[env_ids]
+            team = team[env_ids]
+        local_pos, _, mask = soccer_util.compute_nearest_robots(
+            root_pos, root_rot, rob_pos, torch.zeros_like(rob_pos), rob_valid,
+            self._num_robot_slots)
+        return soccer_util.build_robot_slot_obs(local_pos, mask, team)
+
+    def get_task_block_dim(self):
+        """steer 5 + soccer 6 + ball mask 1 + ROBOT_SLOT_DIM per robot slot."""
+        return 12 + soccer_util.ROBOT_SLOT_DIM * self._num_robot_slots
+
+    def get_num_robot_slots(self):
+        return self._num_robot_slots
+
+    def get_num_obstacles(self):
+        return self._num_obstacles
+
+    def get_task_obs_mirror_extra_signs(self):
+        """Mirror signs of the task-block dims appended after the v1 12-dim
+        block (robot slots); empty list for the v1 layout."""
+        return list(soccer_util.ROBOT_SLOT_MIRROR_SIGNS) * self._num_robot_slots
+
+    def get_ball_mask_frame_index(self):
+        """Index of the ball detection mask inside one measurable frame."""
+        assert self._measurable_obs
+        action_dim = self._action_space.shape[0]
+        return 6 + 3 * action_dim + 11
 
     def _compute_measurable_frame(self, env_ids=None):
         """One measurable frame: [proprio (6 + 3D) | task block (12)]."""
@@ -718,7 +866,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                self._ball_still_time + dt)
 
         # 2. cache the rewards before any ball teleport corrupts the
-        #    potentials or the contact geometry
+        #    potentials or the contact geometry (obstacles move first so the
+        #    collision term sees this step's pose)
+        if (self._num_obstacles > 0):
+            self._update_obstacles(ball_pos)
         self._cache_task_reward(ball_pos, ball_vel, rolling)
         self._cache_aux_reward(ball_pos)
 
@@ -745,6 +896,162 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._meas_hist_buf[:, -1] = self._compute_measurable_frame()
         return
 
+    def _update_obstacles(self, ball_pos):
+        """Scripted keeper tracking + kinematic hold of every obstacle (true
+        ball state drives the keeper; the actor only sees the perceived
+        robots). Called once per control step before the rewards."""
+        dt = self._engine.get_timestep()
+        new_pos = self._obs_pos.clone()
+        keeper_on = torch.logical_and(self._obs_active[:, 0], self._keeper_tracks)
+        if (keeper_on.any()):
+            react = torch.logical_and(keeper_on, self._time_buf >= self._keeper_next_react)
+            if (react.any()):
+                target = soccer_util.compute_keeper_target(
+                    ball_pos, self._goal_pos, self._goal_dir,
+                    self._keeper_depth, self._keeper_lateral_range)
+                self._keeper_target[react] = target[react]
+                self._keeper_next_react[react] = self._time_buf[react] + self._keeper_reaction_period
+            max_step = torch.full([self.get_num_envs()], self._keeper_speed_max * dt,
+                                  device=self._device, dtype=torch.float)
+            moved = soccer_util.move_toward(self._obs_pos[:, 0], self._keeper_target, max_step)
+            new_pos[:, 0] = torch.where(keeper_on.unsqueeze(-1), moved, self._obs_pos[:, 0])
+        self._obs_vel[:] = (new_pos - self._obs_pos) / dt
+        self._obs_pos[:] = new_pos
+        self._write_obstacle_state(None)
+        return
+
+    def _write_obstacle_state(self, env_ids):
+        """Push the commanded obstacle poses to the engine (applied at the
+        start of the next physics step). Inactive obstacles are parked high
+        above their field, spread out so they never touch each other."""
+        n = self.get_num_envs() if env_ids is None else len(env_ids)
+        active = self._obs_active if env_ids is None else self._obs_active[env_ids]
+        pos2 = self._obs_pos if env_ids is None else self._obs_pos[env_ids]
+        vel2 = self._obs_vel if env_ids is None else self._obs_vel[env_ids]
+        offset = self._field_offset if env_ids is None else self._field_offset[env_ids]
+        rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
+        rot[:, 3] = 1.0
+        zero3 = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        for m, obj_id in enumerate(self._obstacle_ids):
+            act = active[:, m].unsqueeze(-1)
+            park = offset.clone()
+            park[:, 0] += 1.0 * m
+            pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+            pos[:, 0:2] = torch.where(act, pos2[:, m], park)
+            pos[:, 2] = torch.where(active[:, m],
+                                    torch.full([n], self._obstacle_height + self._ground_z_offset,
+                                               device=self._device),
+                                    torch.full([n], self._obstacle_park_z, device=self._device))
+            vel = zero3.clone()
+            vel[:, 0:2] = torch.where(act, vel2[:, m], torch.zeros_like(vel2[:, m]))
+            self._engine.set_root_pos(env_ids, obj_id, pos)
+            self._engine.set_root_rot(env_ids, obj_id, rot)
+            self._engine.set_root_vel(env_ids, obj_id, vel)
+            self._engine.set_root_ang_vel(env_ids, obj_id, zero3)
+        return
+
+    def _current_scenario_weights(self):
+        return soccer_util.compute_stage_weights(
+            self._get_schedule_samples(), self._obstacle_stage_samples,
+            self._obstacle_stage_weights)
+
+    def _reset_obstacles(self, env_ids, scenario=None, deterministic=False):
+        """Sample a scenario per env (or force one) and place the obstacles.
+        Must run after the robot placement and the ball reset (the keeper
+        station and the field-obstacle spawn lines depend on both).
+        deterministic=True: keeper static at the goal center station, field
+        obstacle at the midpoint of the ball->goal segment (benchmarks)."""
+        n = len(env_ids)
+        if (n == 0):
+            return
+        if (self._num_obstacles == 0):
+            self._scenario[env_ids] = 0
+            return
+        if (scenario is None):
+            scen = soccer_util.sample_scenarios(self._current_scenario_weights(), n, self._device)
+        else:
+            scen = torch.full([n], int(scenario), device=self._device, dtype=torch.long)
+        self._scenario[env_ids] = scen
+        keeper_on = (scen == 1) | (scen == 3)
+        field_on = (scen == 2) | (scen == 3)
+        if (self._num_obstacles < 2):
+            field_on = torch.zeros_like(field_on)
+
+        char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)[env_ids]
+        ball_pos = self._get_ball_pos()[env_ids]
+        goal_pos = self._goal_pos[env_ids]
+        goal_dir = self._goal_dir[env_ids]
+        offset = self._field_offset[env_ids]
+        half_x = 0.5 * self._field_length - self._spawn_margin
+        half_y = 0.5 * self._field_width - self._spawn_margin
+
+        active = torch.zeros([n, self._num_obstacles], device=self._device, dtype=torch.bool)
+        pos = torch.zeros([n, self._num_obstacles, 2], device=self._device, dtype=torch.float)
+
+        # keeper (obstacle 0)
+        active[:, 0] = keeper_on
+        if (deterministic):
+            station = goal_pos + goal_dir * self._keeper_depth
+            tracks = torch.zeros([n], device=self._device, dtype=torch.bool)
+        else:
+            station = soccer_util.compute_keeper_target(ball_pos, goal_pos, goal_dir,
+                                                        self._keeper_depth,
+                                                        self._keeper_lateral_range)
+            tracks = torch.rand([n], device=self._device) < self._keeper_track_prob
+        pos[:, 0] = station
+        self._keeper_tracks[env_ids] = torch.logical_and(tracks, keeper_on)
+        self._keeper_target[env_ids] = station
+        self._keeper_next_react[env_ids] = self._time_buf[env_ids]
+
+        # field obstacle (obstacle 1)
+        if (self._num_obstacles >= 2):
+            active[:, 1] = field_on
+            if (deterministic):
+                frac = torch.full([n], 0.5, device=self._device)
+                fpos = soccer_util.compute_segment_points(ball_pos[:, 0:2], goal_pos, frac)
+            else:
+                probs = torch.as_tensor(np.asarray(self._obstacle_spawn_mode_probs, dtype=np.float32),
+                                        device=self._device)
+                mode = torch.multinomial(probs, n, replacement=True)
+                frac = 0.3 + 0.4 * torch.rand([n], device=self._device)
+                uni = torch.zeros([n, 2], device=self._device, dtype=torch.float)
+                uni[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
+                uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+                uni += offset
+                on_rb = soccer_util.compute_segment_points(root_pos[:, 0:2], ball_pos[:, 0:2], frac)
+                on_bg = soccer_util.compute_segment_points(ball_pos[:, 0:2], goal_pos, frac)
+                fpos = torch.where((mode == 1).unsqueeze(-1), on_rb, uni)
+                fpos = torch.where((mode == 2).unsqueeze(-1), on_bg, fpos)
+                # keep clear of the robot, the ball and the keeper station
+                fpos = self._push_away(fpos, root_pos[:, 0:2], self._obstacle_min_dist_robot)
+                fpos = self._push_away(fpos, ball_pos[:, 0:2], self._obstacle_min_dist_ball)
+                fpos = self._push_away(fpos, station, 2.0 * self._obstacle_radius + 0.1)
+                local = fpos - offset
+                local[:, 0] = torch.clamp(local[:, 0], -half_x, half_x)
+                local[:, 1] = torch.clamp(local[:, 1], -half_y, half_y)
+                fpos = local + offset
+            pos[:, 1] = fpos
+
+        self._obs_active[env_ids] = active
+        self._obs_pos[env_ids] = pos
+        self._obs_vel[env_ids] = 0.0
+        self._prev_obs_contact[env_ids] = False
+        self._prev_ball_blocked[env_ids] = False
+        self._write_obstacle_state(env_ids)
+        return
+
+    @staticmethod
+    def _push_away(p, center, min_dist):
+        delta = p - center
+        dist = torch.linalg.norm(delta, dim=-1, keepdim=True)
+        too_close = (dist < min_dist).squeeze(-1)
+        # a coincident point gets an arbitrary fixed direction
+        safe = torch.where(dist > 1e-6, delta / torch.clamp_min(dist, 1e-6),
+                           torch.tensor([[1.0, 0.0]], device=p.device, dtype=p.dtype).expand_as(delta))
+        pushed = center + safe * min_dist
+        return torch.where(too_close.unsqueeze(-1), pushed, p)
+
     def _update_perception(self):
         """One tick of the virtual camera pipeline (Frente E).
 
@@ -764,6 +1071,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             upd = env_ids[valid]
             self._percep_ball_pos[upd] = self._percep_buf_pos[env_ids, slots][valid]
             self._percep_ball_valid[env_ids] = valid
+            if (self._num_obstacles > 0):
+                # robots: an undetected robot simply drops out of the slots
+                # (mask 0), so no zero-order hold is needed
+                self._percep_rob_pos[env_ids] = self._percep_buf_rob_pos[env_ids, slots]
+                self._percep_rob_valid[env_ids] = self._percep_buf_rob_valid[env_ids, slots]
             self._percep_buf_deliver[due] = float("inf")
 
         # capture
@@ -813,6 +1125,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             head = self._percep_buf_head[env_ids]
             self._percep_buf_pos[env_ids, head] = noisy_pos
             self._percep_buf_valid[env_ids, head] = detected
+            if (self._num_obstacles > 0):
+                rob_pos, rob_det = self._capture_robots(env_ids, root_pos, root_rot, p, fov_deg)
+                self._percep_buf_rob_pos[env_ids, head] = rob_pos
+                self._percep_buf_rob_valid[env_ids, head] = rob_det
             self._percep_buf_deliver[env_ids, head] = self._time_buf[env_ids] + latency
             self._percep_buf_head[env_ids] = (head + 1) % self._percep_buf_slots
             self._percep_next_capture[env_ids] = self._percep_next_capture[env_ids] \
@@ -828,6 +1144,42 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_sum("reacq_count", reacq_count)
         self._prev_percep_valid[:] = self._percep_ball_valid
         return
+
+    def _capture_robots(self, env_ids, root_pos, root_rot, p, fov_deg):
+        """One camera frame of the M obstacles for the capturing envs: same
+        FOV/curriculum as the ball, robot-specific detection and noise
+        parameters. Returns (noisy_pos [n, M, 2], detected [n, M])."""
+        n = len(env_ids)
+        M = self._num_obstacles
+        obs_pos = self._obs_pos[env_ids]  # [n, M, 2]
+        active = self._obs_active[env_ids]
+        detect_prob = 1.0 + p * (self._percep_robot_detect_prob - 1.0)
+        noise_dist_coef = p * self._percep_robot_noise_dist_coef
+        noise_base = p * self._percep_robot_noise_base
+
+        flat_pos = torch.zeros([n * M, 3], device=self._device, dtype=torch.float)
+        flat_pos[:, 0:2] = obs_pos.reshape(n * M, 2)
+        flat_pos[:, 2] = self._obstacle_height
+        dist = torch.linalg.norm(obs_pos - root_pos[:, 0:2].unsqueeze(1), dim=-1).reshape(n * M)
+        half_fov = 0.5 * fov_deg * np.pi / 180.0
+        if (self._fov_body_id is not None):
+            char_id = self._get_char_id()
+            head_pos = self._engine.get_body_pos(char_id)[env_ids, self._fov_body_id]
+            head_rot = self._engine.get_body_rot(char_id)[env_ids, self._fov_body_id]
+            in_fov = soccer_util.compute_ball_in_fov_body(
+                head_pos.repeat_interleave(M, dim=0), head_rot.repeat_interleave(M, dim=0),
+                flat_pos, half_fov)
+        else:
+            in_fov = soccer_util.compute_ball_in_fov(
+                root_pos.repeat_interleave(M, dim=0), root_rot.repeat_interleave(M, dim=0),
+                flat_pos, half_fov)
+        prob = soccer_util.compute_ball_detection_prob(
+            dist, in_fov, detect_prob,
+            self._percep_robot_detect_full_range, self._percep_robot_detect_decay_range)
+        detected = (torch.rand_like(dist) < prob).reshape(n, M) & active
+        noise_std = soccer_util.compute_perception_noise_std(dist, noise_dist_coef, noise_base)
+        noisy = obs_pos + noise_std.reshape(n, M, 1) * torch.randn_like(obs_pos)
+        return noisy, detected
 
     def _reset_perception(self, env_ids):
         """Per-episode camera parameters + a clean first measurement (the
@@ -848,6 +1200,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_ball_valid[env_ids] = True
         self._prev_percep_valid[env_ids] = True
         self._percep_lost_since[env_ids] = -1.0
+        if (self._num_obstacles > 0):
+            self._percep_buf_rob_valid[env_ids] = False
+            self._percep_rob_pos[env_ids] = self._obs_pos[env_ids]
+            self._percep_rob_valid[env_ids] = self._obs_active[env_ids]
         return
 
     def _cache_task_reward(self, ball_pos, ball_vel, rolling):
@@ -867,9 +1223,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             hidden = ~self._percep_ball_valid
             approach_r = approach_r * (~hidden).float()
             progress_r = progress_r * (~hidden).float()
-        dir_r = soccer_util.compute_kick_direction_reward(
-            ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
-            self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
+        if (self._kick_direction_mouth):
+            dir_r = soccer_util.compute_kick_direction_reward_mouth(
+                ball_pos, ball_vel, self._goal_pos, self._goal_dir,
+                self._kick_direction_half_mouth, self._kick_direction_min_vel,
+                self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
+        else:
+            dir_r = soccer_util.compute_kick_direction_reward(
+                ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
+                self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
         goal_r = self._goal_scored_buf.float()
         position_r = torch.zeros_like(goal_r)
         if (self._reward_kick_position_w != 0.0):
@@ -992,6 +1354,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         waiting_r = self._reward_waiting_w * wait_frac * wait_frac
         aux_r += waiting_r
 
+        # Fase 1: contact with another robot (planar root-to-obstacle-axis
+        # distance; paper Table 3 non-foot collision penalty). True state,
+        # like every reward term.
+        obs_contact = torch.zeros_like(self._prev_obs_contact)
+        ball_blocked = torch.zeros_like(self._prev_ball_blocked)
+        collision_r = torch.zeros_like(aux_r)
+        if (self._num_obstacles > 0):
+            obs_contact = soccer_util.compute_obstacle_contact_flags(
+                root_pos, self._obs_pos, self._obs_active, self._obstacle_collision_dist).any(dim=-1)
+            collision_r = self._reward_obstacle_collision_w * obs_contact.float()
+            aux_r += collision_r
+            ball_blocked = soccer_util.compute_obstacle_contact_flags(
+                ball_pos, self._obs_pos, self._obs_active,
+                self._obstacle_radius + self._ball_radius + 0.05).any(dim=-1)
+
         self._aux_reward_buf[:] = aux_r
 
         # diagnostics: weighted per-term means (env part of the aux stream;
@@ -1019,6 +1396,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         new_touch = torch.logical_and(touch_any, ~self._prev_ball_touch)
         d.add_sum("touch_events", new_touch.float())
         self._prev_ball_touch[:] = touch_any
+        if (self._num_obstacles > 0):
+            d.add_mean("reward_obstacle_collision", collision_r)
+            d.add_mean("obstacle_contact_frac", obs_contact.float())
+            d.add_sum("collision_events",
+                      torch.logical_and(obs_contact, ~self._prev_obs_contact).float())
+            d.add_sum("ball_blocked_events",
+                      torch.logical_and(ball_blocked, ~self._prev_ball_blocked).float())
+            d.add_mean("obstacle_active_frac", self._obs_active.float().mean(dim=-1))
+            self._prev_obs_contact[:] = obs_contact
+            self._prev_ball_blocked[:] = ball_blocked
         return
 
     def _update_done(self):
@@ -1125,6 +1512,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             samples, self._steer_anneal_start_samples, self._steer_anneal_end_samples)
         diags["ball_behind_curriculum"] = soccer_util.compute_curriculum_progress(
             samples, self._ball_behind_start_samples, self._ball_behind_end_samples)
+        if (self._num_obstacles > 0):
+            diags["ep_collisions"] = sums.get("collision_events", 0.0) / eps if eps > 0.0 else 0.0
+            diags["ep_ball_blocked"] = sums.get("ball_blocked_events", 0.0) / eps if eps > 0.0 else 0.0
+            w = self._current_scenario_weights()
+            for i, name in enumerate(["none", "keeper", "field", "both"]):
+                diags["obstacle_w_" + name] = float(w[i])
         return diags
 
     def record_train_diagnostics(self):
@@ -1153,12 +1546,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         obs = torch.cat([obs, block], dim=-1)
         if (self._measurable_obs):
             char_id = self._get_char_id()
+            root_pos = self._engine.get_root_pos(char_id)
+            root_rot = self._engine.get_root_rot(char_id)
             ball_state = soccer_util.compute_ball_state_local(
-                self._engine.get_root_pos(char_id),
-                self._engine.get_root_rot(char_id),
-                self._get_ball_pos(),
+                root_pos, root_rot, self._get_ball_pos(),
                 self._engine.get_root_vel(self._get_ball_id()))
-            return torch.cat([obs, ball_state[..., 2:4]], dim=-1)
+            obs = torch.cat([obs, ball_state[..., 2:4]], dim=-1)
+            if (self._num_obstacles > 0):
+                # Fase 1: true obstacle state, fixed order (critic only)
+                priv = soccer_util.compute_obstacle_priv_state(
+                    root_pos, root_rot, self._obs_pos, self._obs_vel, self._obs_active)
+                obs = torch.cat([obs, priv], dim=-1)
+            return obs
         if (self._task_hist_steps > 0):
             obs = torch.cat([obs, self._critic_task_hist_buf.flatten(start_dim=1)], dim=-1)
         return obs
@@ -1170,17 +1569,25 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _compute_recon_tar(self):
         """Decoder target (paper Fig. 4B): true planar ball position and
-        velocity in the heading frame. Training-only; never enters the actor."""
+        velocity in the heading frame (+ [x, y, vx, vy] of the K nearest TRUE
+        robots, Fase 1). Training-only; never enters the actor."""
         char_id = self._get_char_id()
-        return soccer_util.compute_ball_state_local(
-            self._engine.get_root_pos(char_id),
-            self._engine.get_root_rot(char_id),
-            self._get_ball_pos(),
+        root_pos = self._engine.get_root_pos(char_id)
+        root_rot = self._engine.get_root_rot(char_id)
+        tar = soccer_util.compute_ball_state_local(
+            root_pos, root_rot, self._get_ball_pos(),
             self._engine.get_root_vel(self._get_ball_id()))
+        if (self._num_robot_slots > 0):
+            local_pos, local_vel, mask = soccer_util.compute_nearest_robots(
+                root_pos, root_rot, self._obs_pos, self._obs_vel, self._obs_active,
+                self._num_robot_slots)
+            tar = torch.cat([tar, soccer_util.build_robot_recon_target(local_pos, local_vel, mask)],
+                            dim=-1)
+        return tar
 
     def get_recon_tar_size(self):
         assert self._measurable_obs
-        return 4
+        return 4 + 4 * self._num_robot_slots
 
     def _update_ball_perturb(self):
         if (not self._ball_perturb_enable):
@@ -1268,6 +1675,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # key-body obs will mix the old pose with the new root position
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
+            self._reset_obstacles(env_ids)
             if (self._virtual_perception):
                 self._reset_perception(env_ids)
             if (self._task_hist_steps > 0):
@@ -1306,10 +1714,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._resample_char_push_times(env_ids)
         return
 
-    def reset_to_spatial_benchmark(self, env_ids, ball_local_xy):
-        """Reset trials to a fixed center pose and caller-provided ball cells."""
+    def reset_to_spatial_benchmark(self, env_ids, ball_local_xy, scenario=None):
+        """Reset trials to a fixed center pose and caller-provided ball cells.
+        scenario (Fase 1): None draws from the training mixture; 0..3 forces
+        [none, keeper, field obstacle, both] with deterministic placement
+        (static keeper at the goal center station, field obstacle at the
+        midpoint of the ball->goal segment)."""
         if (env_ids.ndim != 1 or ball_local_xy.shape != (len(env_ids), 2)):
             raise ValueError("expected env_ids [N] and ball_local_xy [N, 2]")
+        if (scenario is not None and self._num_obstacles == 0 and int(scenario) != 0):
+            raise ValueError("obstacle scenarios require num_obstacles > 0")
 
         half_x = 0.5 * self._field_length
         half_y = 0.5 * self._field_width
@@ -1354,6 +1768,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_pos[env_ids] = ball_pos
         self._ball_moving_time[env_ids] = 0.0
         self._ball_still_time[env_ids] = 0.0
+        self._reset_obstacles(env_ids, scenario=scenario, deterministic=(scenario is not None))
         if (self._virtual_perception):
             self._reset_perception(env_ids)
         if (self._task_hist_steps > 0):
@@ -1387,6 +1802,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._done_buf[env_ids] = base_env.DoneFlags.NULL.value
         self._reset_ball(env_ids, near=not self._ball_soft_reset_far,
                          gauss=self._ball_event_gauss())
+        self._reset_obstacles(env_ids)
         self._post_goal_steps_left[:] = 0
         self._post_goal_steps_left[env_ids] = 16  # ~0.5 s at 30 Hz
         if (self._virtual_perception):

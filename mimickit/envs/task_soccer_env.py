@@ -993,6 +993,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         active[:, 0] = keeper_on
         if (deterministic):
             station = goal_pos + goal_dir * self._keeper_depth
+            # a ball cell on top of the station would be shoved by the
+            # kinematic capsule: keep the same clearance as in training
+            station = self._push_away(station, ball_pos[:, 0:2], self._obstacle_min_dist_ball)
             tracks = torch.zeros([n], device=self._device, dtype=torch.bool)
         else:
             station = soccer_util.compute_keeper_target(ball_pos, goal_pos, goal_dir,
@@ -1010,6 +1013,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (deterministic):
                 frac = torch.full([n], 0.5, device=self._device)
                 fpos = soccer_util.compute_segment_points(ball_pos[:, 0:2], goal_pos, frac)
+                fpos = self._push_away(fpos, ball_pos[:, 0:2], self._obstacle_min_dist_ball)
             else:
                 probs = torch.as_tensor(np.asarray(self._obstacle_spawn_mode_probs, dtype=np.float32),
                                         device=self._device)

@@ -119,6 +119,49 @@ def compute_kick_direction_reward(ball_pos, ball_vel, goal_pos, min_vel, decay_t
 
 
 @torch.jit.script
+def compute_goal_mouth_target(ball_pos, ball_vel, goal_pos, goal_dir, half_mouth: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, float) -> Tensor
+    """Aim point on the goal mouth for a rolling ball (Fase 1 obstacles).
+
+    Where the ball's planar velocity ray crosses the goal line, clamped to
+    the mouth [-half_mouth, half_mouth] around the goal center. A ball
+    heading anywhere between the posts is therefore aimed "at itself" (the
+    kick-direction reward becomes flat across the mouth), while a ball
+    heading wide is aimed at the nearest post. A ball not moving toward the
+    goal falls back to the goal center. goal_dir is the goal's unit normal
+    pointing INTO the field. Returns [N, 2] world (x, y).
+    """
+    n = -goal_dir                                     # field -> goal
+    t = torch.stack([-n[..., 1], n[..., 0]], dim=-1)  # along the goal line
+    to_goal = goal_pos - ball_pos[..., 0:2]
+    along = torch.sum(to_goal * n, dim=-1)            # distance to the goal line
+    v_n = torch.sum(ball_vel[..., 0:2] * n, dim=-1)
+    v_t = torch.sum(ball_vel[..., 0:2] * t, dim=-1)
+    lateral0 = -torch.sum(to_goal * t, dim=-1)        # ball offset along the line
+    toward = v_n > 1e-3
+    hit = lateral0 + v_t * along / torch.clamp_min(v_n, 1e-3)
+    hit = torch.where(toward, hit, torch.zeros_like(hit))
+    hit = torch.clamp(hit, min=-half_mouth, max=half_mouth)
+    return goal_pos + hit.unsqueeze(-1) * t
+
+
+@torch.jit.script
+def compute_kick_direction_reward_mouth(ball_pos, ball_vel, goal_pos, goal_dir,
+                                        half_mouth: float, min_vel: float, decay_tau: float,
+                                        ball_moving_time, max_reward: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, Tensor, float) -> Tensor
+    """compute_kick_direction_reward with the goal CENTER replaced by the
+    goal-mouth aim point (compute_goal_mouth_target): any shot between the
+    posts pays its full speed, shots wide decay with the angle to the
+    nearest post. With a goalkeeper on the line, rewarding the center alone
+    would pay for kicking straight into the keeper. half_mouth <= 0 recovers
+    the center-aimed reward exactly."""
+    target = compute_goal_mouth_target(ball_pos, ball_vel, goal_pos, goal_dir, half_mouth)
+    return compute_kick_direction_reward(ball_pos, ball_vel, target, min_vel, decay_tau,
+                                         ball_moving_time, max_reward)
+
+
+@torch.jit.script
 def compute_ball_approach_reward(root_pos, prev_root_pos, ball_pos, prev_ball_pos):
     # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
     """Potential-based robot->ball shaping: r = d_prev - d_curr (planar)."""
@@ -533,3 +576,170 @@ def compute_head_gaze_reward(head_pos, head_rot, ball_pos):
     local_ball = torch_util.quat_rotate(torch_util.quat_conjugate(head_rot), ball_rel)
     dist = torch.clamp(torch.linalg.norm(local_ball, dim=-1), min=1e-6)
     return torch.clamp(local_ball[..., 0] / dist, min=0.0, max=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Fase 1 (obstacle-aware skill): other robots on the field
+# ---------------------------------------------------------------------------
+
+# one actor obs slot per tracked robot: local (x, y) in the heading frame,
+# team code (0 = unknown/neutral, reserved for +1 opponent / -1 teammate) and
+# the detection mask. Mirror signs: x keeps, y flips, team and mask are
+# side-blind. Single source for the env, mirror_util and the contract.
+ROBOT_SLOT_DIM = 4
+ROBOT_SLOT_MIRROR_SIGNS = [1.0, -1.0, 1.0, 1.0]
+# critic-only state per PHYSICAL obstacle: local (x, y, vx, vy) + active flag
+OBSTACLE_PRIV_DIM = 5
+
+
+@torch.jit.script
+def compute_nearest_robots(root_pos, root_rot, robot_pos, robot_vel, robot_valid,
+                           num_slots: int):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, int) -> Tuple[Tensor, Tensor, Tensor]
+    """K-nearest robots in the heading frame, ordered by planar distance.
+
+    robot_pos: [N, M, 2] world (x, y); robot_vel: [N, M, 2] world;
+    robot_valid: [N, M] bool (detected/active). Invalid robots sort last and
+    their slot is zeroed with mask 0. Returns (local_pos [N, K, 2],
+    local_vel [N, K, 2], mask [N, K]) with K = num_slots. M may be smaller
+    than K (the remaining slots are empty).
+    """
+    n = robot_pos.shape[0]
+    m = robot_pos.shape[1]
+    heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)  # [N, 4]
+    rot_exp = heading_inv_rot.unsqueeze(1).expand(n, m, 4)
+    rel = torch.cat([robot_pos - root_pos[..., 0:2].unsqueeze(1),
+                     torch.zeros_like(robot_pos[..., 0:1])], dim=-1)  # [N, M, 3]
+    local_pos = torch_util.quat_rotate(rot_exp, rel)[..., 0:2]
+    vel3 = torch.cat([robot_vel, torch.zeros_like(robot_vel[..., 0:1])], dim=-1)
+    local_vel = torch_util.quat_rotate(rot_exp, vel3)[..., 0:2]
+
+    dist = torch.linalg.norm(local_pos, dim=-1)
+    dist = torch.where(robot_valid, dist, torch.full_like(dist, float("inf")))
+    k = min(num_slots, m)
+    _, order = torch.sort(dist, dim=-1)
+    order = order[:, :k]
+    idx2 = order.unsqueeze(-1).expand(n, k, 2)
+    sel_pos = torch.gather(local_pos, 1, idx2)
+    sel_vel = torch.gather(local_vel, 1, idx2)
+    sel_mask = torch.gather(robot_valid, 1, order)
+    maskf = sel_mask.float().unsqueeze(-1)
+    sel_pos = sel_pos * maskf
+    sel_vel = sel_vel * maskf
+
+    if (k < num_slots):
+        pad = num_slots - k
+        sel_pos = torch.cat([sel_pos, torch.zeros([n, pad, 2], device=root_pos.device,
+                                                  dtype=root_pos.dtype)], dim=1)
+        sel_vel = torch.cat([sel_vel, torch.zeros([n, pad, 2], device=root_pos.device,
+                                                  dtype=root_pos.dtype)], dim=1)
+        sel_mask = torch.cat([sel_mask, torch.zeros([n, pad], device=root_pos.device,
+                                                    dtype=torch.bool)], dim=1)
+    return sel_pos, sel_vel, sel_mask
+
+
+@torch.jit.script
+def build_robot_slot_obs(local_pos, mask, team):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Actor slots [N, K * ROBOT_SLOT_DIM] from compute_nearest_robots:
+    [x, y, team, mask] per slot; empty slots are all zeros."""
+    maskf = mask.float().unsqueeze(-1)
+    slots = torch.cat([local_pos, team.float().unsqueeze(-1) * maskf, maskf], dim=-1)
+    return slots.flatten(start_dim=1)
+
+
+@torch.jit.script
+def build_robot_recon_target(local_pos, local_vel, mask):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Decoder target for the K nearest TRUE robots: [x, y, vx, vy] per slot
+    (heading frame), zeros for empty slots. Returns [N, 4K]."""
+    maskf = mask.float().unsqueeze(-1)
+    return (torch.cat([local_pos, local_vel], dim=-1) * maskf).flatten(start_dim=1)
+
+
+@torch.jit.script
+def compute_obstacle_priv_state(root_pos, root_rot, obs_pos, obs_vel, active):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor) -> Tensor
+    """Privileged critic block per physical obstacle, FIXED order (no
+    sorting): local (x, y, vx, vy) in the heading frame + active flag,
+    zeros when inactive. Returns [N, M * OBSTACLE_PRIV_DIM]."""
+    n = obs_pos.shape[0]
+    m = obs_pos.shape[1]
+    heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
+    rot_exp = heading_inv_rot.unsqueeze(1).expand(n, m, 4)
+    rel = torch.cat([obs_pos - root_pos[..., 0:2].unsqueeze(1),
+                     torch.zeros_like(obs_pos[..., 0:1])], dim=-1)
+    local_pos = torch_util.quat_rotate(rot_exp, rel)[..., 0:2]
+    vel3 = torch.cat([obs_vel, torch.zeros_like(obs_vel[..., 0:1])], dim=-1)
+    local_vel = torch_util.quat_rotate(rot_exp, vel3)[..., 0:2]
+    actf = active.float().unsqueeze(-1)
+    block = torch.cat([local_pos * actf, local_vel * actf, actf], dim=-1)
+    return block.flatten(start_dim=1)
+
+
+@torch.jit.script
+def compute_obstacle_contact_flags(pos, obs_pos, active, contact_dist: float):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Planar proximity of a point (robot root or ball) to each ACTIVE
+    obstacle axis: pos [N, 3] or [N, 2], obs_pos [N, M, 2]. Returns [N, M]
+    bool (distance < contact_dist)."""
+    d = torch.linalg.norm(obs_pos - pos[..., 0:2].unsqueeze(1), dim=-1)
+    return torch.logical_and(d < contact_dist, active)
+
+
+@torch.jit.script
+def compute_keeper_target(ball_pos, goal_pos, goal_dir, depth: float, half_range: float):
+    # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
+    """Scripted goalkeeper station: ``depth`` meters in front of the goal line
+    (into the field), laterally at the ball's projection on the line clamped
+    to +-half_range around the goal center. Returns [N, 2] world (x, y)."""
+    t = torch.stack([-goal_dir[..., 1], goal_dir[..., 0]], dim=-1)
+    lateral = torch.sum((ball_pos[..., 0:2] - goal_pos) * t, dim=-1)
+    lateral = torch.clamp(lateral, min=-half_range, max=half_range)
+    return goal_pos + goal_dir * depth + lateral.unsqueeze(-1) * t
+
+
+@torch.jit.script
+def move_toward(cur, target, max_step):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Move cur [N, 2] toward target [N, 2] by at most max_step [N] (m)."""
+    delta = target - cur
+    dist = torch.linalg.norm(delta, dim=-1)
+    scale = torch.clamp(max_step / torch.clamp_min(dist, 1e-6), max=1.0)
+    return cur + delta * scale.unsqueeze(-1)
+
+
+@torch.jit.script
+def compute_segment_points(a, b, frac):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Points a + frac * (b - a) for planar a, b [N, 2] and frac [N]."""
+    return a + (b - a) * frac.unsqueeze(-1)
+
+
+def compute_stage_weights(samples, stage_samples, stage_weights):
+    """Piecewise-constant scenario mixture: the weights of the LAST stage
+    whose start sample count is <= samples (stage_samples must be sorted
+    ascending, first entry is the start of the schedule). Before the first
+    stage, the first stage's weights apply. Returns a normalized numpy
+    vector."""
+    stage_samples = list(stage_samples)
+    stage_weights = [list(w) for w in stage_weights]
+    assert len(stage_samples) == len(stage_weights) and len(stage_samples) > 0, \
+        "obstacle_stage_samples and obstacle_stage_weights must be non-empty and aligned"
+    assert all(stage_samples[i] <= stage_samples[i + 1] for i in range(len(stage_samples) - 1)), \
+        "obstacle_stage_samples must be sorted ascending"
+    idx = 0
+    for i, start in enumerate(stage_samples):
+        if (samples >= start):
+            idx = i
+    w = np.asarray(stage_weights[idx], dtype=np.float64)
+    assert np.all(w >= 0.0) and w.sum() > 0.0, "stage weights must be non-negative, sum > 0"
+    return w / w.sum()
+
+
+def sample_scenarios(weights, n, device):
+    """Draw n scenario ids from a mixture weight vector (torch RNG)."""
+    w = torch.as_tensor(np.asarray(weights, dtype=np.float32), device=device)
+    if (n == 0):
+        return torch.zeros([0], device=device, dtype=torch.long)
+    return torch.multinomial(w, n, replacement=True)

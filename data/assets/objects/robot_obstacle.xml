@@ -1,0 +1,13 @@
+<mujoco model="robot_obstacle">
+	<!-- Fase 1 stand-in for another robot on the field: a heavy capsule
+	     (radius 0.2 m, 1.2 m tall, ~67 kg) held kinematically by the soccer
+	     env (root pose rewritten every control step). Center at z = 0.6 puts
+	     the bottom cap on the ground. -->
+	<compiler angle="radian"/>
+	<worldbody>
+		<body name="obstacle" pos="0 0 0">
+			<freejoint name="root"/>
+			<geom name="obstacle" type="capsule" size="0.2 0.4" density="500.0" friction="0.8 0.02 0.002"/>
+		</body>
+	</worldbody>
+</mujoco>

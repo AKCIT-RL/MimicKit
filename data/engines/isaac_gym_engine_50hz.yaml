@@ -1,0 +1,16 @@
+# E3: the paper's control rate (50 Hz, dt = 0.02 s).
+#
+# Identical to isaac_gym_engine.yaml except the two frequencies. sim_freq 200
+# keeps decimation at 4, as in the 30/120 baseline -- the paper states only the
+# policy rate, so holding the decimation fixed is what keeps this one variable
+# instead of two. Note the T1 motion .pkl files are recorded at fps = 30 and
+# motion_lib interpolates in time, so 50 Hz adds no information to the motion
+# prior; it changes the control loop, not the data.
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 50
+sim_freq: 200
+env_spacing: 5
+
+ground_contact_height: 0.3

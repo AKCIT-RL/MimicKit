@@ -72,7 +72,11 @@ class Engine:
     @abc.abstractmethod
     def get_timestep(self):
         return 0.0
-    
+
+    def get_num_sim_steps(self):
+        """Physics substeps per control step."""
+        raise NotImplementedError("get_num_sim_steps not supported by engine {}".format(self.get_name()))
+
     @abc.abstractmethod
     def get_num_envs(self):
         return 0
@@ -169,13 +173,35 @@ class Engine:
     def set_body_forces(self, env_id, obj_id, body_id, forces):
         return
 
-    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None):
-        """Per-env collision-shape randomization (build time, before sim init)."""
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
+                            compliance=None, body_ids=None):
+        """Per-env collision-shape randomization (build time, before sim init).
+
+        body_ids restricts the change to the shapes of those bodies; None means
+        every shape of the object.
+        """
         raise NotImplementedError("set_obj_shape_props not supported by engine {}".format(self.get_name()))
 
     def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
         """Per-env body mass/CoM randomization (build time, before sim init)."""
         raise NotImplementedError("scale_obj_masses not supported by engine {}".format(self.get_name()))
+
+    def scale_obj_pd_gains(self, env_id, obj_id, kp_scales, kd_scales):
+        """Per-env motor stiffness/damping randomization (Table 2).
+
+        Unlike the mass and shape properties above this one is not restricted
+        to build time: the gains are plain tensors read by the PD loop.
+        """
+        raise NotImplementedError("scale_obj_pd_gains not supported by engine {}".format(self.get_name()))
+
+    def set_action_delay(self, delay_weights):
+        """Sub-control-step action delay (Table 2).
+
+        delay_weights is [num_envs, num_substeps]: the weight of the CURRENT
+        joint target at each physics substep, the previous target taking the
+        complement. All-ones is the undelayed behaviour.
+        """
+        raise NotImplementedError("set_action_delay not supported by engine {}".format(self.get_name()))
 
     @abc.abstractmethod
     def get_obj_type(self, obj_id):

@@ -91,6 +91,10 @@ class IsaacGymEngine(engine.Engine):
         self._obj_kd = [[] for i in range(num_envs)]
         self._obj_torque_lim = [[] for i in range(num_envs)]
 
+        # Table 2 action delay, off unless set_action_delay() is called
+        self._action_delay_w = None
+        self._prev_dof_cmd = None
+
         self._build_ground()
 
         if (visualize):
@@ -135,11 +139,24 @@ class IsaacGymEngine(engine.Engine):
 
         if (self.enabled_record_video() and self._recording):
             self._video_recorder.capture_frame()
-        
-        for i in range(self._sim_steps):
-            self._pre_sim_step()
-            self._sim_step()
-            
+
+        if (self._action_delay_w is None):
+            for i in range(self._sim_steps):
+                self._pre_sim_step()
+                self._sim_step()
+        else:
+            # Table 2 action delay: the joint target is held across the control
+            # step, so a sub-step delay is applied by blending this step's
+            # command with the previous one, substep by substep.
+            curr_cmd = self._dof_cmd_raw.clone()
+            for i in range(self._sim_steps):
+                w = self._action_delay_w[:, i].unsqueeze(-1)
+                self._dof_cmd_raw[:] = w * curr_cmd + (1.0 - w) * self._prev_dof_cmd
+                self._pre_sim_step()
+                self._sim_step()
+            self._dof_cmd_raw[:] = curr_cmd
+            self._prev_dof_cmd[:] = curr_cmd
+
         self._refresh_sim_tensors()
         return
 
@@ -273,7 +290,10 @@ class IsaacGymEngine(engine.Engine):
     def get_sim_timestep(self):
         sim_params = self._gym.get_sim_params(self._sim)
         return sim_params.dt
-    
+
+    def get_num_sim_steps(self):
+        return self._sim_steps
+
     def get_num_envs(self):
         return self._num_envs
     
@@ -625,15 +645,87 @@ class IsaacGymEngine(engine.Engine):
                                                    float(tile_size[1]), amplitude, total_tris))
         return
 
-    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None):
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
+                            compliance=None, body_ids=None):
         env_ptr = self.get_env(env_id)
         props = self._gym.get_actor_rigid_shape_properties(env_ptr, obj_id)
-        for p in props:
+
+        if (body_ids is None):
+            shape_ids = range(len(props))
+        else:
+            shape_ids = self.get_obj_body_shape_ids(env_id, obj_id, body_ids)
+
+        for i in shape_ids:
+            p = props[i]
             if (friction is not None):
                 p.friction = float(friction)
             if (restitution is not None):
                 p.restitution = float(restitution)
+            if (compliance is not None):
+                p.compliance = float(compliance)
         self._gym.set_actor_rigid_shape_properties(env_ptr, obj_id, props)
+        return
+
+    def get_obj_body_shape_ids(self, env_id, obj_id, body_ids):
+        """Indices into the actor's rigid-shape list for the given bodies.
+
+        Table 2 randomizes the FEET, not the whole robot, and the shape list is
+        flat: without this mapping the friction of the torso and arms would be
+        randomized too, which also changes how a fall behaves.
+        """
+        env_ptr = self.get_env(env_id)
+        shape_indices = self._gym.get_actor_rigid_body_shape_indices(env_ptr, obj_id)
+
+        shape_ids = []
+        for body_id in body_ids:
+            entry = shape_indices[int(body_id)]
+            shape_ids.extend(range(entry.start, entry.start + entry.count))
+        return shape_ids
+
+    def scale_obj_pd_gains(self, env_id, obj_id, kp_scales, kd_scales):
+        """Scale this env's motor gains in place (Table 2).
+
+        Must be called AFTER initialize_sim: _obj_kp/_obj_kd only become views
+        of the [num_envs, total_dofs] tensors in _build_control_tensors, and the
+        PD loop reads those tensors directly.
+        """
+        kp = self._obj_kp[obj_id]
+        kd = self._obj_kd[obj_id]
+        assert torch.is_tensor(kp), \
+            "scale_obj_pd_gains called before initialize_sim(); the gains are " \
+            "still per-env python lists at this point"
+
+        kp[env_id] *= torch.as_tensor(kp_scales, device=kp.device, dtype=kp.dtype)
+        kd[env_id] *= torch.as_tensor(kd_scales, device=kd.device, dtype=kd.dtype)
+        return
+
+    def set_action_delay(self, delay_weights):
+        num_envs = self.get_num_envs()
+        weights = torch.as_tensor(delay_weights, device=self._device, dtype=torch.float32)
+        assert weights.shape == (num_envs, self._sim_steps), \
+            "action delay weights must be [num_envs, {}], got {}".format(
+                self._sim_steps, tuple(weights.shape))
+
+        self._action_delay_w = weights
+        self._prev_dof_cmd = torch.zeros_like(self._dof_cmd_raw)
+        self.reset_action_delay()
+        return
+
+    def reset_action_delay(self, env_ids=None):
+        """Point the delayed command at the current joint positions.
+
+        Without this an episode's first step would briefly replay the previous
+        episode's command on that env, since the delay buffer knows nothing
+        about episode boundaries. Holding the current pose is what a motor with
+        no fresh command would do anyway (near-zero PD error).
+        """
+        if (self._action_delay_w is None):
+            return
+        dof_pos = self._dof_state[..., :, 0]
+        if (env_ids is None):
+            self._prev_dof_cmd[:] = dof_pos
+        else:
+            self._prev_dof_cmd[env_ids] = dof_pos[env_ids]
         return
 
     def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):

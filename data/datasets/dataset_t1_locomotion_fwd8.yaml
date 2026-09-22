@@ -1,0 +1,20 @@
+# Booster T1 - controle de diluicao: so locomocao para frente, sem curvas.
+# Todas as motions com peso 1.0. Transicoes e giros entram como CLAMP (nao sao
+# ciclicos: seam medida 3.5-11.5 sem aparar, contra 0.98 do walk).
+motions:
+  - file: "data/motions/t1/t1_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_stand.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_to_stand.pkl"
+    weight: 1.0

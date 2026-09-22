@@ -77,6 +77,19 @@ class SMPEnv(amp_env.AMPEnv):
         kin_char_model = self._kin_char_model
         num_rots = kin_char_model.get_num_joints() - 1
         frame_size = self._motion_lib.get_motion_frame_size()
+
+        # This reads the disc obs by fixed offsets, so it only holds for the
+        # generic amp_env layout: root_pos, root_rot tan-norm, joint_rot
+        # tan-norm. A task that redefines its disc obs (see
+        # task_steering_meas_env) would be silently reinterpreted here as
+        # whatever happens to sit at those indices. Currently unreachable, as
+        # only SMPAgent calls into GSI and no T1 config uses it - fail loudly
+        # if that changes.
+        expected = 3 + 6 + num_rots * 6
+        assert sample.shape[-1] >= expected, (
+            "GSI expects the generic disc obs layout ({} dims or more), got "
+            "{}. This env redefines its discriminator observation; convert it "
+            "explicitly instead of slicing.".format(expected, sample.shape[-1]))
         
         data_frames = torch.zeros(list(sample.shape[:-1]) + [frame_size], device=sample.device, dtype=sample.dtype)
 

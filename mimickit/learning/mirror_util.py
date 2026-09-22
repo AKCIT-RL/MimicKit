@@ -168,6 +168,9 @@ TASK_OBS_MIRROR = {
     # task_steering_env.compute_steering_observations:
     #   local_tar_dir (2), tar_speed (1), local_face_dir (2)
     "TaskSteeringEnv": [1.0, -1.0, 1.0, 1.0, -1.0],
+    # task_steering_meas_env reuses that same command block unchanged; only the
+    # character half of the observation differs (measurable frame + history).
+    "TaskSteeringMeasEnv": [1.0, -1.0, 1.0, 1.0, -1.0],
     # task_soccer_env._compute_task_block: the steering block above, then
     # soccer_util.compute_soccer_observations — local_ball (2), local_goal (2),
     # local_goal_dir (2), all heading-frame planar (x, y) pairs — and the ball

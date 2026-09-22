@@ -1,0 +1,68 @@
+# Booster T1 steering: observation split (Table 3) PLUS domain randomization
+# (Table 2). E2 of the experiment matrix.
+#
+# Field-for-field identical to wamp_t1_steering_meas_wrturn_env.yaml except the
+# domain_randomization block below, so reading this against E1 isolates the
+# randomization alone. Ranges default to Table 2; dr_ranges overrides them.
+env_name: "task_steering_meas"
+
+char_file: "data/assets/t1/t1.xml"
+camera_mode: "track"
+
+episode_length: 10.0 # seconds
+global_obs: False
+root_height_obs: True
+pose_termination: False
+enable_phase_obs: False
+enable_tar_obs: False
+num_disc_obs_steps: 10
+rand_reset: True
+zero_center_action: True
+
+# encoder history: 1.0 s of measurable frames. The paper buffers 50 frames at
+# 50 Hz (= 1.0 s); this stack runs at control_freq 30, so 1.0 s is 30 frames.
+# If the control frequency changes, this must follow to keep the window at 1 s.
+measurable_hist_steps: 30
+
+# domain randomization (Table 2). Static per env, drawn once at build time.
+# Ranges come from steering_dr.DEFAULT_RANGES; set dr_ranges here to override.
+# dr_seed is left unset on purpose: the draw then follows --rand_seed, so two
+# seeds of this experiment see two different sets of robots. The holdout env
+# pins it instead.
+domain_randomization: true
+
+ref_char_offset: [2.0, 0.0, 0.0] # m
+init_pose: [0, 0, 0.69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+enable_early_termination: True
+key_bodies: ["left_ankle_roll_link", "right_ankle_roll_link", "aahead_pitch_link", "left_elbow_yaw_link", "right_elbow_yaw_link"]
+contact_bodies: ["left_knee_pitch_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_pitch_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
+
+rand_tar_dir: True
+rand_face_dir: False
+# 0.0, not 0.5: tar_speed is drawn as U(min, max), so a positive floor
+# means the policy NEVER sees a stop command and never learns to stand
+# still. It showed up in deploy, where asking for 0 m/s still walked.
+tar_speed_min: 0.0
+tar_speed_max: 2.5
+tar_change_time_min: 4.0
+tar_change_time_max: 7.0
+
+motion_file: "data/datasets/dataset_t1_locomotion_wrturn.yaml"
+
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+
+reward_steering_tar_w: 0.7
+reward_steering_face_w: 0.3
+
+reward_steering_vel_scale: 0.5

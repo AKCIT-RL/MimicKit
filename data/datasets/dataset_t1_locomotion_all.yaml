@@ -1,0 +1,52 @@
+# Booster T1 - base + turns + backwards: todos os 22.
+# Todas as motions com peso 1.0. Transicoes e giros entram como CLAMP (nao sao
+# ciclicos: seam medida 3.5-11.5 sem aparar, contra 0.98 do walk).
+motions:
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_run.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_left135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_right135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_turn_around.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_left135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right45.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right90.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_right135.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_turn_around.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand_to_walk_back.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_back_to_stand.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_back_turn_fwd.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_back_stop_fwd.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_stand_to_run_back.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_back_to_stand.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_back_turn_fwd.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_run_back_stop_fwd.pkl"
+    weight: 1.0

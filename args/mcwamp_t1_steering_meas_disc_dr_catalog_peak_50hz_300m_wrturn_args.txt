@@ -1,0 +1,11 @@
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_50hz.yaml
+--env_config data/envs/wamp_t1_steering_meas_disc_dr_catalog_peak_50hz_wrturn_env.yaml
+--agent_config data/agents/mcwamp_t1_steering_meas_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 300000000
+--out_dir output/t1_meas_disc_dr_catalog_peak_50hz_vmin0_wrturn_seed1/

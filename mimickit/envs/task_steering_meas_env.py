@@ -25,6 +25,7 @@ import gymnasium.spaces as spaces
 import numpy as np
 import torch
 
+import envs.diag_util as diag_util
 import envs.steering_dr as steering_dr
 import envs.steering_disc as steering_disc
 import envs.steering_reward as steering_reward
@@ -161,6 +162,7 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         if (self._aux_reward_enabled):
             self._aux_reward_buf = torch.zeros([num_envs], device=self._device,
                                                dtype=torch.float)
+            self._diag = diag_util.DiagWindow(self._device)
             char_id = self._get_char_id()
             self._reward_foot_body_ids = [
                 self._engine.find_obj_body_id(char_id, name)
@@ -325,9 +327,28 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
         foot_prox = steering_reward.compute_foot_proximity_penalty(
             left, right, self._foot_proximity_min_dist)
-        self._foot_prox_last = foot_prox
         self._aux_reward_buf[:] = self._reward_foot_proximity_w * foot_prox
+
+        # logged per term, not inferred from a shift in Aux_Reward_Mean: that
+        # total also carries the style reward, so a term that silently did
+        # nothing would be indistinguishable from one that did a little
+        # names stay <= 18 chars: the logger pads columns to 25 and prefixes
+        # them with "Train_"/"Test_", so a longer name overflows the pad and
+        # runs into the next column, breaking whitespace parsing of the log
+        # (which is how compare_train_logs.py reads it)
+        self._diag.step()
+        self._diag.add_mean("reward_foot_prox",
+                            self._reward_foot_proximity_w * foot_prox)
+        self._diag.add_mean("foot_dist_planar",
+                            torch.linalg.norm(left[..., 0:2] - right[..., 0:2], dim=-1))
         return
+
+    def record_diagnostics(self):
+        diags = dict(super().record_diagnostics())
+        if (self._aux_reward_enabled):
+            means, _ = self._diag.pop()
+            diags.update(means)
+        return diags
 
     # -------------------------------------------------------- discriminator
 

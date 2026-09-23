@@ -688,6 +688,61 @@ def compute_obstacle_contact_flags(pos, obs_pos, active, contact_dist: float):
 
 
 @torch.jit.script
+def compute_obstacle_proximity_penalty(pos, obs_pos, active, contact_dist: float, margin: float):
+    # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
+    """Smooth pre-contact shaping (o3): quadratic ramp from 0 at
+    contact_dist + margin to 1 at contact_dist, max over ACTIVE obstacles.
+    Gives the policy a gradient to steer away before the hard collision
+    penalty fires. pos [N, 3] or [N, 2], obs_pos [N, M, 2]. Returns [N]."""
+    d = torch.linalg.norm(obs_pos - pos[..., 0:2].unsqueeze(1), dim=-1)
+    x = torch.clamp((contact_dist + margin - d) / max(margin, 1e-6), min=0.0, max=1.0)
+    x = torch.where(active, x, torch.zeros_like(x))
+    return torch.max(x * x, dim=-1)[0]
+
+
+@torch.jit.script
+def compute_goal_mouth_target_free(ball_pos, ball_vel, goal_pos, goal_dir, half_mouth: float,
+                                   obs_pos, obs_active, shadow_radius: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, float) -> Tensor
+    """compute_goal_mouth_target that also dodges the shadow each ACTIVE
+    obstacle standing between the ball and the goal line casts on that line
+    (o2). If the velocity ray hits the line inside a shadow, the aim point is
+    moved to the nearer shadow edge (clamped to the mouth), so a shot straight
+    into the keeper is scored like a shot wide of the near post. A shadow
+    covering the whole mouth leaves the aim point unchanged. Shadows are
+    applied one obstacle at a time (M <= 2 in practice). Returns [N, 2]."""
+    target = compute_goal_mouth_target(ball_pos, ball_vel, goal_pos, goal_dir, half_mouth)
+    n = -goal_dir
+    t = torch.stack([-n[..., 1], n[..., 0]], dim=-1)
+    to_goal = goal_pos - ball_pos[..., 0:2]
+    along_b = torch.sum(to_goal * n, dim=-1)          # ball -> goal line
+    lat_b = -torch.sum(to_goal * t, dim=-1)           # ball offset along the line
+    hit = torch.sum((target - goal_pos) * t, dim=-1)
+    m = obs_pos.shape[1]
+    for i in range(m):
+        rel = obs_pos[:, i] - goal_pos
+        along_o = -torch.sum(rel * n, dim=-1)
+        lat_o = torch.sum(rel * t, dim=-1)
+        between = torch.logical_and(obs_active[:, i], along_o > 0.05)
+        between = torch.logical_and(between, along_o < along_b - 0.05)
+        scale = along_b / torch.clamp_min(along_b - along_o, 0.05)
+        center = lat_b + (lat_o - lat_b) * scale
+        w = shadow_radius * scale
+        lo = center - w
+        hi = center + w
+        inside = torch.logical_and(between, torch.logical_and(hit >= lo, hit <= hi))
+        covers = torch.logical_and(lo <= -half_mouth, hi >= half_mouth)
+        move = torch.logical_and(inside, ~covers)
+        # nearer edge, unless that edge lies beyond a post (then the other one)
+        use_hi = hit - lo > hi - hit
+        use_hi = torch.logical_or(use_hi, lo < -half_mouth)
+        use_hi = torch.logical_and(use_hi, hi <= half_mouth)
+        edge = torch.where(use_hi, hi, lo)
+        hit = torch.where(move, edge, hit)
+    return goal_pos + hit.unsqueeze(-1) * t
+
+
+@torch.jit.script
 def compute_keeper_target(ball_pos, goal_pos, goal_dir, depth: float, half_range: float):
     # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
     """Scripted goalkeeper station: ``depth`` meters in front of the goal line

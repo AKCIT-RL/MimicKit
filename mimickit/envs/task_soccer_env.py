@@ -293,6 +293,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._obstacle_park_z = float(env_config.get("obstacle_park_z", 30.0))
         self._obstacle_collision_dist = float(env_config.get("obstacle_collision_dist", 0.45))
         self._reward_obstacle_collision_w = float(env_config.get("reward_obstacle_collision_w", 0.0))
+        # o3: smooth pre-contact shaping (ramp over obstacle_proximity_margin
+        # outside obstacle_collision_dist)
+        self._reward_obstacle_proximity_w = float(env_config.get("reward_obstacle_proximity_w", 0.0))
+        self._obstacle_proximity_margin = float(env_config.get("obstacle_proximity_margin", 0.4))
+        # o2: kick-direction aim point dodges the shadow obstacles cast on
+        # the goal line (needs kick_direction_mouth)
+        self._kick_direction_avoid_obstacles = bool(env_config.get("kick_direction_avoid_obstacles", False))
         # scenario mixture schedule: piecewise-constant weights over the
         # sample clock (see soccer_util.compute_stage_weights)
         self._obstacle_stage_samples = list(env_config.get("obstacle_stage_samples", [0.0]))
@@ -327,6 +334,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # hitting anywhere between the posts is flat) instead of the center
         self._kick_direction_mouth = bool(env_config.get("kick_direction_mouth", False))
         self._kick_direction_half_mouth = 0.5 * self._goal_width - self._ball_radius
+        if (self._kick_direction_avoid_obstacles):
+            assert self._kick_direction_mouth and self._num_obstacles > 0, \
+                "kick_direction_avoid_obstacles needs kick_direction_mouth and num_obstacles > 0"
 
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
@@ -1227,7 +1237,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             hidden = ~self._percep_ball_valid
             approach_r = approach_r * (~hidden).float()
             progress_r = progress_r * (~hidden).float()
-        if (self._kick_direction_mouth):
+        if (self._kick_direction_avoid_obstacles):
+            target = soccer_util.compute_goal_mouth_target_free(
+                ball_pos, ball_vel, self._goal_pos, self._goal_dir,
+                self._kick_direction_half_mouth, self._obs_pos, self._obs_active,
+                self._obstacle_radius + self._ball_radius)
+            dir_r = soccer_util.compute_kick_direction_reward(
+                ball_pos, ball_vel, target, self._kick_direction_min_vel,
+                self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
+        elif (self._kick_direction_mouth):
             dir_r = soccer_util.compute_kick_direction_reward_mouth(
                 ball_pos, ball_vel, self._goal_pos, self._goal_dir,
                 self._kick_direction_half_mouth, self._kick_direction_min_vel,
@@ -1364,11 +1382,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         obs_contact = torch.zeros_like(self._prev_obs_contact)
         ball_blocked = torch.zeros_like(self._prev_ball_blocked)
         collision_r = torch.zeros_like(aux_r)
+        proximity_r = torch.zeros_like(aux_r)
         if (self._num_obstacles > 0):
             obs_contact = soccer_util.compute_obstacle_contact_flags(
                 root_pos, self._obs_pos, self._obs_active, self._obstacle_collision_dist).any(dim=-1)
             collision_r = self._reward_obstacle_collision_w * obs_contact.float()
             aux_r += collision_r
+            if (self._reward_obstacle_proximity_w != 0.0):
+                proximity_r = self._reward_obstacle_proximity_w * \
+                    soccer_util.compute_obstacle_proximity_penalty(
+                        root_pos, self._obs_pos, self._obs_active,
+                        self._obstacle_collision_dist, self._obstacle_proximity_margin)
+                aux_r += proximity_r
             ball_blocked = soccer_util.compute_obstacle_contact_flags(
                 ball_pos, self._obs_pos, self._obs_active,
                 self._obstacle_radius + self._ball_radius + 0.05).any(dim=-1)
@@ -1402,6 +1427,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_touch[:] = touch_any
         if (self._num_obstacles > 0):
             d.add_mean("reward_obstacle_collision", collision_r)
+            if (self._reward_obstacle_proximity_w != 0.0):
+                d.add_mean("reward_obstacle_proximity", proximity_r)
             d.add_mean("obstacle_contact_frac", obs_contact.float())
             d.add_sum("collision_events",
                       torch.logical_and(obs_contact, ~self._prev_obs_contact).float())

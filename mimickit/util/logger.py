@@ -134,17 +134,27 @@ class Logger:
             if (self._row_count == 0):
                 self._dump_str_template = self._build_str_template()
 
+            # names and values come out of the SAME filter, on purpose. The
+            # template has one slot per numeric key (_build_str_template), but
+            # the header used to be formatted with every key, numeric or not.
+            # str.format drops the extras silently, so each non-numeric key
+            # shifted every later NAME one column left of its value -- the
+            # values were always right, the labels were not. Two non-numeric
+            # keys exist today (Train_/Test_Sim_Recording, sim_env.py:103), so
+            # anything logged after them read back under the wrong name.
+            keys = []
             vals = []
             for key in self.log_headers:
                 entry = self.log_current_row[key]
                 val = entry.val
 
                 if (isinstance(entry.val, numbers.Number)):
+                    keys.append(key)
                     vals.append(val)
-            
+
             if self.output_file is not None:
                 if (self._row_count == 0):
-                    header_str = self._dump_str_template.format(*self.log_headers)
+                    header_str = self._dump_str_template.format(*keys)
                     self.output_file.write(header_str + "\r")
 
                 val_str = self._dump_str_template.format(*map(str,vals))

@@ -36,6 +36,19 @@ import util.torch_util as torch_util
 TASK_BLOCK_DIM = 5      # local_tar_dir (2), tar_speed (1), local_face_dir (2)
 RECON_TAR_DIM = 3       # base-frame linear velocity
 
+# DOF groups for the Table 4 action-rate terms, which weigh the head (-15) and
+# the legs (-1) differently and give the arms no term at all. Named by BODY,
+# resolved through the char model, so a renamed link raises instead of silently
+# weighing the wrong joints. Overridable per config for another embodiment.
+DEFAULT_HEAD_BODIES = ["aahead_yaw_link", "aahead_pitch_link"]
+DEFAULT_LEG_BODIES = ["{}_{}_link".format(side, joint)
+                      for side in ("left", "right")
+                      for joint in ("hip_pitch", "hip_roll", "hip_yaw",
+                                    "knee_pitch", "ankle_pitch", "ankle_roll")]
+# "collision on body parts except the feet" -- the foot body is ankle_roll,
+# which is where the foot collision box lives in t1.xml.
+DEFAULT_COLLISION_EXEMPT = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
 
 class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
@@ -68,7 +81,52 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # to the runs that came before, so this is inert unless a config asks.
         self._reward_foot_proximity_w = float(env_config.get("reward_foot_proximity_w", 0.0))
         self._foot_proximity_min_dist = float(env_config.get("foot_proximity_min_dist", 0.2))
-        self._aux_reward_enabled = (self._reward_foot_proximity_w != 0.0)
+        self._reward_head_action_rate_w = float(env_config.get("reward_head_action_rate_w", 0.0))
+        self._reward_leg_action_rate_w = float(env_config.get("reward_leg_action_rate_w", 0.0))
+        self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", 0.0))
+        self._reward_base_accel_w = float(env_config.get("reward_base_accel_w", 0.0))
+        self._reward_collision_w = float(env_config.get("reward_collision_w", 0.0))
+
+        # 0 on purpose: the reference motions rest the knee at exactly 0.0 rad,
+        # its hard lower limit, for part of every stride (see
+        # steering_reward.compute_joint_limit_penalty). Any guard band above 0
+        # therefore penalizes the pose the discriminator is paying for.
+        self._joint_limit_margin = float(env_config.get("joint_limit_margin", 0.0))
+        # False is the paper-literal reading ("joint positions exceeding
+        # limits") and is provably inert here: the engine clamps dof_pos, so
+        # the measured excursion is 1.5e-5 rad. The COMMANDED target is not
+        # clamped by anything -- the action bound is +-1.4x the joint range --
+        # and the same rollout measures 0.279 rad of excursion on it, ~18000x
+        # more. True penalizes that instead, which is the only version of this
+        # term that can act at all in a position-controlled setup.
+        self._joint_limit_on_action = bool(env_config.get("joint_limit_on_action", False))
+        # 1 N, not the 0.1 N of the fall check: that one reads ground forces
+        # the engine has already height-filtered, while these are raw and 0.1 N
+        # is inside resting-contact noise.
+        self._collision_force_thresh = float(env_config.get("collision_force_thresh", 1.0))
+
+        self._head_dof_bodies = list(env_config.get("head_dof_bodies", DEFAULT_HEAD_BODIES))
+        self._leg_dof_bodies = list(env_config.get("leg_dof_bodies", DEFAULT_LEG_BODIES))
+        self._collision_exempt_bodies = list(env_config.get(
+            "collision_exempt_bodies", DEFAULT_COLLISION_EXEMPT))
+
+        # every weight has to flip the gate. An OR that forgot one would leave
+        # _aux_reward_buf unallocated and info["aux_reward"] unpublished, and
+        # that config would train as if the term were not there.
+        self._reg_weights = (self._reward_foot_proximity_w,
+                             self._reward_head_action_rate_w,
+                             self._reward_leg_action_rate_w,
+                             self._reward_joint_limit_w,
+                             self._reward_base_accel_w,
+                             self._reward_collision_w)
+        self._aux_reward_enabled = any(w != 0.0 for w in self._reg_weights)
+
+        # measure-before-you-spend: logs every raw term with ALL weights at 0,
+        # so the magnitudes can be read off a short run before a weight is
+        # picked. The reward path stays untouched -- _update_info still does
+        # not publish aux_reward, so the agent never sees a second stream.
+        self._reg_diag_enabled = self._aux_reward_enabled or \
+            bool(env_config.get("reward_reg_diagnostics", False))
 
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
@@ -159,7 +217,7 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             [num_envs, self._meas_hist_steps, self._meas_frame_dim],
             device=self._device, dtype=torch.float)
 
-        if (self._aux_reward_enabled):
+        if (self._reg_diag_enabled):
             self._aux_reward_buf = torch.zeros([num_envs], device=self._device,
                                                dtype=torch.float)
             self._diag = diag_util.DiagWindow(self._device)
@@ -167,6 +225,48 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             self._reward_foot_body_ids = [
                 self._engine.find_obj_body_id(char_id, name)
                 for name in self._disc_foot_bodies]
+
+            self._dt = self._engine.get_timestep()
+
+            # DOF ids come from the char model; BODY ids for contact forces come
+            # from the engine. The two orderings are not the same and mixing
+            # them is silent.
+            self._head_dof_ids = torch.tensor(
+                steering_util.build_dof_group_ids(self._kin_char_model,
+                                                  self._head_dof_bodies),
+                device=self._device, dtype=torch.long)
+            self._leg_dof_ids = torch.tensor(
+                steering_util.build_dof_group_ids(self._kin_char_model,
+                                                  self._leg_dof_bodies),
+                device=self._device, dtype=torch.long)
+
+            # read once from env 0: domain randomization does not randomize
+            # joint limits (steering_dr.DEFAULT_RANGES has no such key), so
+            # they are the same in every env.
+            dof_low, dof_high = self._engine.get_obj_dof_limits(0, char_id)
+            self._soft_dof_low = torch.as_tensor(
+                np.asarray(dof_low), device=self._device,
+                dtype=torch.float) + self._joint_limit_margin
+            self._soft_dof_high = torch.as_tensor(
+                np.asarray(dof_high), device=self._device,
+                dtype=torch.float) - self._joint_limit_margin
+            assert torch.all(self._soft_dof_low < self._soft_dof_high), \
+                "joint_limit_margin {} is wider than some joint's range".format(
+                    self._joint_limit_margin)
+
+            exempt = set(self._engine.find_obj_body_id(char_id, name)
+                         for name in self._collision_exempt_bodies)
+            num_bodies = self._engine.get_obj_num_bodies(char_id)
+            self._collision_body_ids = torch.tensor(
+                [b for b in range(num_bodies) if b not in exempt],
+                device=self._device, dtype=torch.long)
+
+            self._prev_root_vel = torch.zeros([num_envs, 3], device=self._device,
+                                              dtype=torch.float)
+            self._head_act_rate_buf = torch.zeros([num_envs], device=self._device,
+                                                  dtype=torch.float)
+            self._leg_act_rate_buf = torch.zeros([num_envs], device=self._device,
+                                                 dtype=torch.float)
 
         if (self._disc_table3):
             # before _build_data_buffers, which sizes the disc obs from a demo
@@ -183,7 +283,43 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)
+        if (self._reg_diag_enabled):
+            self._cache_pre_physics_terms(actions)
         self._prev_action[:] = actions
+        return
+
+    def _cache_pre_physics_terms(self, actions):
+        """Everything that needs a_t and a_{t-1} together, or the velocity from
+        BEFORE the physics step.
+
+        This is the only moment both exist. By the time _update_reward runs,
+        _prev_action below has already been overwritten with a_t, so an action
+        rate computed there is identically zero -- and a term that is always
+        zero is indistinguishable from a term that does not help.
+        super()._pre_physics_step only writes the command, it does not advance
+        the simulation, so get_root_vel here is still the pre-step velocity
+        that the acceleration needs.
+        """
+        # the first step of an episode has no predecessor: _prev_action was
+        # zeroed on reset and our action is an ABSOLUTE joint target, so the
+        # "rate" would be ||a_1||^2 of a whole pose. Left in, it scales with
+        # 1/episode_length and would make the term move when episode_length
+        # changes and nothing else does.
+        first = (self._timestep_buf == 0)
+
+        head = steering_reward.compute_action_rate_penalty(
+            actions.index_select(-1, self._head_dof_ids),
+            self._prev_action.index_select(-1, self._head_dof_ids))
+        leg = steering_reward.compute_action_rate_penalty(
+            actions.index_select(-1, self._leg_dof_ids),
+            self._prev_action.index_select(-1, self._leg_dof_ids))
+
+        zero = torch.zeros_like(head)
+        self._head_act_rate_buf[:] = torch.where(first, zero, head)
+        self._leg_act_rate_buf[:] = torch.where(first, zero, leg)
+
+        char_id = self._get_char_id()
+        self._prev_root_vel[:] = self._engine.get_root_vel(char_id)
         return
 
     def _apply_action(self, actions):
@@ -292,7 +428,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _update_reward(self):
         super()._update_reward()
-        if (self._aux_reward_enabled):
+        # the looser gate: with every weight at 0 this still fills the buffer
+        # and the diagnostics, but _update_info below does not publish the key,
+        # so the agent path stays bit-identical. That is the measurement mode.
+        if (self._reg_diag_enabled):
             self._cache_aux_reward()
         return
 
@@ -327,25 +466,79 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
         foot_prox = steering_reward.compute_foot_proximity_penalty(
             left, right, self._foot_proximity_min_dist)
-        self._aux_reward_buf[:] = self._reward_foot_proximity_w * foot_prox
 
-        # logged per term, not inferred from a shift in Aux_Reward_Mean: that
-        # total also carries the style reward, so a term that silently did
-        # nothing would be indistinguishable from one that did a little
-        # names stay <= 18 chars: the logger pads columns to 25 and prefixes
-        # them with "Train_"/"Test_", so a longer name overflows the pad and
-        # runs into the next column, breaking whitespace parsing of the log
-        # (which is how compare_train_logs.py reads it)
+        dof_pos = self._engine.get_dof_pos(char_id)
+        pos_exc = steering_reward.compute_joint_limit_penalty(
+            dof_pos, self._soft_dof_low, self._soft_dof_high)
+        # _prev_action holds a_t here: _pre_physics_step overwrote it with this
+        # step's action before the physics ran. That is the target the policy
+        # asked for, which is the quantity the gradient can actually shape.
+        act_exc = steering_reward.compute_joint_limit_penalty(
+            self._prev_action, self._soft_dof_low, self._soft_dof_high)
+        joint_lim = act_exc if self._joint_limit_on_action else pos_exc
+
+        base_accel = steering_reward.compute_base_accel_penalty(
+            self._engine.get_root_vel(char_id), self._prev_root_vel, self._dt)
+
+        # the RAW contact forces. get_ground_contact_forces zeroes every body
+        # above ground_contact_height (0.3 m), which is exactly where an
+        # arm-into-hip self-contact lives -- it is also why the existing fall
+        # termination cannot see one.
+        forces = self._engine.get_contact_forces(char_id)
+        collision = steering_reward.compute_collision_penalty(
+            forces, self._collision_body_ids, self._collision_force_thresh)
+
+        # one in-place write at the end. _update_info published this buffer's
+        # REFERENCE before _update_reward ran, so rebinding it here would leave
+        # stale zeros there and nothing would report it.
+        self._aux_reward_buf[:] = (
+            self._reward_foot_proximity_w * foot_prox
+            + self._reward_head_action_rate_w * self._head_act_rate_buf
+            + self._reward_leg_action_rate_w * self._leg_act_rate_buf
+            + self._reward_joint_limit_w * joint_lim
+            + self._reward_base_accel_w * base_accel
+            + self._reward_collision_w * collision)
+
+        # Weighted AND raw, per term. Weighted alone cannot tell "the weight is
+        # too small" from "the signal is not there"; raw alone cannot tell
+        # whether the term reaches the critic. Inferring either from a shift in
+        # Aux_Reward_Mean does not work: that total also carries the style
+        # reward, which moves on its own.
+        # Names stay <= 18 chars. The logger pads columns to 25 and prefixes
+        # them with Train_/Test_, so a longer name overflows the pad and runs
+        # into the next column, breaking the whitespace parsing that
+        # compare_train_logs.py depends on.
         self._diag.step()
-        self._diag.add_mean("reward_foot_prox",
-                            self._reward_foot_proximity_w * foot_prox)
+        self._diag.add_mean("rew_foot_prox", self._reward_foot_proximity_w * foot_prox)
+        self._diag.add_mean("rew_head_actrate",
+                            self._reward_head_action_rate_w * self._head_act_rate_buf)
+        self._diag.add_mean("rew_leg_actrate",
+                            self._reward_leg_action_rate_w * self._leg_act_rate_buf)
+        self._diag.add_mean("rew_joint_limit", self._reward_joint_limit_w * joint_lim)
+        self._diag.add_mean("rew_base_accel", self._reward_base_accel_w * base_accel)
+        self._diag.add_mean("rew_collision", self._reward_collision_w * collision)
+
+        self._diag.add_mean("head_act_rate", self._head_act_rate_buf)
+        self._diag.add_mean("leg_act_rate", self._leg_act_rate_buf)
+        # BOTH, always: whichever one the reward uses, the other says whether
+        # the choice mattered. pos_exc reading ~0 while act_exc reads ~0.3 is
+        # the whole reason joint_limit_on_action exists.
+        self._diag.add_mean("joint_lim_exc", pos_exc)
+        self._diag.add_mean("act_lim_exc", act_exc)
+        self._diag.add_mean("base_accel_sq", base_accel)
+        self._diag.add_mean("collision_rate", collision)
+        # how MANY bodies are in contact, not whether any is. A count pinned
+        # near K means two collision primitives permanently interpenetrate,
+        # which the binary term cannot distinguish from a real constant event.
+        self._diag.add_mean("collision_bodies", steering_reward.compute_collision_count(
+            forces, self._collision_body_ids, self._collision_force_thresh))
         self._diag.add_mean("foot_dist_planar",
                             torch.linalg.norm(left[..., 0:2] - right[..., 0:2], dim=-1))
         return
 
     def record_diagnostics(self):
         diags = dict(super().record_diagnostics())
-        if (self._aux_reward_enabled):
+        if (self._reg_diag_enabled):
             means, _ = self._diag.pop()
             diags.update(means)
         return diags
@@ -421,6 +614,16 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                 # same reasoning for the delay buffer, which knows nothing
                 # about episode boundaries
                 self._engine.reset_action_delay(env_ids)
+            if (self._reg_diag_enabled):
+                # super()._reset_envs has already teleported the character to a
+                # motion frame, so this re-seeds from the NEW velocity. A stale
+                # value would make the first step of every episode pay
+                # |v_new - v_old| / dt -- at 2.5 m/s and dt = 1/30 that is
+                # ~5600, a constant bias that reads like the term working.
+                char_id = self._get_char_id()
+                self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
+                self._head_act_rate_buf[env_ids] = 0.0
+                self._leg_act_rate_buf[env_ids] = 0.0
             frame = self._compute_measurable_frame(env_ids)
             self._meas_hist_buf[env_ids] = frame.unsqueeze(1)
         return

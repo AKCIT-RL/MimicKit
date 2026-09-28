@@ -70,3 +70,36 @@ def compute_privileged_block(root_pos, root_rot, root_vel):
     lin_vel = compute_root_lin_vel_b(root_rot, root_vel)
     root_h = root_pos[..., 2:3]
     return torch.cat([lin_vel, root_h], dim=-1)
+
+
+def build_dof_group_ids(kin_char_model, body_names):
+    """DOF indices of the joints attached to body_names, in asset order.
+
+    Used to split the action vector into the groups Table 4 weighs differently
+    (head -15, legs -1). Returns a plain list of ints.
+
+    BY NAME, never by index. The three torque profiles (t1.xml,
+    t1_catalog_peak.xml, t1_firmware_derated.xml) share their joints today, so
+    a hardcoded index would work -- right up until an asset reorders, at which
+    point a reward term would start weighing the wrong joints and nothing would
+    say so. A name that stops existing raises instead: get_body_id asserts on
+    an unknown body.
+
+    get_body_id, NOT get_joint_id. The latter returns body_id - 1 because it
+    indexes arrays that exclude the root, while self._joints includes it, so
+    get_joint(get_joint_id(name)) hands back the joint of the PREVIOUS body.
+    On the T1 that silently shifts every group by one and drags in the fixed
+    camera joint (dof_dim 0) -- the dof_dim assert below is what catches it.
+    """
+    ids = []
+    for name in body_names:
+        j = kin_char_model.get_body_id(name)
+        idx = kin_char_model.get_joint_dof_idx(j)
+        dim = kin_char_model.get_joint_dof_dim(j)
+        assert dim == 1, \
+            "expected a 1-DOF hinge at '{}', got dof_dim {}".format(name, dim)
+        ids.extend(range(idx, idx + dim))
+
+    assert len(set(ids)) == len(ids), \
+        "overlapping DOF groups in {}".format(body_names)
+    return ids

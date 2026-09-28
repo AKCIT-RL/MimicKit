@@ -1,0 +1,103 @@
+# CAMPANHA DE REGULARIZACAO (Table 4), grupo "allreg".
+# OS CINCO JUNTOS. Nao isola nada; mede a combinacao. A diferenca
+# entre a soma dos efeitos isolados e este e a estimativa de interacao.
+#
+# Base: best_urdf (mirror + vscale10 + footprox, 30 Hz, torque do URDF). Muda
+# SO o bloco de pesos abaixo.
+#
+# POR QUE OS PESOS NAO SAO OS DO PAPER. O stream auxiliar do paper carrega
+# survival +3, termination -1000, stagnation -100, chutes +-20, gaze, sweep e
+# waiting alem dos regularizadores (mcwamp_t1_soccer_env.yaml:94-105). O nosso
+# carrega o style reward e mais nada, entao os pesos de la calibrados contra
+# aquele conjunto colocam um unico termo em 95% da variancia daqui: medido,
+# collision_rate e Bernoulli com p=0,144, logo std=0,351, e -100 x isso = 35
+# contra 1,04 do segundo colocado.
+#
+# REGRA DE CALIBRACAO, fixada antes de olhar resultado: o bloco de
+# regularizacao contribui tanta variancia quanto o style reward
+# (Disc_Reward_Std = 0,1561 medido no best_urdf seed1), dividida IGUALMENTE
+# entre os cinco termos -> |w| x std_bruto = 0,0312 para cada um. Os desvios
+# brutos sairam de logs/div_s{1,2}.json, 64 episodios por seed a 1,0 m/s.
+# Isto e o que sobrevive a normalizacao: compute_multi_critic_adv normaliza
+# cada stream pela propria media e desvio, entao a escala absoluta e dividida
+# fora e so a fracao da variancia conta.
+#
+# Pesos do paper, para registro: head -15, leg -1, joint_limit -100,
+# base_accel -0,001, collision -100.
+#
+# joint_limit_on_action: o paper diz "joint positions exceeding limits", mas a
+# fisica trava dof_pos -- excursao medida 1,5e-5 rad, inerte a qualquer peso.
+# O alvo COMANDADO nao e travado por nada e mede 0,279 rad no mesmo rollout,
+# ~18000x mais. Sem isto o termo nao tem onde agir.
+env_name: "task_steering_meas"
+
+char_file: "data/assets/t1/t1.xml"
+camera_mode: "track"
+
+episode_length: 10.0 # seconds
+global_obs: False
+root_height_obs: True
+pose_termination: False
+enable_phase_obs: False
+enable_tar_obs: False
+num_disc_obs_steps: 10
+rand_reset: True
+zero_center_action: True
+
+# Encoder history: 30 frames at 30 Hz (one second of samples).
+measurable_hist_steps: 30
+
+# domain randomization (Table 2). Static per env, drawn once at build time.
+# Ranges come from steering_dr.DEFAULT_RANGES; set dr_ranges here to override.
+# dr_seed is left unset on purpose: the draw then follows --rand_seed, so two
+# seeds of this experiment see two different sets of robots. The holdout env
+# pins it instead.
+domain_randomization: true
+disc_obs_table3: true
+
+ref_char_offset: [2.0, 0.0, 0.0] # m
+init_pose: [0, 0, 0.69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+enable_early_termination: True
+key_bodies: ["left_ankle_roll_link", "right_ankle_roll_link", "aahead_pitch_link", "left_elbow_yaw_link", "right_elbow_yaw_link"]
+contact_bodies: ["left_knee_pitch_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_pitch_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
+
+rand_tar_dir: True
+rand_face_dir: False
+# 0.0, not 0.5: tar_speed is drawn as U(min, max), so a positive floor
+# means the policy NEVER sees a stop command and never learns to stand
+# still. It showed up in deploy, where asking for 0 m/s still walked.
+tar_speed_min: 0.0
+tar_speed_max: 2.5
+tar_change_time_min: 4.0
+tar_change_time_max: 7.0
+
+motion_file: "data/datasets/dataset_t1_locomotion_wrturn.yaml"
+
+reward_foot_proximity_w: -5.0
+foot_proximity_min_dist: 0.2
+
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+
+reward_steering_tar_w: 0.7
+reward_steering_face_w: 0.3
+
+reward_steering_vel_scale: 10.0
+
+# --- bloco de regularizacao (allreg) ---
+joint_limit_on_action: true
+reward_head_action_rate_w: -0.451349
+reward_leg_action_rate_w: -0.041542
+reward_joint_limit_w: -0.110531
+reward_base_accel_w: -0.00073277
+reward_collision_w: -0.089033

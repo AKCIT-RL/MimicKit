@@ -103,3 +103,51 @@ def build_dof_group_ids(kin_char_model, body_names):
     assert len(set(ids)) == len(ids), \
         "overlapping DOF groups in {}".format(body_names)
     return ids
+
+
+# config key -> slice of the measurable frame it corrupts. prev_action and the
+# steering command are absent ON PURPOSE: the first is the policy's own output
+# and is exact on the robot, the second is a command, not a measurement.
+OBS_NOISE_KEYS = ("obs_noise_gravity", "obs_noise_ang_vel",
+                  "obs_noise_dof_pos", "obs_noise_dof_vel")
+
+
+def build_obs_noise_std(env_config, num_dofs, task_dim):
+    """Per-dimension std of the actor's sensor noise, [6 + 3D + task_dim].
+
+    Layout matches compute_proprio_frame + the task block:
+      gravity(3) ang_vel(3) dof_pos(D) dof_vel(D) prev_action(D) task(task_dim)
+    Each obs_noise_* key is one std for its whole block (default 0), times
+    obs_noise_scale (default 1), which exists so an evaluation can sweep the
+    level without editing the four stds. A single std per block is also what
+    keeps the noise mirror-symmetric: the frame's mirror map only permutes
+    and flips signs WITHIN a block.
+
+    Gaussian and white on purpose -- the minimum model. Nothing here has been
+    measured on the robot yet; see the env yaml for where the values came from.
+    """
+    std = {k: float(env_config.get(k, 0.0)) for k in OBS_NOISE_KEYS}
+    scale = float(env_config.get("obs_noise_scale", 1.0))
+    for k, v in std.items():
+        assert v >= 0.0, "{} must be >= 0, got {}".format(k, v)
+    assert scale >= 0.0, "obs_noise_scale must be >= 0, got {}".format(scale)
+
+    blocks = [torch.full([3], std["obs_noise_gravity"]),
+              torch.full([3], std["obs_noise_ang_vel"]),
+              torch.full([num_dofs], std["obs_noise_dof_pos"]),
+              torch.full([num_dofs], std["obs_noise_dof_vel"]),
+              torch.zeros([num_dofs]),
+              torch.zeros([task_dim])]
+    return scale * torch.cat(blocks)
+
+
+def apply_obs_noise(frame, noise_std):
+    """Additive white Gaussian noise, frame [N, F] + noise_std [F] * N(0, 1).
+
+    Returns the input tensor itself (not a copy) when every std is zero, so a
+    disabled operator is bit-exact disabled -- no randn is drawn and the RNG
+    stream the rest of the run consumes is untouched.
+    """
+    if (not bool(torch.any(noise_std > 0))):
+        return frame
+    return frame + noise_std * torch.randn_like(frame)

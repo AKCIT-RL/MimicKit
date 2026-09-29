@@ -62,6 +62,13 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # read by ppo_agent to pick the measurable mirror map
         self._measurable_obs = True
 
+        # actor-only sensor noise (paper, Appendix A: "only the actor's
+        # observations ... were corrupted with simulated sensor noise"). All
+        # stds default to 0, and a zero std leaves the env bit-identical.
+        self._obs_noise_cfg = {k: env_config[k]
+                               for k in steering_util.OBS_NOISE_KEYS + ("obs_noise_scale",)
+                               if k in env_config}
+
         # domain randomization (Table 2). Off by default so this env stays
         # bit-identical to the E1 runs unless a config asks for it.
         self._dr_enabled = bool(env_config.get("domain_randomization", False))
@@ -216,6 +223,11 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._meas_hist_buf = torch.zeros(
             [num_envs, self._meas_hist_steps, self._meas_frame_dim],
             device=self._device, dtype=torch.float)
+
+        self._obs_noise_std = steering_util.build_obs_noise_std(
+            self._obs_noise_cfg, action_dim, TASK_BLOCK_DIM).to(self._device)
+        assert self._obs_noise_std.shape[0] == self._meas_frame_dim
+        self._obs_noise_on = bool(torch.any(self._obs_noise_std > 0))
 
         if (self._reg_diag_enabled):
             self._aux_reward_buf = torch.zeros([num_envs], device=self._device,
@@ -381,9 +393,24 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # the history is rolled once per step in _update_task (and refilled on
         # reset), NEVER here: _compute_obs doubles as a shape probe for
         # get_obs_space() and is called more than once per step
-        frame = self._compute_measurable_frame(env_ids)
         hist = self._meas_hist_buf if env_ids is None else self._meas_hist_buf[env_ids]
+        if (self._obs_noise_on):
+            # the noisy frame was drawn ONCE, when it entered the history.
+            # Re-drawing here would hand the actor a current frame that
+            # differs from hist[-1] -- the deploy side sends the same frame in
+            # both places -- and a different one on every call.
+            frame = hist[:, -1]
+        else:
+            frame = self._compute_measurable_frame(env_ids)
         return torch.cat([frame, hist.flatten(start_dim=1)], dim=-1)
+
+    def _compute_actor_frame(self, env_ids=None):
+        """The frame the actor receives: the measurable frame, corrupted with
+        sensor noise when configured. Called exactly once per step (history
+        roll) and once per reset (refill). The critic never goes through here:
+        _compute_critic_obs calls _compute_measurable_frame, which is clean."""
+        return steering_util.apply_obs_noise(self._compute_measurable_frame(env_ids),
+                                             self._obs_noise_std)
 
     def get_measurable_frame_dim(self):
         return self._meas_frame_dim
@@ -597,7 +624,7 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # history slot must hold the frame the actor was actually given
         super()._update_task()
 
-        frame = self._compute_measurable_frame()
+        frame = self._compute_actor_frame()
         self._meas_hist_buf[:, :-1] = self._meas_hist_buf[:, 1:].clone()
         self._meas_hist_buf[:, -1] = frame
         return
@@ -624,6 +651,6 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                 self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
                 self._head_act_rate_buf[env_ids] = 0.0
                 self._leg_act_rate_buf[env_ids] = 0.0
-            frame = self._compute_measurable_frame(env_ids)
+            frame = self._compute_actor_frame(env_ids)
             self._meas_hist_buf[env_ids] = frame.unsqueeze(1)
         return

@@ -533,3 +533,22 @@ def compute_head_gaze_reward(head_pos, head_rot, ball_pos):
     local_ball = torch_util.quat_rotate(torch_util.quat_conjugate(head_rot), ball_rel)
     dist = torch.clamp(torch.linalg.norm(local_ball, dim=-1), min=1e-6)
     return torch.clamp(local_ball[..., 0] / dist, min=0.0, max=1.0)
+
+
+@torch.jit.script
+def compute_head_gaze_angles(head_pos, head_rot, ball_pos):
+    # type: (Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor]
+    """|yaw| and |pitch| of the ball in the head frame, radians, each capped at
+    pi/2 (paper Table 4 penalizes head pitch and yaw separately, -0.5 each).
+
+    yaw is the bearing in the head's horizontal plane, pitch the elevation off
+    that plane. Capped so a ball behind the robot costs a bounded amount
+    instead of pushing the head against its joint limit.
+    """
+    ball_rel = ball_pos - head_pos
+    local = torch_util.quat_rotate(torch_util.quat_conjugate(head_rot), ball_rel)
+    yaw = torch.abs(torch.atan2(local[..., 1], local[..., 0]))
+    horiz = torch.sqrt(local[..., 0] * local[..., 0] + local[..., 1] * local[..., 1])
+    pitch = torch.abs(torch.atan2(local[..., 2], horiz))
+    half_pi = 1.5707963267948966
+    return torch.clamp(yaw, max=half_pi), torch.clamp(pitch, max=half_pi)

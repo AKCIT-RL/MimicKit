@@ -7,6 +7,9 @@ import envs.base_env as base_env
 import envs.diag_util as diag_util
 import envs.smp_env as smp_env
 import envs.soccer_util as soccer_util
+import envs.steering_dr as steering_dr
+import envs.steering_reward as steering_reward
+import envs.steering_util as steering_util
 import envs.task_steering_env as task_steering_env
 import util.torch_util as torch_util
 
@@ -116,6 +119,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._rand_char_base_mass_scale = list(env_config.get("rand_char_base_mass_scale", [0.8, 1.2]))
         self._rand_char_base_com = list(env_config.get("rand_char_base_com", [-0.1, 0.1]))
         self._rand_char_other_mass_scale = list(env_config.get("rand_char_other_mass_scale", [0.98, 1.02]))
+
+        # Table 2 domain randomization, shared with the steering env (same
+        # sampler, same ranges). Replaces rand_char_props when on: the two draw
+        # the same friction/mass/CoM with different ranges and must not stack.
+        self._dr_enabled = bool(env_config.get("domain_randomization", False))
+        assert not (self._dr_enabled and self._rand_char_props), \
+            "domain_randomization supersedes rand_char_props; set only one"
+        self._dr_ranges = steering_dr.load_ranges(env_config) if self._dr_enabled else None
+        self._dr_seed = env_config.get("dr_seed", None)
+        self._dr_foot_bodies = list(env_config.get(
+            "dr_foot_bodies", ["left_ankle_roll_link", "right_ankle_roll_link"]))
+        # the critic sees torso mass/CoM (Table 3) only if asked: it changes the
+        # critic input size, which breaks warm-starting from a checkpoint
+        self._dr_critic_torso_obs = bool(env_config.get("dr_critic_torso_obs", False))
+        self._dr_samples = []
 
         # random velocity pushes on the robot (paper: physical confrontation;
         # magnitude matches the HTWK T1 push: ~10 N x 1 s / ~30 kg)
@@ -265,6 +283,26 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # angle between the camera body boresight and the ball; requires
         # percep_fov_body. 0 disables (G1 baseline parity).
         self._reward_head_gaze_w = float(env_config.get("reward_head_gaze_w", 0.0))
+        # Table 4 variants, all 0 = bit-identical to the runs before them:
+        #  - action rate split by joint group (head -15, legs -1); the whole-body
+        #    reward_action_rate_w stays for the older configs and should be 0
+        #    when these are on
+        #  - head pitch/yaw penalty (-0.5 each) as the paper words the head term
+        #  - collision on every body but the feet (-100)
+        self._reward_head_action_rate_w = float(env_config.get("reward_head_action_rate_w", 0.0))
+        self._reward_leg_action_rate_w = float(env_config.get("reward_leg_action_rate_w", 0.0))
+        self._reward_head_pitch_w = float(env_config.get("reward_head_pitch_w", 0.0))
+        self._reward_head_yaw_w = float(env_config.get("reward_head_yaw_w", 0.0))
+        self._reward_collision_w = float(env_config.get("reward_collision_w", 0.0))
+        self._collision_force_thresh = float(env_config.get("collision_force_thresh", 1.0))
+        self._head_dof_bodies = list(env_config.get("head_dof_bodies", ["aahead_yaw_link", "aahead_pitch_link"]))
+        self._leg_dof_bodies = list(env_config.get(
+            "leg_dof_bodies", ["{}_{}_link".format(side, joint)
+                               for side in ("left", "right")
+                               for joint in ("hip_pitch", "hip_roll", "hip_yaw",
+                                             "knee_pitch", "ankle_pitch", "ankle_roll")]))
+        self._collision_exempt_bodies = list(env_config.get(
+            "collision_exempt_bodies", ["left_ankle_roll_link", "right_ankle_roll_link"]))
 
         self._stagnation_window = float(env_config.get("stagnation_window", 1.0))
         self._stagnation_move_threshold = float(env_config.get("stagnation_move_threshold", 0.1))
@@ -317,6 +355,44 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._randomize_env_props(env_id, ball_id)
         return
 
+    def _get_dr_rng(self):
+        if (not hasattr(self, "_dr_rng")):
+            seed = self._dr_seed if self._dr_seed is not None else np.random.randint(2**31 - 1)
+            self._dr_rng = np.random.RandomState(int(seed))
+        return self._dr_rng
+
+    def _apply_dr_runtime(self):
+        """The half of Table 2 that needs the post-initialize_sim tensors:
+        motor gains, motor bias and the action delay."""
+        char_id = self._get_char_id()
+        for env_id, params in enumerate(self._dr_samples):
+            self._engine.scale_obj_pd_gains(env_id, char_id, params["kp_scale"],
+                                            params["kd_scale"])
+        self._motor_bias = torch.as_tensor(
+            np.stack([p["motor_bias"] for p in self._dr_samples]),
+            device=self._device, dtype=torch.float)
+        control_dt = self._engine.get_timestep()
+        num_substeps = self._engine.get_num_sim_steps()
+        weights = np.stack([
+            steering_dr.substep_action_blend(p["action_delay_ms"], num_substeps, control_dt)
+            for p in self._dr_samples])
+        self._engine.set_action_delay(weights)
+        self._dr_torso_params = torch.as_tensor(
+            np.stack([p["torso_params"] for p in self._dr_samples]),
+            device=self._device, dtype=torch.float)
+        return
+
+    def _apply_action(self, actions):
+        if (not self._dr_enabled):
+            super()._apply_action(actions)
+            return
+        # motor bias lands on the target AFTER the clip (see the steering env)
+        char_id = self._get_char_id()
+        clip_action = torch.minimum(torch.maximum(actions, self._action_bound_low),
+                                    self._action_bound_high)
+        self._engine.set_cmd(char_id, clip_action + self._motor_bias)
+        return
+
     def _randomize_env_props(self, env_id, ball_id):
         """Per-env static randomization, applied at build time (before the sim
         is initialized, which is required by Isaac Gym's GPU pipeline)."""
@@ -330,6 +406,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             mass_scale = np.random.uniform(self._rand_ball_mass_scale[0],
                                            self._rand_ball_mass_scale[1])
             self._engine.scale_obj_masses(env_id, ball_id, np.full([num_bodies], mass_scale))
+
+        if (self._dr_enabled):
+            char_id = self._get_char_id()
+            num_bodies = self._engine.get_obj_num_bodies(char_id)
+            num_dofs = self._engine.get_obj_num_dofs(char_id)
+            params = steering_dr.sample_env_params(self._get_dr_rng(), self._dr_ranges,
+                                                   num_bodies, num_dofs)
+            self._dr_samples.append(params)
+            self._engine.scale_obj_masses(env_id, char_id, params["mass_scales"],
+                                          params["com_offsets"])
+            foot_ids = [self._engine.find_obj_body_id(char_id, n) for n in self._dr_foot_bodies]
+            self._engine.set_obj_shape_props(env_id, char_id,
+                                             friction=params["foot_friction"],
+                                             restitution=params["foot_restitution"],
+                                             compliance=params["foot_compliance"],
+                                             body_ids=foot_ids)
 
         if (self._rand_char_props):
             char_id = self._get_char_id()
@@ -441,6 +533,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_buf_head = torch.zeros([num_envs], device=self._device, dtype=torch.long)
         self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
+        # evaluation hook (occlusion experiment): captures are all misses until
+        # this time. -inf = never blacked out, so training is unaffected.
+        self._percep_blackout_until = torch.full([num_envs], -float("inf"), device=self._device,
+                                                 dtype=torch.float)
 
         # per-iteration diagnostics window (reward-term decomposition +
         # episode event rates); popped and reset by record_diagnostics()
@@ -478,11 +574,30 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._dof_limits_high = torch.tensor(np.asarray(dof_high), device=self._device,
                                              dtype=torch.float)
 
+        self._head_act_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._leg_act_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._head_dof_ids = torch.tensor(
+            steering_util.build_dof_group_ids(self._kin_char_model, self._head_dof_bodies),
+            device=self._device, dtype=torch.long)
+        self._leg_dof_ids = torch.tensor(
+            steering_util.build_dof_group_ids(self._kin_char_model, self._leg_dof_bodies),
+            device=self._device, dtype=torch.long)
+        exempt = set(self._engine.find_obj_body_id(self._get_char_id(), n)
+                     for n in self._collision_exempt_bodies)
+        self._collision_body_ids = torch.tensor(
+            [b for b in range(self._engine.get_obj_num_bodies(self._get_char_id()))
+             if b not in exempt], device=self._device, dtype=torch.long)
+        if (self._dr_enabled):
+            self._apply_dr_runtime()
+
         self._foot_body_ids = self._build_body_ids_tensor(self._kick_feet_bodies)
         if (self._percep_fov_body != ""):
             self._fov_body_id = int(self._build_body_ids_tensor([self._percep_fov_body])[0].item())
         else:
             self._fov_body_id = None
+        assert ((self._reward_head_pitch_w == 0.0 and self._reward_head_yaw_w == 0.0)
+                or self._fov_body_id is not None), \
+            "reward_head_pitch_w/yaw_w need percep_fov_body (the head frame)"
         assert (self._reward_head_gaze_w == 0.0 or self._fov_body_id is not None), \
             "reward_head_gaze_w requires percep_fov_body (the gaze is measured " \
             "about the camera body's boresight)"
@@ -579,6 +694,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         self._action_rate_buf[:] = soccer_util.compute_action_rate_penalty(actions,
                                                                            self._prev_action)
+        # split rates skip the first step of an episode: _prev_action was zeroed
+        # and the action is an absolute target, so the "rate" would be |a_1|^2
+        first = (self._timestep_buf == 0)
+        head = soccer_util.compute_action_rate_penalty(
+            actions.index_select(-1, self._head_dof_ids),
+            self._prev_action.index_select(-1, self._head_dof_ids))
+        leg = soccer_util.compute_action_rate_penalty(
+            actions.index_select(-1, self._leg_dof_ids),
+            self._prev_action.index_select(-1, self._leg_dof_ids))
+        zero = torch.zeros_like(head)
+        self._head_act_rate_buf[:] = torch.where(first, zero, head)
+        self._leg_act_rate_buf[:] = torch.where(first, zero, leg)
         self._prev_action[:] = actions
         return
 
@@ -801,6 +928,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 dist, in_fov, detect_prob,
                 self._percep_detect_full_range, self._percep_detect_decay_range)
             detected = torch.rand_like(dist) < detect_prob_t
+            detected = detected & (self._time_buf[env_ids] >= self._percep_blackout_until[env_ids])
 
             noise_std = soccer_util.compute_perception_noise_std(
                 dist, noise_dist_coef, noise_base)
@@ -829,6 +957,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_percep_valid[:] = self._percep_ball_valid
         return
 
+    def set_percep_blackout(self, env_ids, duration_s):
+        """Hide the ball from the actor for `duration_s` from now (evaluation
+        only). Drops what is already in flight too, so the actor sees the
+        mask go to 0 immediately instead of after the camera latency."""
+        self._percep_blackout_until[env_ids] = self._time_buf[env_ids] + float(duration_s)
+        self._percep_buf_valid[env_ids] = False
+        self._percep_ball_valid[env_ids] = False
+        return
+
     def _reset_perception(self, env_ids):
         """Per-episode camera parameters + a clean first measurement (the
         true ball position, valid), so the policy never sees stale data from
@@ -843,6 +980,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             * torch.rand([n], device=self._device)
         self._percep_buf_deliver[env_ids] = float("inf")
         self._percep_buf_valid[env_ids] = False
+        self._percep_blackout_until[env_ids] = -float("inf")
         self._percep_buf_head[env_ids] = 0
         self._percep_ball_pos[env_ids] = self._get_ball_pos()[env_ids][:, 0:2]
         self._percep_ball_valid[env_ids] = True
@@ -976,6 +1114,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._head_yaw_prev[:] = head_yaw
 
         aux_r += self._reward_action_rate_w * self._action_rate_buf
+        aux_r += self._reward_head_action_rate_w * self._head_act_rate_buf
+        aux_r += self._reward_leg_action_rate_w * self._leg_act_rate_buf
+
+        # head pitch/yaw penalty (Table 4): true ball state, like the gaze term
+        if (self._reward_head_pitch_w != 0.0 or self._reward_head_yaw_w != 0.0):
+            body_rot = self._engine.get_body_rot(char_id)
+            yaw_err, pitch_err = soccer_util.compute_head_gaze_angles(
+                body_pos[:, self._fov_body_id, :], body_rot[:, self._fov_body_id, :], ball_pos)
+            aux_r += self._reward_head_pitch_w * pitch_err + self._reward_head_yaw_w * yaw_err
+
+        collision = None
+        if (self._reward_collision_w != 0.0):
+            collision = steering_reward.compute_collision_penalty(
+                self._engine.get_contact_forces(char_id), self._collision_body_ids,
+                self._collision_force_thresh)
+            aux_r += self._reward_collision_w * collision
 
         dof_pos = self._engine.get_dof_pos(char_id)
         joint_limit = soccer_util.compute_joint_limit_penalty(dof_pos, self._dof_limits_low,
@@ -1010,6 +1164,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._reward_head_gaze_w != 0.0):
             d.add_mean("reward_head_gaze", self._reward_head_gaze_w * gaze_r)
         d.add_mean("reward_action_rate", self._reward_action_rate_w * self._action_rate_buf)
+        if (self._reward_head_action_rate_w != 0.0 or self._reward_leg_action_rate_w != 0.0):
+            d.add_mean("reward_head_action_rate",
+                       self._reward_head_action_rate_w * self._head_act_rate_buf)
+            d.add_mean("reward_leg_action_rate",
+                       self._reward_leg_action_rate_w * self._leg_act_rate_buf)
+        if (self._reward_head_pitch_w != 0.0 or self._reward_head_yaw_w != 0.0):
+            d.add_mean("reward_head_pitch", self._reward_head_pitch_w * pitch_err)
+            d.add_mean("reward_head_yaw", self._reward_head_yaw_w * yaw_err)
+        if (collision is not None):
+            d.add_mean("reward_collision", self._reward_collision_w * collision)
         d.add_mean("reward_joint_limit", self._reward_joint_limit_w * joint_limit)
         d.add_mean("reward_base_accel", self._reward_base_accel_w * base_accel)
         d.add_mean("reward_waiting", waiting_r)
@@ -1158,7 +1322,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._engine.get_root_rot(char_id),
                 self._get_ball_pos(),
                 self._engine.get_root_vel(self._get_ball_id()))
-            return torch.cat([obs, ball_state[..., 2:4]], dim=-1)
+            blocks = [obs, ball_state[..., 2:4]]
+            if (self._dr_enabled and self._dr_critic_torso_obs):
+                blocks.append(self._dr_torso_params)
+            return torch.cat(blocks, dim=-1)
         if (self._task_hist_steps > 0):
             obs = torch.cat([obs, self._critic_task_hist_buf.flatten(start_dim=1)], dim=-1)
         return obs
@@ -1283,6 +1450,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
             self._aux_reward_buf[env_ids] = 0.0
             self._action_rate_buf[env_ids] = 0.0
+            self._head_act_rate_buf[env_ids] = 0.0
+            self._leg_act_rate_buf[env_ids] = 0.0
+            if (self._dr_enabled):
+                self._engine.reset_action_delay(env_ids)
             self._prev_action[env_ids] = 0.0
             self._prev_ball_touch[env_ids] = False
             if (self._search_sweep_w != 0.0):

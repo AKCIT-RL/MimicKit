@@ -9,7 +9,9 @@ import util.torch_util as torch_util
 class BaseModel(torch.nn.Module):
     def __init__(self, config, env):
         super().__init__()
-        self._activation = torch.nn.ReLU
+        # ReLU unless the agent config asks otherwise (paper Table 1: ELU).
+        # Applies to every net the model builds through net_builder.
+        self._activation = getattr(torch.nn, config.get("activation", "ReLU"))
         return
 
     def _build_action_distribution(self, config, env, input):

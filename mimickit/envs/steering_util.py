@@ -11,6 +11,8 @@ Deliberately independent from envs/soccer_util.py: that module belongs to the
 soccer track and carries ball/goal semantics, so the two evolve separately.
 """
 
+from typing import Tuple  # noqa: F401  (TorchScript type comments)
+
 import torch
 
 import util.torch_util as torch_util
@@ -103,6 +105,67 @@ def build_dof_group_ids(kin_char_model, body_names):
     assert len(set(ids)) == len(ids), \
         "overlapping DOF groups in {}".format(body_names)
     return ids
+
+
+# Foot collision box of the T1 (data/assets/t1/t1.xml, identical in the two
+# torque-profile assets and for both feet), in the ankle_roll body frame. The
+# body ORIGIN sits 4.3 cm above the sole, so anything about the foot touching
+# the ground has to be computed on this box, not on the origin. Overridable per
+# env config (foot_box_half / foot_box_pos) for another embodiment.
+DEFAULT_FOOT_BOX_HALF = (0.112434, 0.05, 0.02183)
+DEFAULT_FOOT_BOX_POS = (0.0101079, 0.0, -0.0214208)
+
+
+def build_foot_box_corners(half=DEFAULT_FOOT_BOX_HALF, pos=DEFAULT_FOOT_BOX_POS):
+    """The 8 corners of the foot collision box in the foot body frame, [8, 3]."""
+    corners = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                corners.append([pos[0] + sx * half[0], pos[1] + sy * half[1],
+                                pos[2] + sz * half[2]])
+    return torch.tensor(corners)
+
+
+@torch.jit.script
+def compute_sole_contact_state(foot_pos, foot_rot, foot_vel, foot_ang_vel, corners):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor]
+    """Sole height and contact-point velocity of each foot.
+
+    foot_pos/foot_vel/foot_ang_vel [N, F, 3] world, foot_rot [N, F, 4] xyzw,
+    corners [8, 3] in the foot frame. Returns (sole_z [N, F], the world z of the
+    lowest box corner; v_xy [N, F, 2], the planar velocity of that corner).
+
+    The lowest corner is the contact point, so v_xy is what slides when a foot
+    slips. The origin is the wrong point: while the foot rolls heel-to-toe it
+    moves with the toe planted (measured: up to 1.7 m/s of fake "slip").
+    v_point = v_origin + omega x r.
+    """
+    n, f = foot_pos.shape[0], foot_pos.shape[1]
+    k = corners.shape[0]
+    rot = foot_rot.unsqueeze(-2).expand(n, f, k, 4)
+    r = torch_util.quat_rotate(rot.reshape(-1, 4),
+                               corners.expand(n, f, k, 3).reshape(-1, 3)).reshape(n, f, k, 3)
+    z = foot_pos[..., 2:3] + r[..., 2]
+    sole_z, idx = torch.min(z, dim=-1)
+    r_low = torch.gather(r, 2, idx.unsqueeze(-1).unsqueeze(-1).expand(n, f, 1, 3)).squeeze(2)
+    v = foot_vel + torch.cross(foot_ang_vel, r_low, dim=-1)
+    return sole_z, v[..., 0:2]
+
+
+@torch.jit.script
+def compute_gait_clock_obs(phase, freq):
+    # type: (Tensor, Tensor) -> Tensor
+    """[cos, sin](2 pi phase), zeroed when the clock is stopped (freq == 0).
+
+    Booster Gym's commanded gait clock (envs/t1.py, the cos/sin pair in the
+    actor obs). Under the left/right mirror the clock shifts by half a cycle,
+    since the left swing window sits at phase 0.25 and the right at 0.75, and
+    cos/sin of (phase + 0.5) are exactly -cos/-sin: the mirror signs are (-1, -1).
+    """
+    on = (freq > 0.0).to(phase.dtype)
+    ang = 2.0 * 3.141592653589793 * phase
+    return torch.stack([torch.cos(ang) * on, torch.sin(ang) * on], dim=-1)
 
 
 # config key -> slice of the measurable frame it corrupts. prev_action and the

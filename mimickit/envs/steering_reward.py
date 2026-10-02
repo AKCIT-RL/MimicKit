@@ -32,6 +32,8 @@ track, even though the arithmetic of three of these is the same. A change made
 there must not silently alter a run made here.
 """
 
+import math
+
 import torch
 
 
@@ -187,3 +189,139 @@ def compute_collision_count(contact_forces, body_ids, force_thresh):
     f = contact_forces.index_select(-2, body_ids)
     mag = torch.linalg.norm(f, dim=-1)
     return torch.sum((mag > force_thresh).to(contact_forces.dtype), dim=-1)
+
+
+# ----------------------------------------------------------------------------
+# Gait terms from Booster Gym (arXiv 2506.15132, the framework the paper cites as
+# [45]; booster_gym/envs/t1.py). NOT in the paper's own reward table, whose only
+# foot term is foot proximity: these are adopted for two symptoms seen on the
+# real robot (a dragging foot; the foot turning inward above ~0.8 m/s), not for
+# fidelity. Booster Gym's weights do not transfer -- its stream is single and
+# clipped positive -- so every term is measured raw before a weight is chosen.
+# Foot order everywhere: index 0 = left, 1 = right.
+# ----------------------------------------------------------------------------
+
+
+@torch.jit.script
+def wrap_to_pi(x):
+    # type: (Tensor) -> Tensor
+    return torch.remainder(x + math.pi, 2.0 * math.pi) - math.pi
+
+
+@torch.jit.script
+def compute_feet_slip_penalty(contact_vel_xy, contact):
+    # type: (Tensor, Tensor) -> Tensor
+    """Sum over feet of the squared planar contact-point speed while in contact.
+
+    contact_vel_xy [N, F, 2] (steering_util.compute_sole_contact_state),
+    contact [N, F] bool. Booster Gym _reward_feet_slip, weight -0.1, with two
+    deliberate differences:
+
+      POINT    the lowest box corner, not the body origin. Booster Gym
+               differences the origin, which during the heel-to-toe roll moves
+               with the toe planted -- measured on our policies as up to
+               1.7 m/s of slip that is not there. Penalizing that would punish
+               the roll, not the drag.
+      PLANAR   x and y only. A foot dragging is a foot moving ALONG the ground;
+               the vertical speed at touchdown and liftoff is the step itself.
+
+    The contact rule is Booster Gym's: geometric, the sole within 1 cm of the
+    ground (it tests four sole corners against 0.01 m; this tests the lowest of
+    the eight box corners, the same quantity). A foot grazing the ground in
+    mid-swing is exactly "in contact and moving", so it pays here.
+    """
+    speed_sq = torch.sum(torch.square(contact_vel_xy), dim=-1)
+    return torch.sum(speed_sq * contact.to(speed_sq.dtype), dim=-1)
+
+
+@torch.jit.script
+def compute_feet_yaw_diff_penalty(foot_yaw):
+    # type: (Tensor) -> Tensor
+    """(yaw_right - yaw_left)^2, wrapped. Booster Gym _reward_feet_yaw_diff, -1.
+
+    foot_yaw [N, 2] world yaw of each foot. Zero when the feet are parallel,
+    whatever their common heading. A symmetric toe-in (both points inward)
+    makes the feet NON-parallel, so it scores here -- unlike feet_yaw_mean,
+    which averages the two feet and cancels it out.
+    """
+    return torch.square(wrap_to_pi(foot_yaw[..., 1] - foot_yaw[..., 0]))
+
+
+@torch.jit.script
+def compute_feet_yaw_mean_penalty(base_yaw, foot_yaw):
+    # type: (Tensor, Tensor) -> Tensor
+    """(base_yaw - mean foot yaw)^2, wrapped. Booster Gym _reward_feet_yaw_mean.
+
+    Measured only, not trained: it is blind to a symmetric toe-in (the mean of
+    +a and -a is 0), and what it does see -- the torso twisting against the
+    feet -- is the per-step hip yaw the reference motions themselves contain.
+    The +pi branch is Booster Gym's, for feet whose yaws straddle the wrap.
+    """
+    straddle = torch.abs(foot_yaw[..., 1] - foot_yaw[..., 0]) > math.pi
+    mean = foot_yaw.mean(dim=-1) + math.pi * straddle.to(foot_yaw.dtype)
+    return torch.square(wrap_to_pi(base_yaw - mean))
+
+
+@torch.jit.script
+def compute_feet_roll_penalty(foot_roll):
+    # type: (Tensor) -> Tensor
+    """Sum of squared foot roll. Booster Gym _reward_feet_roll. Measured only."""
+    return torch.sum(torch.square(foot_roll), dim=-1)
+
+
+@torch.jit.script
+def compute_feet_lateral_distance(base_yaw, left_pos, right_pos):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """Lateral (sideways) separation of the feet in the base heading frame, m.
+
+    Booster Gym's formula. Unlike the planar Euclidean distance that
+    foot_proximity uses, this ignores how far one foot is AHEAD of the other,
+    so a long stride cannot satisfy it with the feet on one line.
+    """
+    dx = right_pos[..., 0] - left_pos[..., 0]
+    dy = right_pos[..., 1] - left_pos[..., 1]
+    return torch.abs(torch.cos(base_yaw) * dy - torch.sin(base_yaw) * dx)
+
+
+@torch.jit.script
+def compute_feet_lateral_distance_penalty(base_yaw, left_pos, right_pos, ref, cap):
+    # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
+    """clip(ref - lateral separation, 0, cap). Booster Gym _reward_feet_distance
+    (ref 0.2 m, cap 0.1 m, weight -1). One-sided: zero once the feet are ref
+    apart sideways. Added ON TOP of foot_proximity (decision 2026-10-01), whose
+    Euclidean distance a long stride satisfies by fore-aft separation alone."""
+    d = compute_feet_lateral_distance(base_yaw, left_pos, right_pos)
+    return torch.clamp(ref - d, min=0.0, max=cap)
+
+
+@torch.jit.script
+def compute_feet_swing_reward(phase, freq, contact, swing_period):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Booster Gym _reward_feet_swing (weight +3): 1 per foot that is OFF the
+    ground inside its swing window of the commanded gait clock.
+
+    phase/freq [N], contact [N, 2] bool (left, right). Left window centred at
+    phase 0.25, right at 0.75, half-width swing_period / 2 (Booster Gym 0.2).
+    Zero while the clock is stopped. A REWARD, positive: it pays the foot for
+    being in the air when the clock says swing, which is Booster Gym's only
+    anti-drag mechanism -- it has no foot-height term.
+    """
+    half = 0.5 * swing_period
+    running = freq > 0.0
+    left = (torch.abs(phase - 0.25) < half) & running
+    right = (torch.abs(phase - 0.75) < half) & running
+    return ((left & ~contact[..., 0]).to(phase.dtype)
+            + (right & ~contact[..., 1]).to(phase.dtype))
+
+
+@torch.jit.script
+def compute_toe_in(base_yaw, foot_yaw):
+    # type: (Tensor, Tensor) -> Tensor
+    """Signed toe-in of each foot relative to the base heading, rad, [N, 2].
+
+    Positive = the toe points INWARD on either side (left foot yawed right,
+    right foot yawed left), so the two columns are comparable and a mirror-
+    symmetric gait gives equal values. A metric, not a reward.
+    """
+    rel = wrap_to_pi(foot_yaw - base_yaw.unsqueeze(-1))
+    return torch.stack([-rel[..., 0], rel[..., 1]], dim=-1)

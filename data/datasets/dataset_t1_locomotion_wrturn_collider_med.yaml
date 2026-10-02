@@ -1,0 +1,36 @@
+# Same clips and weights as data/datasets/dataset_t1_locomotion_wrturn.yaml, re-clamped on the foot
+# collider by scripts/collider_clamp_motions.py (anchor stance_median: at 0.000 m).
+# Only root z differs from the originals.
+motions:
+- file: data/motions/t1_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_around.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_around.pkl
+  weight: 1.0

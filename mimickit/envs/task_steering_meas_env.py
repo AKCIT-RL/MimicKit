@@ -94,6 +94,40 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._reward_base_accel_w = float(env_config.get("reward_base_accel_w", 0.0))
         self._reward_collision_w = float(env_config.get("reward_collision_w", 0.0))
 
+        # gait terms from Booster Gym (see steering_reward, "Gait terms"). Weight
+        # 0 keeps the env bit-identical; each is measured raw before a weight is
+        # picked, because Booster Gym's weights belong to a different stream.
+        self._reward_feet_slip_w = float(env_config.get("reward_feet_slip_w", 0.0))
+        self._reward_feet_yaw_diff_w = float(env_config.get("reward_feet_yaw_diff_w", 0.0))
+        self._reward_feet_lat_dist_w = float(env_config.get("reward_feet_lat_dist_w", 0.0))
+        # Booster Gym uses ref 0.2 m. NOT a safe default here: the reference
+        # motions walk with the feet 0.10-0.16 m apart sideways (p50, measured),
+        # so 0.2 would fight the discriminator on its own data. Configs set it.
+        self._feet_lat_dist_ref = float(env_config.get("feet_lat_dist_ref", 0.2))
+        self._feet_lat_dist_cap = float(env_config.get("feet_lat_dist_cap", 0.1))
+        # Booster Gym's contact rule: the sole within 1 cm of the ground
+        self._feet_contact_height = float(env_config.get("feet_contact_height", 0.01))
+        self._foot_box_half = tuple(env_config.get("foot_box_half",
+                                                   steering_util.DEFAULT_FOOT_BOX_HALF))
+        self._foot_box_pos = tuple(env_config.get("foot_box_pos",
+                                                  steering_util.DEFAULT_FOOT_BOX_POS))
+
+        # Booster Gym's commanded gait clock + feet_swing. OFF by default: it
+        # adds two dims to the actor frame, which changes the obs contract, the
+        # export and the deploy side. The frequency range defaults to the
+        # reference motions' measured cadence (1.31-2.27 Hz over the 16 clips of
+        # dataset_t1_locomotion_wrturn), not Booster Gym's U(1, 2), so that the
+        # clock and the discriminator do not ask for two different cadences.
+        self._gait_clock = bool(env_config.get("gait_clock", False))
+        self._gait_clock_freq = tuple(env_config.get("gait_clock_freq", [1.3, 2.3]))
+        # below this commanded speed the clock stops (Booster Gym's "still")
+        self._gait_clock_still_speed = float(env_config.get("gait_clock_still_speed", 0.1))
+        self._reward_feet_swing_w = float(env_config.get("reward_feet_swing_w", 0.0))
+        self._feet_swing_period = float(env_config.get("feet_swing_period", 0.2))
+        assert self._gait_clock or self._reward_feet_swing_w == 0.0, \
+            "reward_feet_swing_w needs gait_clock: true -- it has no clock to read"
+        self._task_dim = TASK_BLOCK_DIM + (2 if self._gait_clock else 0)
+
         # 0 on purpose: the reference motions rest the knee at exactly 0.0 rad,
         # its hard lower limit, for part of every stride (see
         # steering_reward.compute_joint_limit_penalty). Any guard band above 0
@@ -125,7 +159,11 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                              self._reward_leg_action_rate_w,
                              self._reward_joint_limit_w,
                              self._reward_base_accel_w,
-                             self._reward_collision_w)
+                             self._reward_collision_w,
+                             self._reward_feet_slip_w,
+                             self._reward_feet_yaw_diff_w,
+                             self._reward_feet_lat_dist_w,
+                             self._reward_feet_swing_w)
         self._aux_reward_enabled = any(w != 0.0 for w in self._reg_weights)
 
         # measure-before-you-spend: logs every raw term with ALL weights at 0,
@@ -219,13 +257,17 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device,
                                         dtype=torch.float)
-        self._meas_frame_dim = 6 + 3 * action_dim + TASK_BLOCK_DIM
+        # the clock buffers exist even when it is off, so the task block code
+        # has one path; with gait_clock off they are never read
+        self._gait_phase = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._gait_freq = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._meas_frame_dim = 6 + 3 * action_dim + self._task_dim
         self._meas_hist_buf = torch.zeros(
             [num_envs, self._meas_hist_steps, self._meas_frame_dim],
             device=self._device, dtype=torch.float)
 
         self._obs_noise_std = steering_util.build_obs_noise_std(
-            self._obs_noise_cfg, action_dim, TASK_BLOCK_DIM).to(self._device)
+            self._obs_noise_cfg, action_dim, self._task_dim).to(self._device)
         assert self._obs_noise_std.shape[0] == self._meas_frame_dim
         self._obs_noise_on = bool(torch.any(self._obs_noise_std > 0))
 
@@ -275,6 +317,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
             self._prev_root_vel = torch.zeros([num_envs, 3], device=self._device,
                                               dtype=torch.float)
+            self._foot_box_corners = steering_util.build_foot_box_corners(
+                self._foot_box_half, self._foot_box_pos).to(self._device)
+            assert len(self._reward_foot_body_ids) == 2, \
+                "gait terms assume two feet, left then right"
             self._head_act_rate_buf = torch.zeros([num_envs], device=self._device,
                                                   dtype=torch.float)
             self._leg_act_rate_buf = torch.zeros([num_envs], device=self._device,
@@ -365,8 +411,29 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             tar_speed = tar_speed[env_ids]
             face_dir = face_dir[env_ids]
 
-        return task_steering_env.compute_steering_observations(root_rot, tar_dir,
-                                                                tar_speed, face_dir)
+        block = task_steering_env.compute_steering_observations(root_rot, tar_dir,
+                                                                 tar_speed, face_dir)
+        if (not self._gait_clock):
+            return block
+        phase, freq = self._gait_phase, self._gait_freq
+        if (env_ids is not None):
+            phase, freq = phase[env_ids], freq[env_ids]
+        return torch.cat([block, steering_util.compute_gait_clock_obs(phase, freq)], dim=-1)
+
+    def get_mirror_task_key(self):
+        """mirror_util.TASK_OBS_MIRROR entry for this config's task block."""
+        return "TaskSteeringMeasEnvClock" if self._gait_clock else type(self).__name__
+
+    def _reset_task(self, env_ids):
+        super()._reset_task(env_ids)
+        if (self._gait_clock and len(env_ids) > 0):
+            # resampled with the command, as Booster Gym does; stopped when the
+            # commanded speed is a stand
+            lo, hi = self._gait_clock_freq
+            f = lo + (hi - lo) * torch.rand(len(env_ids), device=self._device)
+            still = self._tar_speed[env_ids] < self._gait_clock_still_speed
+            self._gait_freq[env_ids] = torch.where(still, torch.zeros_like(f), f)
+        return
 
     def _compute_measurable_frame(self, env_ids=None):
         """One measurable frame: [proprio (6 + 3D) | steering command (5)]."""
@@ -515,6 +582,27 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         collision = steering_reward.compute_collision_penalty(
             forces, self._collision_body_ids, self._collision_force_thresh)
 
+        # --- Booster Gym gait terms ------------------------------------------
+        foot_ids = self._reward_foot_body_ids
+        f_pos = body_pos[:, foot_ids, :]
+        f_rot = self._engine.get_body_rot(char_id)[:, foot_ids, :]
+        f_vel = self._engine.get_body_vel(char_id)[:, foot_ids, :]
+        f_ang = self._engine.get_body_ang_vel(char_id)[:, foot_ids, :]
+        sole_z, cp_vel = steering_util.compute_sole_contact_state(
+            f_pos, f_rot, f_vel, f_ang, self._foot_box_corners)
+        contact_geo = sole_z < self._feet_contact_height
+        feet_slip = steering_reward.compute_feet_slip_penalty(cp_vel, contact_geo)
+
+        root_rot = self._engine.get_root_rot(char_id)
+        base_yaw = torch_util.quat_to_euler_xyz(root_rot)[..., 2]
+        foot_euler = torch_util.quat_to_euler_xyz(f_rot)
+        foot_yaw = foot_euler[..., 2]
+        feet_yaw_diff = steering_reward.compute_feet_yaw_diff_penalty(foot_yaw)
+        feet_lat = steering_reward.compute_feet_lateral_distance_penalty(
+            base_yaw, left, right, self._feet_lat_dist_ref, self._feet_lat_dist_cap)
+        feet_swing = steering_reward.compute_feet_swing_reward(
+            self._gait_phase, self._gait_freq, contact_geo, self._feet_swing_period)
+
         # one in-place write at the end. _update_info published this buffer's
         # REFERENCE before _update_reward ran, so rebinding it here would leave
         # stale zeros there and nothing would report it.
@@ -524,7 +612,27 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             + self._reward_leg_action_rate_w * self._leg_act_rate_buf
             + self._reward_joint_limit_w * joint_lim
             + self._reward_base_accel_w * base_accel
-            + self._reward_collision_w * collision)
+            + self._reward_collision_w * collision
+            + self._reward_feet_slip_w * feet_slip
+            + self._reward_feet_yaw_diff_w * feet_yaw_diff
+            + self._reward_feet_lat_dist_w * feet_lat
+            + self._reward_feet_swing_w * feet_swing)
+        self._diag.add_mean("rew_feet_swing", self._reward_feet_swing_w * feet_swing)
+        self._diag.add_mean("feet_swing", feet_swing)
+
+        self._diag.add_mean("rew_feet_slip", self._reward_feet_slip_w * feet_slip)
+        self._diag.add_mean("rew_feet_yawdiff", self._reward_feet_yaw_diff_w * feet_yaw_diff)
+        self._diag.add_mean("rew_feet_latdist", self._reward_feet_lat_dist_w * feet_lat)
+        self._diag.add_mean("feet_slip_cp", feet_slip)
+        self._diag.add_mean("feet_yaw_diff", feet_yaw_diff)
+        self._diag.add_mean("feet_lat_pen", feet_lat)
+        # metrics, not rewards: what the terms are meant to move
+        self._diag.add_mean("toe_in_mean", steering_reward.compute_toe_in(
+            base_yaw, foot_yaw).mean(dim=-1))
+        self._diag.add_mean("feet_lat_dist_m", steering_reward.compute_feet_lateral_distance(
+            base_yaw, left, right))
+        self._diag.add_mean("feet_yaw_mean", steering_reward.compute_feet_yaw_mean_penalty(
+            base_yaw, foot_yaw))
 
         # Weighted AND raw, per term. Weighted alone cannot tell "the weight is
         # too small" from "the signal is not there"; raw alone cannot tell
@@ -624,6 +732,12 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # history slot must hold the frame the actor was actually given
         super()._update_task()
 
+        if (self._gait_clock):
+            # advanced BEFORE the frame is built, so the clock in the history is
+            # the clock the reward reads this step
+            self._gait_phase[:] = torch.fmod(
+                self._gait_phase + self._engine.get_timestep() * self._gait_freq, 1.0)
+
         frame = self._compute_actor_frame()
         self._meas_hist_buf[:, :-1] = self._meas_hist_buf[:, 1:].clone()
         self._meas_hist_buf[:, -1] = frame
@@ -637,6 +751,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             # history, otherwise every episode starts with H frames carrying
             # the last action of the previous one
             self._prev_action[env_ids] = 0.0
+            if (self._gait_clock):
+                # Booster Gym never resets the phase; a random start does the
+                # same job here without all envs stepping in lockstep
+                self._gait_phase[env_ids] = torch.rand(len(env_ids), device=self._device)
             if (self._dr_enabled):
                 # same reasoning for the delay buffer, which knows nothing
                 # about episode boundaries

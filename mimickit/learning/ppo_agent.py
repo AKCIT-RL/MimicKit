@@ -73,10 +73,14 @@ class PPOAgent(base_agent.BaseAgent):
         key_body_names = [char_model.get_body_name(int(i)) for i in key_body_ids]
 
         obs_size = int(np.prod(env.get_obs_space().shape))
+        # an env whose task block depends on its config (e.g. the gait clock)
+        # names its own mirror entry; the class name otherwise
+        task_key = env.get_mirror_task_key() if hasattr(env, "get_mirror_task_key") \
+            else type(env).__name__
         if (getattr(env, "_measurable_obs", False)):
             # Frente F: [current frame | history], the frame map tiled
             obs_perm, obs_signs = mirror_util.build_measurable_obs_mirror(
-                task_key=type(env).__name__,
+                task_key=task_key,
                 char_model=char_model,
                 num_frames=1 + env.get_measurable_hist_steps(),
                 obs_size=obs_size)

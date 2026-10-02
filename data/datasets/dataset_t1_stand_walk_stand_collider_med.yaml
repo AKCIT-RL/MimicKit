@@ -1,0 +1,8 @@
+# Mesmos dois clipes de dataset_t1_stand_walk_stand.yaml, re-clampados pelo
+# colisor do pe (scripts/collider_clamp_motions.py, anchor stance_median: 0.000 m),
+# a mesma regra da pasta t1_collider_med. So o z da raiz difere dos originais.
+motions:
+  - file: "data/motions/t1_collider_med/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1_collider_med/t1_walk_to_stand.pkl"
+    weight: 1.0

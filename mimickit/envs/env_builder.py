@@ -48,6 +48,9 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
     elif (env_name == "task_steering_meas"):
         import envs.task_steering_meas_env as task_steering_meas_env
         env = task_steering_meas_env.TaskSteeringMeasEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+    elif (env_name == "task_location_meas"):
+        import envs.task_location_meas_env as task_location_meas_env
+        env = task_location_meas_env.TaskLocationMeasEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
     elif (env_name == "task_dodgeball"):
         import envs.task_dodgeball_env as task_dodgeball_env
         env = task_dodgeball_env.TaskDodgeballEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)

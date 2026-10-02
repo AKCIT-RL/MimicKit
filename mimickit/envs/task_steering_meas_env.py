@@ -52,6 +52,10 @@ DEFAULT_COLLISION_EXEMPT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
+    # width of the task block appended to the proprioceptive frame; a subclass
+    # with another goal (e.g. a location target) overrides it
+    TASK_BLOCK_DIM = TASK_BLOCK_DIM
+
     def __init__(self, env_config, engine_config, num_envs, device, visualize,
                  record_video=False):
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
@@ -126,7 +130,7 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._feet_swing_period = float(env_config.get("feet_swing_period", 0.2))
         assert self._gait_clock or self._reward_feet_swing_w == 0.0, \
             "reward_feet_swing_w needs gait_clock: true -- it has no clock to read"
-        self._task_dim = TASK_BLOCK_DIM + (2 if self._gait_clock else 0)
+        self._task_dim = self.TASK_BLOCK_DIM + (2 if self._gait_clock else 0)
 
         # 0 on purpose: the reference motions rest the knee at exactly 0.0 rad,
         # its hard lower limit, for part of every stride (see

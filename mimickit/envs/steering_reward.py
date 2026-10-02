@@ -325,3 +325,41 @@ def compute_toe_in(base_yaw, foot_yaw):
     """
     rel = wrap_to_pi(foot_yaw - base_yaw.unsqueeze(-1))
     return torch.stack([-rel[..., 0], rel[..., 1]], dim=-1)
+
+
+@torch.jit.script
+def compute_location_reward(root_pos, prev_root_pos, tar_pos, tar_speed, dt,
+                            pos_err_scale, vel_err_scale, pos_w, vel_w, stop_radius):
+    # type: (Tensor, Tensor, Tensor, float, float, float, float, float, float, float) -> Tensor
+    """Target-location reward of AMP (Peng et al. 2021, appendix A, eq. 12) with
+    a stopping mask.
+
+      r = pos_w * exp(-pos_err_scale * ||x* - x_root||^2)
+        + vel_w * exp(-vel_err_scale * max(0, v* - d* . xdot_root)^2)
+
+    planar (x, y). Paper values: pos_w 0.7, vel_w 0.3, pos_err_scale 0.5,
+    vel_err_scale 1.0. The paper's xdot is the centre-of-mass velocity; the
+    root's finite-difference velocity is used here (MimicKit's own location
+    task does the same).
+
+    THE MASK, a deliberate addition: eq. 12 read literally pays LESS for
+    standing at the target than for walking past it -- standing still gives
+    max(0, v* - 0) = v* and the velocity term drops to exp(-v*^2). Our task has
+    to stop there (walk_to_stand), so inside stop_radius the velocity term is 1,
+    as MimicKit's task_location_env does with its dist_threshold. Moving away
+    from the target outside the radius gets velocity term 0.
+    """
+    diff = tar_pos[..., 0:2] - root_pos[..., 0:2]
+    dist_sq = torch.sum(diff * diff, dim=-1)
+    pos_r = torch.exp(-pos_err_scale * dist_sq)
+
+    tar_dir = torch.nn.functional.normalize(diff, dim=-1)
+    root_vel = (root_pos[..., 0:2] - prev_root_pos[..., 0:2]) / dt
+    speed_to_tar = torch.sum(tar_dir * root_vel, dim=-1)
+    vel_err = torch.clamp_min(tar_speed - speed_to_tar, 0.0)
+    vel_r = torch.exp(-vel_err_scale * vel_err * vel_err)
+    vel_r = torch.where(speed_to_tar <= 0.0, torch.zeros_like(vel_r), vel_r)
+
+    inside = dist_sq < stop_radius * stop_radius
+    vel_r = torch.where(inside, torch.ones_like(vel_r), vel_r)
+    return pos_w * pos_r + vel_w * vel_r

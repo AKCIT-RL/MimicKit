@@ -1,0 +1,7 @@
+# Booster T1 - so sair do parado e parar: os dois clipes de transicao.
+# Experimento de isolamento (tarefa de alvo a 3 m, docs/t1/14 seq.).
+motions:
+  - file: "data/motions/t1/t1_stand_to_walk.pkl"
+    weight: 1.0
+  - file: "data/motions/t1/t1_walk_to_stand.pkl"
+    weight: 1.0

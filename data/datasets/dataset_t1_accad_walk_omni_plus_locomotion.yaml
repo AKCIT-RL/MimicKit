@@ -1,0 +1,44 @@
+# Booster T1 - omni ACCAD walking (89.5 s) PLUS the c11 locomotion prior (walk + run), as one discriminator reference.
+# Why: the omni set has clips that start/end standing (StandToWalk, WalkToStand), so "stand and shuffle" is in-distribution;
+# the walk+run prior of the c11 lineage is always moving forward. Weights are seconds: walk 20 s + run 10 s = 25% of the set.
+motions:
+  - file: "data/motions/t1_accad/Male2_B1_StandToWalk.pkl"
+    weight: 3.62
+  - file: "data/motions/t1_accad/Male2_B2_WalkToStand.pkl"
+    weight: 3.63
+  - file: "data/motions/t1_accad/Male2_B3_Walk.pkl"
+    weight: 4.42
+  - file: "data/motions/t1_accad/Male2_B4_StandToWalkBackwards.pkl"
+    weight: 4.60
+  - file: "data/motions/t1_accad/Male2_B5_WalkBackwards.pkl"
+    weight: 6.30
+  - file: "data/motions/t1_accad/Male2_B6_WalkBackwardsToStand.pkl"
+    weight: 6.23
+  - file: "data/motions/t1_accad/Male2_B7_WalkBackwardsTurnForward.pkl"
+    weight: 6.07
+  - file: "data/motions/t1_accad/Male2_B8_WalkBackwardsStopForward.pkl"
+    weight: 6.40
+  - file: "data/motions/t1_accad/Male2_B9_WalkTurnLeft90.pkl"
+    weight: 5.03
+  - file: "data/motions/t1_accad/Male2_B10_WalkTurnLeft45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B11_WalkTurnLeft135.pkl"
+    weight: 5.53
+  - file: "data/motions/t1_accad/Male2_B12_WalkTurnRight90.pkl"
+    weight: 5.37
+  - file: "data/motions/t1_accad/Male2_B13_WalkTurnRight135.pkl"
+    weight: 6.33
+  - file: "data/motions/t1_accad/Male2_B14_WalkTurnRight45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B15_WalkTurnAround.pkl"
+    weight: 6.87
+  - file: "data/motions/t1_accad/Male2_B16_WalkTurnChange.pkl"
+    weight: 7.17
+  - file: "data/motions/t1_accad/Male2_B22_SideStepLeft.pkl"
+    weight: 2.47
+  - file: "data/motions/t1_accad/Male2_B23_SideStepRight.pkl"
+    weight: 3.00
+  - file: "data/motions/t1/t1_walk.pkl"
+    weight: 20.0
+  - file: "data/motions/t1/t1_run.pkl"
+    weight: 10.0

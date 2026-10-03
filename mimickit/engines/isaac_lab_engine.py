@@ -772,88 +772,13 @@ class IsaacLabEngine(engine.Engine):
         return self._sim
     
     def _build_ground(self):
-        """Ground built locally (no Nucleus asset, so no network at runtime): a static box
-        for `plane`, or one static triangle mesh per tile (plus a safety floor) for `uneven`,
-        mirroring the Isaac Gym engine. The ground root is a kinematic rigid body so the
-        contact sensors can filter against it."""
-        from pxr import Gf, UsdGeom, UsdPhysics, UsdShade
-        import util.terrain_util as terrain_util
-
-        config = self._ground_config if (self._ground_config is not None) else dict()
-        ground_type = config.get("type", "plane")
-        static_friction = float(config.get("static_friction", 1.0))
-        dynamic_friction = float(config.get("dynamic_friction", 1.0))
-        restitution = float(config.get("restitution", 0.0))
-
-        stage = self._stage
-        UsdGeom.Xform.Define(stage, GROUND_PATH)
-        ground_prim = stage.GetPrimAtPath(GROUND_PATH)
-        UsdPhysics.RigidBodyAPI.Apply(ground_prim)
-        UsdPhysics.RigidBodyAPI.Get(stage, GROUND_PATH).GetKinematicEnabledAttr().Set(True)
-
-        mat_path = GROUND_PATH + "/physics_material"
-        material = UsdShade.Material.Define(stage, mat_path)
-        mat_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
-        mat_api.CreateStaticFrictionAttr(static_friction)
-        mat_api.CreateDynamicFrictionAttr(dynamic_friction)
-        mat_api.CreateRestitutionAttr(restitution)
-
-        def bind(prim):
-            UsdPhysics.CollisionAPI.Apply(prim)
-            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
-                material, UsdShade.Tokens.weakerThanDescendants, "physics")
-
-        def add_floor(top_z, half_extent):
-            floor = UsdGeom.Cube.Define(stage, GROUND_PATH + "/floor")
-            floor.CreateSizeAttr(1.0)
-            thickness = 2.0
-            xf = floor
-            xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, top_z - 0.5 * thickness))
-            xf.AddScaleOp().Set(Gf.Vec3d(2.0 * half_extent, 2.0 * half_extent, thickness))
-            floor.CreateVisibilityAttr("invisible")
-            bind(floor.GetPrim())
+        """Ground built locally (no Nucleus asset, so no network at runtime); see
+        util/usd_ground.py. The ground root is a kinematic rigid body so the contact
+        sensors can filter against it."""
+        import util.usd_ground as usd_ground
 
         env_offset_max = torch.max(torch.abs(self._env_offsets)).item()
-        if (ground_type == "plane"):
-            add_floor(0.0, 2.0 * env_offset_max + 1000.0)
-        elif (ground_type == "uneven"):
-            tile_centers = config.get("tile_centers", None)
-            tile_size = config.get("tile_size", None)
-            assert (tile_centers is not None and tile_size is not None), \
-                "ground.tile_centers [N, 2] and ground.tile_size [2] (m) are required for " \
-                "uneven ground; the soccer env injects them from its field grid"
-            horizontal_scale = float(config.get("horizontal_scale", 0.5))
-            amplitude = float(config.get("random_height", 0.02))
-            centers = np.asarray(tile_centers, dtype=np.float64)
-            half = float(np.abs(centers).max()) + max(tile_size) + 100.0
-            # safety net just below the deepest dip so nothing falls into the void
-            add_floor(-amplitude, half)
-
-            UsdGeom.Scope.Define(stage, GROUND_PATH + "/tiles")
-            total_tris = 0
-            for i, tile_center in enumerate(tile_centers):
-                heights = terrain_util.build_uneven_tile(float(tile_size[0]), float(tile_size[1]),
-                                                         horizontal_scale, amplitude)
-                nx, ny = heights.shape
-                x_offset = float(tile_center[0]) - 0.5 * (nx - 1) * horizontal_scale
-                y_offset = float(tile_center[1]) - 0.5 * (ny - 1) * horizontal_scale
-                verts, tris = terrain_util.heightfield_to_trimesh(heights, horizontal_scale,
-                                                                  x_offset=x_offset,
-                                                                  y_offset=y_offset)
-                mesh = UsdGeom.Mesh.Define(stage, "{}/tiles/tile_{:d}".format(GROUND_PATH, i))
-                mesh.CreatePointsAttr(verts.astype(np.float32).tolist())
-                mesh.CreateFaceVertexCountsAttr([3] * tris.shape[0])
-                mesh.CreateFaceVertexIndicesAttr(tris.astype(np.int32).flatten().tolist())
-                mesh.CreateVisibilityAttr("invisible")
-                prim = mesh.GetPrim()
-                bind(prim)
-                UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr("none")
-                total_tris += tris.shape[0]
-            Logger.print("Built uneven ground: {:d} tiles of {:.0f}x{:.0f} m, +-{:.3f} m bumps, "
-                         "{:d} triangles total".format(len(tile_centers), float(tile_size[0]),
-                                                       float(tile_size[1]), amplitude, total_tris))
-        else:
-            raise ValueError("Unsupported ground type: {}".format(ground_type))
+        usd_ground.build_ground(self._stage, GROUND_PATH, self._ground_config, env_offset_max)
         return
     
     def _compute_env_offsets(self, num_envs):
@@ -1293,7 +1218,8 @@ class IsaacLabEngine(engine.Engine):
     def _build_ground_contact_sensors(self):
         from isaaclab.sensors import ContactSensorCfg, ContactSensor
 
-        ground_prim_paths = [GROUND_PATH + ".*"]
+        # exact path: only the ground ROOT is a rigid body (its tiles/floor are shapes of it)
+        ground_prim_paths = [GROUND_PATH]
         
         self._ground_contact_sensors = []
         objs_per_env = self.get_objs_per_env()

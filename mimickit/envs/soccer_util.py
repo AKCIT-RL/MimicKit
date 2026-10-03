@@ -100,6 +100,28 @@ def compute_ball_steer_command(root_pos, ball_pos, stop_dist, speed_max):
 
 
 @torch.jit.script
+def compute_ball_chase_reward(root_pos, prev_root_pos, ball_pos, stop_dist, speed_max, dt, vel_err_scale):
+    # type: (Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
+    """Dense chase reward: the steering task's velocity-tracking reward
+    (``task_steering_env.compute_steering_reward``, without the facing term)
+    against the auto ball command of ``compute_ball_steer_command``.
+
+    r = exp(-vel_err_scale * |v_cmd - v_root|^2) in [0, 1], zeroed when the root
+    moves away from the ball. State-based, so unlike the approach potential it
+    pays a steady, graded reward for walking toward the ball at the commanded
+    speed and cannot be farmed by teleporting the ball. Returns [N].
+    """
+    cmd = compute_ball_steer_command(root_pos, ball_pos, stop_dist, speed_max)
+    tar_dir = cmd[..., 0:2]
+    tar_vel = cmd[..., 2].unsqueeze(-1) * tar_dir
+    root_vel = (root_pos[..., 0:2] - prev_root_pos[..., 0:2]) / dt
+    err = torch.sum(torch.square(tar_vel - root_vel), dim=-1)
+    reward = torch.exp(-vel_err_scale * err)
+    proj_speed = torch.sum(tar_dir * root_vel, dim=-1)
+    return torch.where(proj_speed < 0.0, torch.zeros_like(reward), reward)
+
+
+@torch.jit.script
 def compute_kick_direction_reward(ball_pos, ball_vel, goal_pos, min_vel, decay_tau,
                                   ball_moving_time, max_reward):
     # type: (Tensor, Tensor, Tensor, float, float, Tensor, float) -> Tensor

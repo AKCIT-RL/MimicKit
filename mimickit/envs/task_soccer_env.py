@@ -243,6 +243,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_ball_approach_w = float(env_config.get("reward_ball_approach_w", 50.0))
         self._reward_goal_progress_w = float(env_config.get("reward_goal_progress_w", 500.0))
 
+        # dense chase reward (steering velocity tracking toward the ball); off by default
+        self._reward_ball_chase_w = float(env_config.get("reward_ball_chase_w", 0.0))
+        self._ball_chase_vel_scale = float(env_config.get("ball_chase_vel_scale", 1.0))
+
         # directional kick reward (T1 kicking env): ball velocity toward the
         # goal above a threshold, credit concentrated at the impact
         self._reward_kick_direction_w = float(env_config.get("reward_kick_direction_w", 25.0))
@@ -999,6 +1003,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             approach_r = approach_r * (~rolling).float()
         progress_r = soccer_util.compute_goal_progress_reward(ball_pos, self._prev_ball_pos,
                                                               self._goal_pos)
+        chase_r = torch.zeros_like(approach_r)
+        if (self._reward_ball_chase_w != 0.0):
+            chase_r = soccer_util.compute_ball_chase_reward(
+                root_pos, self._prev_root_pos, ball_pos, self._steer_stop_dist,
+                self._steer_speed_max, self._engine.get_timestep(), self._ball_chase_vel_scale)
+            if (self._gate_approach_when_rolling):
+                # same gate as approach: no credit for chasing a ball just kicked
+                chase_r = chase_r * (~rolling).float()
         if (self._percep_potential_freeze and self._virtual_perception):
             # no potential change while the ball is hidden: a teleport is
             # free distance otherwise, and idling on respawn spots pays
@@ -1020,6 +1032,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         shaping_mask = (~self._goal_scored_buf).float()
 
         self._task_reward_buf[:] = shaping_mask * (self._reward_ball_approach_w * approach_r
+                                                   + self._reward_ball_chase_w * chase_r
                                                    + self._reward_goal_progress_w * progress_r
                                                    + self._reward_kick_direction_w * dir_r
                                                    + self._reward_kick_position_w * position_r) \
@@ -1028,6 +1041,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # diagnostics: weighted per-term means (goal stream decomposition)
         d = self._diag
         d.add_mean("reward_ball_approach", shaping_mask * self._reward_ball_approach_w * approach_r)
+        d.add_mean("reward_ball_chase", shaping_mask * self._reward_ball_chase_w * chase_r)
         d.add_mean("reward_goal_progress", shaping_mask * self._reward_goal_progress_w * progress_r)
         d.add_mean("reward_kick_direction", shaping_mask * self._reward_kick_direction_w * dir_r)
         d.add_mean("reward_kick_position", shaping_mask * self._reward_kick_position_w * position_r)

@@ -1,0 +1,14 @@
+# Isaac Lab twin of isaac_gym_engine.yaml (flat ground, 30 Hz control, 120 Hz physics).
+# Same as isaac_lab_engine.yaml but with the ground made explicit.
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 5
+
+ground:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

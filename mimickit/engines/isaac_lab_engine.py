@@ -79,8 +79,15 @@ class IsaacLabEngine(engine.Engine):
         self._create_simulator(sim_timestep, visualize, record_video)
 
         self._env_spacing = config["env_spacing"]
+        self._ground_config = config.get("ground", None)
         self._obj_cfgs = []
         self._obj_control_modes = []
+
+        # Table 2 action delay, off unless set_action_delay() is called
+        self._action_delay_w = None
+        self._latest_cmd = dict()
+        self._prev_cmd = dict()
+        self._shape_counts = dict()
         
         if ("control_mode" in config):
             self._control_mode = engine.ControlMode[config["control_mode"]]
@@ -139,12 +146,33 @@ class IsaacLabEngine(engine.Engine):
         if (self.enabled_record_video() and self._recording):
             self._video_recorder.capture_frame()
         
+        if (self._action_delay_w is None):
+            for i in range(self._sim_steps):
+                self._pre_sim_step()
+                self._sim_step()
+                self._post_sim_step()
+        else:
+            self._step_with_action_delay()
+            
+        self._clear_forces()
+        return
+
+    def _step_with_action_delay(self):
+        # Table 2 action delay: the joint target is held across the control step, so a
+        # sub-step delay blends this step's command with the previous one, substep by
+        # substep (same scheme as the Isaac Gym engine).
         for i in range(self._sim_steps):
+            w = self._action_delay_w[:, i].unsqueeze(-1)
+            for obj_id, curr in self._latest_cmd.items():
+                blend = w * curr + (1.0 - w) * self._prev_cmd[obj_id]
+                self._objs[obj_id].set_joint_position_target(blend)
             self._pre_sim_step()
             self._sim_step()
             self._post_sim_step()
-            
-        self._clear_forces()
+
+        for obj_id, curr in self._latest_cmd.items():
+            self._objs[obj_id].set_joint_position_target(curr)
+            self._prev_cmd[obj_id] = curr.clone()
         return
 
     def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
@@ -187,6 +215,7 @@ class IsaacLabEngine(engine.Engine):
             pass
         elif (self._control_mode == engine.ControlMode.pos):
             obj.set_joint_position_target(sim_cmd)
+            self._latest_cmd[obj_id] = sim_cmd.clone()
         elif (self._control_mode == engine.ControlMode.vel):
             obj.set_joint_velocity_target(sim_cmd)
         elif (self._control_mode == engine.ControlMode.torque):
@@ -577,6 +606,134 @@ class IsaacLabEngine(engine.Engine):
     
     def get_control_mode(self):
         return self._control_mode
+
+    def supports_build_time_props(self):
+        # per-env mass/material live in the PhysX views, which only exist after sim.reset()
+        return False
+
+    def get_num_sim_steps(self):
+        return self._sim_steps
+
+    def set_action_delay(self, delay_weights):
+        num_envs = self.get_num_envs()
+        weights = torch.as_tensor(delay_weights, device=self._device, dtype=torch.float32)
+        assert weights.shape == (num_envs, self._sim_steps), \
+            "action delay weights must be [num_envs, {}], got {}".format(
+                self._sim_steps, tuple(weights.shape))
+        self._action_delay_w = weights
+
+        for obj_id in range(self.get_objs_per_env()):
+            if (self.get_obj_type(obj_id) == engine.ObjType.articulated):
+                dof_pos = self._objs[obj_id].data.joint_pos
+                self._latest_cmd[obj_id] = dof_pos.clone()
+                self._prev_cmd[obj_id] = dof_pos.clone()
+        return
+
+    def reset_action_delay(self, env_ids=None):
+        """Point the delayed command at the current joint positions, so the first step of
+        an episode does not replay the previous episode's command."""
+        if (self._action_delay_w is None):
+            return
+        for obj_id in self._prev_cmd.keys():
+            dof_pos = self._objs[obj_id].data.joint_pos
+            if (env_ids is None):
+                self._prev_cmd[obj_id][:] = dof_pos
+            else:
+                self._prev_cmd[obj_id][env_ids] = dof_pos[env_ids]
+        return
+
+    def scale_obj_pd_gains(self, env_id, obj_id, kp_scales, kd_scales):
+        """Scale this env's motor gains in place (Table 2). Scales come in the common
+        DOF order; the implicit actuator and the PhysX drive are both updated."""
+        obj = self._objs[obj_id]
+        order = self._dof_order_common2sim[obj_id]
+        kp_s = torch.as_tensor(kp_scales, device=self._device, dtype=torch.float32)[order]
+        kd_s = torch.as_tensor(kd_scales, device=self._device, dtype=torch.float32)[order]
+
+        actuator = obj.actuators["actuators"]
+        actuator.stiffness[env_id] *= kp_s
+        actuator.damping[env_id] *= kd_s
+
+        env_ids = torch.tensor([env_id], device=self._device, dtype=torch.int32)
+        obj.write_joint_stiffness_to_sim(actuator.stiffness[env_id].unsqueeze(0), env_ids=env_ids)
+        obj.write_joint_damping_to_sim(actuator.damping[env_id].unsqueeze(0), env_ids=env_ids)
+        return
+
+    def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
+        """Per-env body mass/CoM randomization. Inertia scales with mass, as the Isaac Gym
+        engine recomputes it from the scaled mass. Inputs are in the common body order."""
+        view = self._objs[obj_id].root_physx_view
+        order = self._body_order_common2sim[obj_id].cpu()
+        idx = torch.tensor([env_id], dtype=torch.int32)
+
+        scales = torch.as_tensor(np.asarray(mass_scales), dtype=torch.float32)
+        scales = scales.reshape(-1)[order] if (scales.numel() > 1) else scales.reshape(1)
+
+        masses = view.get_masses().clone()
+        inertias = view.get_inertias().clone()
+        masses[env_id] *= scales
+        inertias[env_id] *= scales.unsqueeze(-1)
+        view.set_masses(masses, idx)
+        view.set_inertias(inertias, idx)
+
+        if (com_offsets is not None):
+            offsets = torch.as_tensor(np.asarray(com_offsets), dtype=torch.float32)
+            offsets = offsets.reshape(-1, 3)[order] if (offsets.shape[0] > 1) else offsets.reshape(1, 3)
+            coms = view.get_coms().clone()
+            coms[env_id, :, :3] += offsets
+            view.set_coms(coms, idx)
+        return
+
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
+                            compliance=None, body_ids=None):
+        """Per-env contact material of the object's shapes (restricted to body_ids when
+        given, in the common order). PhysX has one friction coefficient per direction, so
+        the Isaac Gym single friction is written as static = dynamic. `compliance` has no
+        PhysX counterpart here and is ignored."""
+        view = self._objs[obj_id].root_physx_view
+        idx = torch.tensor([env_id], dtype=torch.int32)
+        shape_ids = self._get_shape_ids(obj_id, body_ids)
+        if (len(shape_ids) == 0):
+            return
+
+        materials = view.get_material_properties().clone()
+        if (friction is not None):
+            materials[env_id, shape_ids, 0] = float(friction)
+            materials[env_id, shape_ids, 1] = float(friction)
+        if (restitution is not None):
+            materials[env_id, shape_ids, 2] = float(restitution)
+        view.set_material_properties(materials, idx)
+        return
+
+    def get_obj_body_shape_ids(self, env_id, obj_id, body_ids):
+        return self._get_shape_ids(obj_id, body_ids)
+
+    def _get_shape_ids(self, obj_id, body_ids):
+        """Flat shape indices (PhysX body-major order) for the given common body ids."""
+        obj = self._objs[obj_id]
+        view = obj.root_physx_view
+        if (self.get_obj_type(obj_id) != engine.ObjType.articulated):
+            return list(range(view.max_shapes))
+        if (body_ids is None):
+            return list(range(view.max_shapes))
+
+        if (obj_id not in self._shape_counts):
+            counts = []
+            for link_path in view.link_paths[0]:
+                link_view = obj._physics_sim_view.create_rigid_body_view(link_path)
+                counts.append(link_view.max_shapes)
+            assert sum(counts) == view.max_shapes, \
+                "shape count mismatch: {} vs {}".format(sum(counts), view.max_shapes)
+            self._shape_counts[obj_id] = counts
+        counts = self._shape_counts[obj_id]
+        starts = np.concatenate([[0], np.cumsum(counts)])
+
+        common2sim = self._body_order_sim2common[obj_id].cpu().tolist()  # common id -> sim id
+        shape_ids = []
+        for b in body_ids:
+            sim_b = common2sim[int(b)]
+            shape_ids.extend(range(int(starts[sim_b]), int(starts[sim_b + 1])))
+        return shape_ids
     
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
         env_offset = self._env_offsets[env_id].cpu().numpy()
@@ -615,31 +772,88 @@ class IsaacLabEngine(engine.Engine):
         return self._sim
     
     def _build_ground(self):
-        import isaaclab.sim as sim_utils
-        from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-        import omni.kit.commands
-        from pxr import UsdPhysics
+        """Ground built locally (no Nucleus asset, so no network at runtime): a static box
+        for `plane`, or one static triangle mesh per tile (plus a safety floor) for `uneven`,
+        mirroring the Isaac Gym engine. The ground root is a kinematic rigid body so the
+        contact sensors can filter against it."""
+        from pxr import Gf, UsdGeom, UsdPhysics, UsdShade
+        import util.terrain_util as terrain_util
 
-        ground_col = np.array([1.0, 0.9, 0.75])
-        ground_col *= 0.017
-        ground_path = GROUND_PATH
+        config = self._ground_config if (self._ground_config is not None) else dict()
+        ground_type = config.get("type", "plane")
+        static_friction = float(config.get("static_friction", 1.0))
+        dynamic_friction = float(config.get("dynamic_friction", 1.0))
+        restitution = float(config.get("restitution", 0.0))
+
+        stage = self._stage
+        UsdGeom.Xform.Define(stage, GROUND_PATH)
+        ground_prim = stage.GetPrimAtPath(GROUND_PATH)
+        UsdPhysics.RigidBodyAPI.Apply(ground_prim)
+        UsdPhysics.RigidBodyAPI.Get(stage, GROUND_PATH).GetKinematicEnabledAttr().Set(True)
+
+        mat_path = GROUND_PATH + "/physics_material"
+        material = UsdShade.Material.Define(stage, mat_path)
+        mat_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        mat_api.CreateStaticFrictionAttr(static_friction)
+        mat_api.CreateDynamicFrictionAttr(dynamic_friction)
+        mat_api.CreateRestitutionAttr(restitution)
+
+        def bind(prim):
+            UsdPhysics.CollisionAPI.Apply(prim)
+            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                material, UsdShade.Tokens.weakerThanDescendants, "physics")
+
+        def add_floor(top_z, half_extent):
+            floor = UsdGeom.Cube.Define(stage, GROUND_PATH + "/floor")
+            floor.CreateSizeAttr(1.0)
+            thickness = 2.0
+            xf = floor
+            xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, top_z - 0.5 * thickness))
+            xf.AddScaleOp().Set(Gf.Vec3d(2.0 * half_extent, 2.0 * half_extent, thickness))
+            floor.CreateVisibilityAttr("invisible")
+            bind(floor.GetPrim())
 
         env_offset_max = torch.max(torch.abs(self._env_offsets)).item()
-        texture_width = 2.0 * env_offset_max + 100.0
+        if (ground_type == "plane"):
+            add_floor(0.0, 2.0 * env_offset_max + 1000.0)
+        elif (ground_type == "uneven"):
+            tile_centers = config.get("tile_centers", None)
+            tile_size = config.get("tile_size", None)
+            assert (tile_centers is not None and tile_size is not None), \
+                "ground.tile_centers [N, 2] and ground.tile_size [2] (m) are required for " \
+                "uneven ground; the soccer env injects them from its field grid"
+            horizontal_scale = float(config.get("horizontal_scale", 0.5))
+            amplitude = float(config.get("random_height", 0.02))
+            centers = np.asarray(tile_centers, dtype=np.float64)
+            half = float(np.abs(centers).max()) + max(tile_size) + 100.0
+            # safety net just below the deepest dip so nothing falls into the void
+            add_floor(-amplitude, half)
 
-        physics_material = sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0,
-                                                          restitution=0.0)
-        plane_cfg = GroundPlaneCfg(physics_material=physics_material, color=ground_col,
-                                    size=(texture_width, texture_width))
-        self._ground = spawn_ground_plane(prim_path=ground_path, cfg=plane_cfg)
-
-        # add rigid body schema to terrain to enable contact sensors
-        UsdPhysics.RigidBodyAPI.Apply(self._stage.GetPrimAtPath(ground_path))
-        UsdPhysics.RigidBodyAPI.Get(self._stage, ground_path).GetKinematicEnabledAttr().Set(True)
-
-        shader_path = ground_path + "/Looks/theGrid/Shader"
-        shader_prim = self._stage.GetPrimAtPath(shader_path)
-        shader_prim.GetAttribute("inputs:albedo_add").Set(10.0)
+            UsdGeom.Scope.Define(stage, GROUND_PATH + "/tiles")
+            total_tris = 0
+            for i, tile_center in enumerate(tile_centers):
+                heights = terrain_util.build_uneven_tile(float(tile_size[0]), float(tile_size[1]),
+                                                         horizontal_scale, amplitude)
+                nx, ny = heights.shape
+                x_offset = float(tile_center[0]) - 0.5 * (nx - 1) * horizontal_scale
+                y_offset = float(tile_center[1]) - 0.5 * (ny - 1) * horizontal_scale
+                verts, tris = terrain_util.heightfield_to_trimesh(heights, horizontal_scale,
+                                                                  x_offset=x_offset,
+                                                                  y_offset=y_offset)
+                mesh = UsdGeom.Mesh.Define(stage, "{}/tiles/tile_{:d}".format(GROUND_PATH, i))
+                mesh.CreatePointsAttr(verts.astype(np.float32).tolist())
+                mesh.CreateFaceVertexCountsAttr([3] * tris.shape[0])
+                mesh.CreateFaceVertexIndicesAttr(tris.astype(np.int32).flatten().tolist())
+                mesh.CreateVisibilityAttr("invisible")
+                prim = mesh.GetPrim()
+                bind(prim)
+                UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr("none")
+                total_tris += tris.shape[0]
+            Logger.print("Built uneven ground: {:d} tiles of {:.0f}x{:.0f} m, +-{:.3f} m bumps, "
+                         "{:d} triangles total".format(len(tile_centers), float(tile_size[0]),
+                                                       float(tile_size[1]), amplitude, total_tris))
+        else:
+            raise ValueError("Unsupported ground type: {}".format(ground_type))
         return
     
     def _compute_env_offsets(self, num_envs):

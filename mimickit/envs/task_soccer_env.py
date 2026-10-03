@@ -356,7 +356,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         else:
             assert(ball_id == self._ball_id)
 
-        self._randomize_env_props(env_id, ball_id)
+        if (self._engine.supports_build_time_props()):
+            self._randomize_env_props(env_id, ball_id)
         return
 
     def _get_dr_rng(self):
@@ -591,6 +592,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._collision_body_ids = torch.tensor(
             [b for b in range(self._engine.get_obj_num_bodies(self._get_char_id()))
              if b not in exempt], device=self._device, dtype=torch.long)
+        if (not self._engine.supports_build_time_props()):
+            # engines whose per-env mass/shape properties need the initialized
+            # sim (Isaac Lab): same per-env order, so the RNG draws are identical
+            for env_id in range(num_envs):
+                self._randomize_env_props(env_id, self._ball_id)
         if (self._dr_enabled):
             self._apply_dr_runtime()
 

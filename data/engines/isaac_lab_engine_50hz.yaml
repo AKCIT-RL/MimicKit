@@ -1,0 +1,14 @@
+# Isaac Lab twin of isaac_gym_engine_50hz.yaml: the paper's 50 Hz control rate with
+# decimation 4 (sim 200 Hz).
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 50
+sim_freq: 200
+env_spacing: 5
+
+ground:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

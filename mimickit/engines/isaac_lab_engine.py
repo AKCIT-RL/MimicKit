@@ -568,7 +568,9 @@ class IsaacLabEngine(engine.Engine):
         meta_data = obj.root_physx_view.shared_metatype
         body_names = meta_data.link_names
         sim_body_id = body_names.index(body_name)
-        body_id = self._body_order_common2sim[obj_id][sim_body_id]
+        # a python int, like the Isaac Gym engine: envs put these in sets and compare them with
+        # ints (e.g. the collision-exempt bodies), which a 0-d tensor silently never matches
+        body_id = int(self._body_order_common2sim[obj_id][sim_body_id])
         return body_id
     
     def get_obj_type(self, obj_id):

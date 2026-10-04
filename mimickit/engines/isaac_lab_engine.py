@@ -672,7 +672,10 @@ class IsaacLabEngine(engine.Engine):
         masses = view.get_masses().clone()
         inertias = view.get_inertias().clone()
         masses[env_id] *= scales
-        inertias[env_id] *= scales.unsqueeze(-1)
+        if (inertias.dim() == 2):  # single rigid body view: [num_envs, 9]
+            inertias[env_id] *= scales.reshape(-1)[0]
+        else:                      # articulation view: [num_envs, num_bodies, 9]
+            inertias[env_id] *= scales.unsqueeze(-1)
         view.set_masses(masses, idx)
         view.set_inertias(inertias, idx)
 
@@ -680,7 +683,10 @@ class IsaacLabEngine(engine.Engine):
             offsets = torch.as_tensor(np.asarray(com_offsets), dtype=torch.float32)
             offsets = offsets.reshape(-1, 3)[order] if (offsets.shape[0] > 1) else offsets.reshape(1, 3)
             coms = view.get_coms().clone()
-            coms[env_id, :, :3] += offsets
+            if (coms.dim() == 2):  # single rigid body view: [num_envs, 7]
+                coms[env_id, :3] += offsets.reshape(-1, 3)[0]
+            else:
+                coms[env_id, :, :3] += offsets
             view.set_coms(coms, idx)
         return
 

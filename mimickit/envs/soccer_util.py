@@ -338,6 +338,16 @@ def compute_joint_limit_penalty(dof_pos, dof_low, dof_high):
 
 
 @torch.jit.script
+def compute_knee_bend_penalty(dof_pos, knee_ids, min_angle: float):
+    # type: (Tensor, Tensor, float) -> Tensor
+    """Total shortfall of the knee flexion below ``min_angle`` (rad), summed over
+    the knees (0 when every knee is bent at least that much). The T1 knee range is
+    [0, 2.145] rad, so a straight leg sits on the lower limit."""
+    knee = dof_pos.index_select(-1, knee_ids)
+    return torch.sum(torch.clamp_min(min_angle - knee, 0.0), dim=-1)
+
+
+@torch.jit.script
 def compute_ball_contact_flags(foot_pos, ball_pos, contact_dist):
     # type: (Tensor, Tensor, float) -> Tensor
     """Foot within contact_dist of the ball center (3D)."""

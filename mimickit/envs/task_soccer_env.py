@@ -282,6 +282,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_foot_proximity_w = float(env_config.get("reward_foot_proximity_w", -5.0))
         self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", -1.0))
         self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", -100.0))
+        # knee-bend shortfall penalty (diagnostic crutch for the straight-leg gait); off by default
+        self._reward_knee_bend_w = float(env_config.get("reward_knee_bend_w", 0.0))
+        self._knee_bend_min = float(env_config.get("knee_bend_min", 0.25))
+        self._knee_dof_bodies = list(env_config.get(
+            "knee_dof_bodies", ["left_knee_pitch_link", "right_knee_pitch_link"]))
         self._reward_base_accel_w = float(env_config.get("reward_base_accel_w", -0.001))
         # head gaze reward (Frente G, paper Table 3 head term): cosine of the
         # angle between the camera body boresight and the ball; requires
@@ -586,6 +591,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             device=self._device, dtype=torch.long)
         self._leg_dof_ids = torch.tensor(
             steering_util.build_dof_group_ids(self._kin_char_model, self._leg_dof_bodies),
+            device=self._device, dtype=torch.long)
+        self._knee_dof_ids = torch.tensor(
+            steering_util.build_dof_group_ids(self._kin_char_model, self._knee_dof_bodies),
             device=self._device, dtype=torch.long)
         exempt = set(self._engine.find_obj_body_id(self._get_char_id(), n)
                      for n in self._collision_exempt_bodies)
@@ -1155,6 +1163,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         joint_limit = soccer_util.compute_joint_limit_penalty(dof_pos, self._dof_limits_low,
                                                               self._dof_limits_high)
         aux_r += self._reward_joint_limit_w * joint_limit
+        if (self._reward_knee_bend_w != 0.0):
+            knee_bend = soccer_util.compute_knee_bend_penalty(dof_pos, self._knee_dof_ids,
+                                                              self._knee_bend_min)
+            aux_r += self._reward_knee_bend_w * knee_bend
+            self._diag.add_mean("reward_knee_bend", self._reward_knee_bend_w * knee_bend)
 
         dt = self._engine.get_timestep()
         base_accel = soccer_util.compute_base_accel_penalty(root_vel, self._prev_root_vel, dt)

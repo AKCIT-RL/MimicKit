@@ -77,6 +77,20 @@ class TaskLocationMeasEnv(task_steering_meas_env.TaskSteeringMeasEnv):
         times = torch.zeros([n], device=self._device, dtype=torch.float)
         return ids, times
 
+    def _sample_motion_times(self, n):
+        """Times for the DISCRIMINATOR's demo windows (amp_env.fetch_disc_obs_demo).
+
+        The parent returns zeros whenever rand_reset is False, which this task
+        needs for its reset -- and which, inherited here, collapsed every demo
+        window to t = 0 of each clip: the critic only ever saw the first pose
+        of stand_to_walk and of walk_to_stand (measured: 1 distinct demo time in
+        20000 draws; the first arm-L runs trained against that). Demos must
+        cover the whole clips whatever the reset does, so they always sample.
+        """
+        motion_ids = self._motion_lib.sample_motions(n)
+        motion_times = self._motion_lib.sample_time(motion_ids)
+        return motion_ids, motion_times
+
     def _reset_task(self, env_ids):
         super()._reset_task(env_ids)
         if (len(env_ids) == 0):

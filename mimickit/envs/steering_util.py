@@ -168,6 +168,27 @@ def compute_gait_clock_obs(phase, freq):
     return torch.stack([torch.cos(ang) * on, torch.sin(ang) * on], dim=-1)
 
 
+def compute_floor_tile_grid(num_envs, tile_size):
+    """Centers of a contiguous, origin-centered square grid of floor tiles,
+    one per env, as float32 [N, 2] (numpy).
+
+    Pitch == tile_size, so tiles laid by the engine's uneven-ground builder
+    (borders flattened to z = 0) meet edge to edge with no gaps: a robot that
+    walks off its own tile lands on its neighbour's, never on a hole.
+    """
+    import numpy as np
+    assert tile_size > 0.0, "tile_size must be positive"
+    n_cols = int(np.ceil(np.sqrt(num_envs)))
+    n_rows = int(np.ceil(num_envs / n_cols))
+    idx = np.arange(num_envs)
+    col = (idx % n_cols).astype(np.float32)
+    row = (idx // n_cols).astype(np.float32)
+    centers = np.zeros([num_envs, 2], dtype=np.float32)
+    centers[:, 0] = (col - 0.5 * (n_cols - 1)) * tile_size
+    centers[:, 1] = (row - 0.5 * (n_rows - 1)) * tile_size
+    return centers
+
+
 # config key -> slice of the measurable frame it corrupts. prev_action and the
 # steering command are absent ON PURPOSE: the first is the policy's own output
 # and is exact on the robot, the second is a command, not a measurement.

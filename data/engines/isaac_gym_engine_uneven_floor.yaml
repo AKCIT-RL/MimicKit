@@ -1,0 +1,25 @@
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # trimesh ground: nonzero env origins break GPU broadphase vs global mesh
+
+ground_contact_height: 0.3
+# "Real flat floor" (2026-10-09): slight unevenness of a floor/turf that is
+# nominally flat -- NOT rough terrain. Heights iid U(-1 cm, +1 cm) on a 0.5 m
+# grid (local slopes <= ~2.3 deg), one 6 m tile per env on a contiguous grid
+# injected by TaskSteeringMeasEnv (floor_tile_size); spawns raised by
+# random_height. Booster Gym uses +-5 cm random and 2 cm steps; soccer C used 2 cm.
+#
+# Ground friction 0.8, not 1.0: PhysX combines friction by AVERAGE (measured,
+# scripts/probe_friction_combine.py: 8/8 within 1e-3), so with the foot drawn
+# from U(0, 1.6) the effective coefficient is U(0.4, 1.2). With ground 1.0 the
+# floor of the range could never go below 0.5.
+ground:
+  type: "uneven"
+  random_height: 0.01 # m
+  horizontal_scale: 0.5 # m
+  static_friction: 0.8
+  dynamic_friction: 0.8
+  restitution: 0.0

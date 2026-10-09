@@ -58,6 +58,23 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def __init__(self, env_config, engine_config, num_envs, device, visualize,
                  record_video=False):
+        # "real flat floor" unevenness (engine ground.type: uneven, the soccer
+        # Frente C builder). One tile per env on a contiguous grid; every actor
+        # is created on its own tile and every reset is shifted there, raised by
+        # the bump amplitude. A pure translation: obs, disc obs and rewards are
+        # all translation invariant. With a plane ground none of this runs.
+        self._floor_offsets = None
+        self._floor_z = 0.0
+        ground = engine_config.get("ground", None)
+        if (ground is not None and ground.get("type", "plane") == "uneven"):
+            tile = float(env_config.get("floor_tile_size", 6.0))
+            centers = steering_util.compute_floor_tile_grid(num_envs, tile)
+            if ("tile_centers" not in ground):
+                ground["tile_centers"] = centers.tolist()
+                ground["tile_size"] = [tile, tile]
+            self._floor_offsets = centers
+            self._floor_z = float(ground.get("random_height", 0.0))
+
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
         assert self._meas_hist_steps > 0, \
             "measurable_hist_steps must be > 0: the encoder has nothing to " \
@@ -185,7 +202,20 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
     # ------------------------------------------------------ domain randomization
 
     def _build_env(self, env_id, config):
-        super()._build_env(env_id, config)
+        if (self._floor_offsets is not None):
+            # created spread over their tiles, not piled at the origin, which
+            # explodes the PhysX GPU broadphase pair count (soccer lesson)
+            orig = self._init_root_pos
+            self._init_root_pos = orig.clone()
+            self._init_root_pos[0] += float(self._floor_offsets[env_id][0])
+            self._init_root_pos[1] += float(self._floor_offsets[env_id][1])
+            self._init_root_pos[2] += self._floor_z
+            try:
+                super()._build_env(env_id, config)
+            finally:
+                self._init_root_pos = orig
+        else:
+            super()._build_env(env_id, config)
         if (self._dr_enabled):
             self._randomize_env_props(env_id)
         return
@@ -261,6 +291,9 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device,
                                         dtype=torch.float)
+        if (self._floor_offsets is not None):
+            self._floor_offsets_t = torch.as_tensor(self._floor_offsets, device=self._device,
+                                                    dtype=torch.float)
         # the clock buffers exist even when it is off, so the task block code
         # has one path; with gait_clock off they are never read
         self._gait_phase = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -341,6 +374,22 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # after the engine's initialize_sim
         if (self._dr_enabled):
             self._apply_dr_runtime()
+        return
+
+    def _ref_state_init(self, env_ids):
+        if (self._floor_offsets is None or len(env_ids) == 0):
+            super()._ref_state_init(env_ids)
+            return
+        # shift only for the duration of the state write: the reference itself
+        # is rewritten from the motion every step and only feeds visualization
+        shift = torch.zeros([len(env_ids), 3], device=self._device, dtype=torch.float)
+        shift[:, 0:2] = self._floor_offsets_t[env_ids]
+        shift[:, 2] = self._floor_z
+        self._ref_root_pos[env_ids] += shift
+        try:
+            super()._ref_state_init(env_ids)
+        finally:
+            self._ref_root_pos[env_ids] -= shift
         return
 
     def _pre_physics_step(self, actions):

@@ -1,0 +1,18 @@
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one shared world mesh; envs share the origin, actors are placed at their own origins
+
+ground_contact_height: 0.3
+# MAPA DE TERRENO DO BOOSTER GYM, IDENTICO (booster_gym/envs/T1.yaml, bloco
+# terrain; util/booster_terrain.py porta utils/terrain.py linha a linha). 8 sub-
+# terrenos 10x10 m em fila + borda 5 m, resolucao 0.1 m / 0.005 m: 0-3 random
+# uniform +-5 cm (grao 0.2 m), 4-7 degraus discretos {+-1, +-2} cm, retangulos
+# 1.0-1.8 m, plataforma plana de 3 m no centro. Atrito do chao 1.0 (o do booster).
+ground:
+  type: "booster_trimesh"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

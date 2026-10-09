@@ -31,6 +31,7 @@ import envs.steering_disc as steering_disc
 import envs.steering_reward as steering_reward
 import envs.steering_util as steering_util
 import envs.task_steering_env as task_steering_env
+import util.booster_terrain as booster_terrain
 import util.torch_util as torch_util
 
 TASK_BLOCK_DIM = 5      # local_tar_dir (2), tar_speed (1), local_face_dir (2)
@@ -74,6 +75,39 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                 ground["tile_size"] = [tile, tile]
             self._floor_offsets = centers
             self._floor_z = float(ground.get("random_height", 0.0))
+
+        # Booster Gym's shared terrain map (engine ground.type: booster_trimesh,
+        # util/booster_terrain.py). Origins need the heightfield, which only
+        # exists once the engine is built, so they are filled on the first
+        # _build_env. Resets follow Booster Gym's _reset_root_states: origin +
+        # U(-1, 1) m in xy, raised by the terrain height under the final xy.
+        # Robots past 0.75 border are teleported as in _teleport_robot.
+        self._booster_terrain = (ground is not None
+                                 and ground.get("type", "plane") == "booster_trimesh")
+        self._booster_reset_xy = tuple(env_config.get("booster_reset_xy", [-1.0, 1.0]))
+
+        # Booster Gym kicks and pushes (envs/t1.py _kick_robots / _push_robots,
+        # T1.yaml randomization). Both on ONE step counter shared by all envs,
+        # never reset, as there. Off unless a config sets the interval.
+        self._kick_interval_s = float(env_config.get("kick_interval_s", 0.0))
+        self._kick_lin_vel_std = float(env_config.get("kick_lin_vel_std", 0.1))
+        self._kick_ang_vel_std = float(env_config.get("kick_ang_vel_std", 0.02))
+        self._push_interval_s = float(env_config.get("push_interval_s", 0.0))
+        self._push_duration_s = float(env_config.get("push_duration_s", 1.0))
+        self._push_force_std = float(env_config.get("push_force_std", 10.0))
+        self._push_torque_std = float(env_config.get("push_torque_std", 2.0))
+        # Booster Gym calls apply_rigid_body_force_tensors once per policy step,
+        # after its 10 substeps, and the force lasts exactly ONE simulate()
+        # (measured, scripts/probe_force_persistence.py). Its push is therefore
+        # a pulse of F x 0.002 s every 0.02 s. This engine re-applies the force
+        # on every substep, so the same impulse per second is F x 0.002/0.02 =
+        # 0.1 F held continuously. 0.1 is that ratio, not a tuning knob.
+        self._push_impulse_scale = float(env_config.get("push_impulse_scale", 0.1))
+
+        # Booster Gym draws friction / compliance / restitution per foot SHAPE
+        # (one box per foot on both assets), so the two feet differ. False keeps
+        # the one-draw-per-env behaviour of every earlier run.
+        self._dr_foot_props_per_foot = bool(env_config.get("dr_foot_props_per_foot", False))
 
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
         assert self._meas_hist_steps > 0, \
@@ -201,8 +235,34 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     # ------------------------------------------------------ domain randomization
 
+    def _init_booster_terrain(self, num_envs):
+        cfg, hf = self._engine.get_booster_ground()
+        origins = booster_terrain.env_origins(num_envs, cfg, hf)
+        self._floor_offsets = origins[:, 0:2].copy()
+        self._floor_z_env = origins[:, 2].copy()
+        self._booster_ground_cfg = cfg
+        self._booster_hf = hf
+        return
+
+    def _build_envs(self, config, num_envs):
+        if (self._booster_terrain):
+            self._init_booster_terrain(num_envs)
+        super()._build_envs(config, num_envs)
+        return
+
     def _build_env(self, env_id, config):
-        if (self._floor_offsets is not None):
+        if (self._booster_terrain):
+            # Booster Gym creates each actor at its origin (z = terrain height)
+            orig = self._init_root_pos
+            self._init_root_pos = orig.clone()
+            self._init_root_pos[0] += float(self._floor_offsets[env_id][0])
+            self._init_root_pos[1] += float(self._floor_offsets[env_id][1])
+            self._init_root_pos[2] += float(self._floor_z_env[env_id])
+            try:
+                super()._build_env(env_id, config)
+            finally:
+                self._init_root_pos = orig
+        elif (self._floor_offsets is not None):
             # created spread over their tiles, not piled at the origin, which
             # explodes the PhysX GPU broadphase pair count (soccer lesson)
             orig = self._init_root_pos
@@ -249,11 +309,26 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                     for name in self._dr_foot_bodies]
         # compliance is written too, with the caveat recorded in steering_dr:
         # it reads back as 0.0 while friction and restitution read back correct
-        self._engine.set_obj_shape_props(env_id, char_id,
-                                         friction=params["foot_friction"],
-                                         restitution=params["foot_restitution"],
-                                         compliance=params["foot_compliance"],
-                                         body_ids=foot_ids)
+        if (self._dr_foot_props_per_foot):
+            # Booster Gym _process_rigid_shape_props: one draw per foot shape,
+            # in its order (friction, compliance, restitution). The env-level
+            # draw above still runs, so every other parameter keeps its stream.
+            rng = self._get_dr_rng()
+            per_foot = []
+            for foot_id in foot_ids:
+                fr = float(rng.uniform(*self._dr_ranges["foot_friction"]))
+                co = float(rng.uniform(*self._dr_ranges["foot_compliance"]))
+                re = float(rng.uniform(*self._dr_ranges["foot_restitution"]))
+                self._engine.set_obj_shape_props(env_id, char_id, friction=fr, restitution=re,
+                                                 compliance=co, body_ids=[foot_id])
+                per_foot.append((fr, co, re))
+            params["foot_props_per_foot"] = per_foot
+        else:
+            self._engine.set_obj_shape_props(env_id, char_id,
+                                             friction=params["foot_friction"],
+                                             restitution=params["foot_restitution"],
+                                             compliance=params["foot_compliance"],
+                                             body_ids=foot_ids)
         return
 
     def _apply_dr_runtime(self):
@@ -294,6 +369,16 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         if (self._floor_offsets is not None):
             self._floor_offsets_t = torch.as_tensor(self._floor_offsets, device=self._device,
                                                     dtype=torch.float)
+        if (self._booster_terrain):
+            cfg = self._booster_ground_cfg
+            self._booster_hf_t = torch.as_tensor(self._booster_hf.astype(np.float32),
+                                                 device=self._device)
+            self._booster_border_px = int(cfg["border_size"] / cfg["horizontal_scale"])
+            self._booster_dims = booster_terrain.map_dims(cfg)
+        self._world_step = 0
+        if (self._push_interval_s > 0.0):
+            self._push_force_b = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
+            self._push_torque_b = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         # the clock buffers exist even when it is off, so the task block code
         # has one path; with gait_clock off they are never read
         self._gait_phase = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -376,7 +461,39 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             self._apply_dr_runtime()
         return
 
+    def ground_height(self, xy):
+        """Terrain height under xy [..., 2]; 0 except on the Booster terrain."""
+        if (not self._booster_terrain):
+            return torch.zeros_like(xy[..., 0])
+        cfg = self._booster_ground_cfg
+        return booster_terrain.heightfield_height_t(self._booster_hf_t, self._booster_border_px,
+                                                    cfg["horizontal_scale"],
+                                                    cfg["vertical_scale"], xy)
+
+    def sole_clearance(self, foot_pos, foot_rot):
+        """Least clearance of the foot box above the ground under each corner,
+        [N, F]. Booster's random terrain moves up to 5 cm over 0.2 m, so the
+        ground under the foot ORIGIN is not the ground under the contact corner
+        (the box is 0.22 m long)."""
+        c = steering_util.compute_foot_corners_world(foot_pos, foot_rot, self._foot_box_corners)
+        return torch.min(c[..., 2] - self.ground_height(c[..., 0:2]), dim=-1)[0]
+
     def _ref_state_init(self, env_ids):
+        if (self._booster_terrain and len(env_ids) > 0):
+            # Booster Gym _reset_root_states: origin + U(lo, hi) in xy, then z
+            # raised by the terrain height under the FINAL xy
+            n = len(env_ids)
+            lo, hi = self._booster_reset_xy
+            shift = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+            shift[:, 0:2] = self._floor_offsets_t[env_ids] \
+                + lo + (hi - lo) * torch.rand([n, 2], device=self._device)
+            shift[:, 2] = self.ground_height(self._ref_root_pos[env_ids, 0:2] + shift[:, 0:2])
+            self._ref_root_pos[env_ids] += shift
+            try:
+                super()._ref_state_init(env_ids)
+            finally:
+                self._ref_root_pos[env_ids] -= shift
+            return
         if (self._floor_offsets is None or len(env_ids) == 0):
             super()._ref_state_init(env_ids)
             return
@@ -394,9 +511,68 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)
+        if (self._push_interval_s > 0.0):
+            self._apply_push()
         if (self._reg_diag_enabled):
             self._cache_pre_physics_terms(actions)
         self._prev_action[:] = actions
+        return
+
+    def _apply_push(self):
+        """The held push, base frame -> world with this step's base rotation
+        (Booster Gym applies it in LOCAL_SPACE). The engine clears body forces
+        after every step, so this is re-issued each control step; zeros are
+        skipped so a push-free stretch makes no force call at all."""
+        if (not bool(torch.any(self._push_force_b != 0.0))):
+            return
+        char_id = self._get_char_id()
+        rot = self._engine.get_root_rot(char_id)
+        f = torch_util.quat_rotate(rot, self._push_force_b) * self._push_impulse_scale
+        t = torch_util.quat_rotate(rot, self._push_torque_b) * self._push_impulse_scale
+        self._engine.set_body_forces(None, char_id, 0, f)
+        self._engine.set_body_torques(None, char_id, 0, t)
+        return
+
+    def _every(self, interval_s):
+        steps = int(round(interval_s / self._engine.get_timestep()))
+        return steps
+
+    def _update_world_perturbations(self):
+        """Booster Gym's post-step block, in its order: counter += 1, kick,
+        push, then (after reset, which MimicKit runs elsewhere) teleport."""
+        self._world_step += 1
+        char_id = self._get_char_id()
+        if (self._kick_interval_s > 0.0 and self._world_step % self._every(self._kick_interval_s) == 0):
+            vel = self._engine.get_root_vel(char_id)
+            ang = self._engine.get_root_ang_vel(char_id)
+            self._engine.set_root_vel(None, char_id, vel + self._kick_lin_vel_std * torch.randn_like(vel))
+            self._engine.set_root_ang_vel(None, char_id, ang + self._kick_ang_vel_std * torch.randn_like(ang))
+        if (self._push_interval_s > 0.0):
+            k = self._world_step % self._every(self._push_interval_s)
+            if (k == 0):
+                self._push_force_b.normal_(0.0, self._push_force_std)
+                self._push_torque_b.normal_(0.0, self._push_torque_std)
+            elif (k == self._every(self._push_duration_s)):
+                self._push_force_b.zero_()
+                self._push_torque_b.zero_()
+        if (self._booster_terrain):
+            pos = self._engine.get_root_pos(char_id)
+            w, l, b = self._booster_dims
+            shift = booster_terrain.teleport_shift(pos[:, 0:2], w, l, b)
+            out = torch.any(shift != 0.0, dim=-1).nonzero(as_tuple=False).flatten()
+            if (len(out) > 0):
+                new_pos = pos[out].clone()
+                new_pos[:, 0:2] += shift[out]
+                self._engine.set_root_pos(out, char_id, new_pos)
+        return
+
+    def _post_physics_step(self):
+        super()._post_physics_step()
+        # AFTER obs, reward and done: Booster Gym computes its velocities before
+        # kicking, so the step's reward never sees the kicked velocity. The kick
+        # lands in the engine buffer and takes effect at the next step.
+        if (self._kick_interval_s > 0.0 or self._push_interval_s > 0.0 or self._booster_terrain):
+            self._update_world_perturbations()
         return
 
     def _cache_pre_physics_terms(self, actions):
@@ -548,8 +724,13 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         Critic-only rows). DIFFERENT SHAPE from the actor obs; consumers must
         size the critic from get_critic_obs_space()."""
         char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)
+        if (self._booster_terrain):
+            # height above the local ground, as Booster Gym's privileged obs
+            root_pos = root_pos.clone()
+            root_pos[:, 2] -= self.ground_height(root_pos[:, 0:2])
         priv = steering_util.compute_privileged_block(
-            self._engine.get_root_pos(char_id),
+            root_pos,
             self._engine.get_root_rot(char_id),
             self._engine.get_root_vel(char_id))
         blocks = [self._compute_measurable_frame(), priv]
@@ -643,6 +824,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         f_ang = self._engine.get_body_ang_vel(char_id)[:, foot_ids, :]
         sole_z, cp_vel = steering_util.compute_sole_contact_state(
             f_pos, f_rot, f_vel, f_ang, self._foot_box_corners)
+        if (self._booster_terrain):
+            sole_z = self.sole_clearance(f_pos, f_rot)
         contact_geo = sole_z < self._feet_contact_height
         feet_slip = steering_reward.compute_feet_slip_penalty(cp_vel, contact_geo)
 

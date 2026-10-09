@@ -154,6 +154,20 @@ def compute_sole_contact_state(foot_pos, foot_rot, foot_vel, foot_ang_vel, corne
 
 
 @torch.jit.script
+def compute_foot_corners_world(foot_pos, foot_rot, corners):
+    # type: (Tensor, Tensor, Tensor) -> Tensor
+    """World positions of the foot box corners, [N, F, K, 3] (foot_rot xyzw).
+    On non-flat ground the contact corner is the one with the least clearance
+    above the ground UNDER IT, not the lowest in absolute z."""
+    n, f = foot_pos.shape[0], foot_pos.shape[1]
+    k = corners.shape[0]
+    rot = foot_rot.unsqueeze(-2).expand(n, f, k, 4)
+    r = torch_util.quat_rotate(rot.reshape(-1, 4),
+                               corners.expand(n, f, k, 3).reshape(-1, 3)).reshape(n, f, k, 3)
+    return foot_pos.unsqueeze(-2) + r
+
+
+@torch.jit.script
 def compute_gait_clock_obs(phase, freq):
     # type: (Tensor, Tensor) -> Tensor
     """[cos, sin](2 pi phase), zeroed when the clock is stopped (freq == 0).

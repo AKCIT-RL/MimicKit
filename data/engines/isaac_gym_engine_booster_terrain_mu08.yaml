@@ -1,0 +1,16 @@
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one shared world mesh; envs share the origin, actors are placed at their own origins
+
+ground_contact_height: 0.3
+# Mapa do booster (ver isaac_gym_engine_booster_terrain.yaml) com o atrito de
+# chao do controle G_floor (0.8), para o braco F_terrain mudar SO a geometria.
+# O atrito 1.0 do booster pertence ao braco de contato (F_fric) e ao F_all.
+ground:
+  type: "booster_trimesh"
+  static_friction: 0.8
+  dynamic_friction: 0.8
+  restitution: 0.0

@@ -11,6 +11,7 @@ import time
 import engines.engine as engine
 import engines.isaac_gym_recorder as isaac_gym_recorder
 from util.logger import Logger
+import util.booster_terrain as booster_terrain
 import util.terrain_util as terrain_util
 import util.torch_util as torch_util
 
@@ -446,6 +447,19 @@ class IsaacGymEngine(engine.Engine):
         if (env_id is None or len(env_id) > 0):
             self._has_body_forces = True
         return
+
+    def set_body_torques(self, env_id, obj_id, body_id, torques):
+        """Same contract as set_body_forces (world frame, every substep of the
+        coming step, cleared after it)."""
+        if (env_id is None):
+            self._obj_body_torques[obj_id][:, body_id, :] = torques
+        else:
+            self._obj_body_torques[obj_id][env_id, body_id, :] = torques
+
+        if (env_id is None or len(env_id) > 0):
+            self._has_body_forces = True
+            self._has_body_torques = True
+        return
     
     def get_obj_torque_limits(self, env_id, obj_id):
         return self._obj_torque_lim[obj_id][env_id].cpu().numpy()
@@ -595,6 +609,8 @@ class IsaacGymEngine(engine.Engine):
             self._gym.add_ground(self._sim, plane_params)
         elif (ground_type == "uneven"):
             self._build_uneven_ground(config, static_friction, dynamic_friction, restitution)
+        elif (ground_type == "booster_trimesh"):
+            self._build_booster_ground(config)
         else:
             raise ValueError("Unsupported ground type: {}".format(ground_type))
         return
@@ -644,6 +660,35 @@ class IsaacGymEngine(engine.Engine):
                      "{:d} triangles total".format(len(tile_centers), float(tile_size[0]),
                                                    float(tile_size[1]), amplitude, total_tris))
         return
+
+    def _build_booster_ground(self, config):
+        # Booster Gym's single shared map (util/booster_terrain.py): same
+        # isaacgym generators, same parameters, same placement. Its own
+        # friction/restitution keys (1.0 / 1.0 / 0.0 by default) apply.
+        cfg = booster_terrain.resolve_config(config)
+        hf = booster_terrain.build_heightfield(cfg)
+        verts, tris = booster_terrain.heightfield_to_mesh(hf, cfg)
+        tm_params = gymapi.TriangleMeshParams()
+        tm_params.nb_vertices = verts.shape[0]
+        tm_params.nb_triangles = tris.shape[0]
+        tm_params.transform.p.x = -cfg["border_size"]
+        tm_params.transform.p.y = -cfg["border_size"]
+        tm_params.transform.p.z = 0.0
+        tm_params.static_friction = cfg["static_friction"]
+        tm_params.dynamic_friction = cfg["dynamic_friction"]
+        tm_params.restitution = cfg["restitution"]
+        self._gym.add_triangle_mesh(self._sim, verts.flatten(order="C"),
+                                    tris.flatten(order="C"), tm_params)
+        self._booster_ground = (cfg, hf)
+        Logger.print("Built Booster Gym terrain: heightfield {}, {:d} triangles, "
+                     "z range [{:.3f}, {:.3f}] m".format(hf.shape, tris.shape[0],
+                                                         hf.min() * cfg["vertical_scale"],
+                                                         hf.max() * cfg["vertical_scale"]))
+        return
+
+    def get_booster_ground(self):
+        """(resolved terrain config, int16 heightfield), or None on other grounds."""
+        return getattr(self, "_booster_ground", None)
 
     def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
                             compliance=None, body_ids=None):
@@ -794,7 +839,11 @@ class IsaacGymEngine(engine.Engine):
 
         if (self._has_body_forces):
             self._gym.apply_rigid_body_force_tensors(self._sim, gymtorch.unwrap_tensor(self._body_forces_raw), 
-                                                     None, gymapi.CoordinateSpace.GLOBAL_SPACE)
+                                                     # None unless a torque was set, so the
+                                                     # force-only callers make the same call
+                                                     gymtorch.unwrap_tensor(self._body_torques_raw)
+                                                     if self._has_body_torques else None,
+                                                     gymapi.CoordinateSpace.GLOBAL_SPACE)
         return
 
     def _sim_step(self):
@@ -856,7 +905,10 @@ class IsaacGymEngine(engine.Engine):
             
         if (self._has_body_forces):
             self._body_forces_raw[:] = 0.0
+            if (self._has_body_torques):
+                self._body_torques_raw[:] = 0.0
             self._has_body_forces = False
+            self._has_body_torques = False
         return
     
     def _control_mode_to_drive_mode(self, mode):
@@ -1006,6 +1058,8 @@ class IsaacGymEngine(engine.Engine):
 
         self._body_forces_raw = torch.zeros_like(self._body_state_raw[..., :3])
         body_forces = self._body_forces_raw.view([num_envs, bodies_per_env, 3])
+        self._body_torques_raw = torch.zeros_like(self._body_forces_raw)
+        body_torques = self._body_torques_raw.view([num_envs, bodies_per_env, 3])
 
         # Note: Careful when using these tensors in observations calculations
         # they are not updated immediately during episode resets, and are not valid
@@ -1016,7 +1070,9 @@ class IsaacGymEngine(engine.Engine):
         self._obj_body_ang_vel = []
         self._obj_contact_forces = []
         self._obj_body_forces = []
+        self._obj_body_torques = []
         self._has_body_forces = False
+        self._has_body_torques = False
 
         body_idx0 = 0
         for obj_id in range(self._objs_per_env):
@@ -1028,6 +1084,7 @@ class IsaacGymEngine(engine.Engine):
             obj_body_vel = body_state[..., body_idx0:body_idx1, 7:10]
             obj_body_ang_vel = body_state[..., body_idx0:body_idx1, 10:13]
             obj_body_forces = body_forces[..., body_idx0:body_idx1, :]
+            obj_body_torques = body_torques[..., body_idx0:body_idx1, :]
             obj_contact_forces = contact_forces[..., body_idx0:body_idx1, :]
 
             self._obj_body_pos.append(obj_body_pos)
@@ -1035,6 +1092,7 @@ class IsaacGymEngine(engine.Engine):
             self._obj_body_vel.append(obj_body_vel)
             self._obj_body_ang_vel.append(obj_body_ang_vel)
             self._obj_body_forces.append(obj_body_forces)
+            self._obj_body_torques.append(obj_body_torques)
             self._obj_contact_forces.append(obj_contact_forces)
 
             body_idx0 = body_idx1

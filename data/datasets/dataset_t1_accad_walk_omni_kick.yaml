@@ -1,0 +1,71 @@
+# Booster T1 + kicks (kick01-14, ~25% of weight) - omnidirectional walking from ACCAD Male2 (forward, backward,
+# turns, side-steps), the paper's walking categories (arXiv:2511.03996 sec 4.4).
+# No running, no stand clip. Retargeted with scripts/retarget_accad_to_t1.py,
+# ground-clamped to 2 cm. Weight = clip duration in seconds, so clips are drawn
+# in proportion to their frames (B3 is a 1.02 s WRAP cycle of a 4.42 s capture
+# and keeps the capture's weight). Everything else is CLAMP.
+motions:
+  - file: "data/motions/t1_accad/Male2_B1_StandToWalk.pkl"
+    weight: 3.62
+  - file: "data/motions/t1_accad/Male2_B2_WalkToStand.pkl"
+    weight: 3.63
+  - file: "data/motions/t1_accad/Male2_B3_Walk.pkl"
+    weight: 4.42
+  - file: "data/motions/t1_accad/Male2_B4_StandToWalkBackwards.pkl"
+    weight: 4.60
+  - file: "data/motions/t1_accad/Male2_B5_WalkBackwards.pkl"
+    weight: 6.30
+  - file: "data/motions/t1_accad/Male2_B6_WalkBackwardsToStand.pkl"
+    weight: 6.23
+  - file: "data/motions/t1_accad/Male2_B7_WalkBackwardsTurnForward.pkl"
+    weight: 6.07
+  - file: "data/motions/t1_accad/Male2_B8_WalkBackwardsStopForward.pkl"
+    weight: 6.40
+  - file: "data/motions/t1_accad/Male2_B9_WalkTurnLeft90.pkl"
+    weight: 5.03
+  - file: "data/motions/t1_accad/Male2_B10_WalkTurnLeft45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B11_WalkTurnLeft135.pkl"
+    weight: 5.53
+  - file: "data/motions/t1_accad/Male2_B12_WalkTurnRight90.pkl"
+    weight: 5.37
+  - file: "data/motions/t1_accad/Male2_B13_WalkTurnRight135.pkl"
+    weight: 6.33
+  - file: "data/motions/t1_accad/Male2_B14_WalkTurnRight45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B15_WalkTurnAround.pkl"
+    weight: 6.87
+  - file: "data/motions/t1_accad/Male2_B16_WalkTurnChange.pkl"
+    weight: 7.17
+  - file: "data/motions/t1_accad/Male2_B22_SideStepLeft.pkl"
+    weight: 2.47
+  - file: "data/motions/t1_accad/Male2_B23_SideStepRight.pkl"
+    weight: 3.00
+  - file: "data/motions/t1_kick/kick01_toque_curto_parado.pkl"
+    weight: 2.35
+  - file: "data/motions/t1_kick/kick02_toque_curto_lateral.pkl"
+    weight: 1.89
+  - file: "data/motions/t1_kick/kick03_toque_suave_giro.pkl"
+    weight: 2.43
+  - file: "data/motions/t1_kick/kick04_chute_lateral_dir.pkl"
+    weight: 2.14
+  - file: "data/motions/t1_kick/kick05_passe_frontal_longo.pkl"
+    weight: 2.36
+  - file: "data/motions/t1_kick/kick06_toque_conducao.pkl"
+    weight: 1.73
+  - file: "data/motions/t1_kick/kick07_toque_lateral_dir_curto.pkl"
+    weight: 1.91
+  - file: "data/motions/t1_kick/kick08_passe_lateral_esq.pkl"
+    weight: 2.95
+  - file: "data/motions/t1_kick/kick09_passada_e_passe.pkl"
+    weight: 2.63
+  - file: "data/motions/t1_kick/kick10_toque_lateral_rapido.pkl"
+    weight: 2.03
+  - file: "data/motions/t1_kick/kick11_passada_e_toque_andando.pkl"
+    weight: 2.09
+  - file: "data/motions/t1_kick/kick12_chute_forte_frontal_dir.pkl"
+    weight: 2.26
+  - file: "data/motions/t1_kick/kick13_toque_pe_interno_curto.pkl"
+    weight: 1.71
+  - file: "data/motions/t1_kick/kick14_passe_frontal_impulso.pkl"
+    weight: 2.48

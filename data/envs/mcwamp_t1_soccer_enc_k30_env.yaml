@@ -1,0 +1,268 @@
+# k30 (paper-base) = k27 + every remaining paper implementation item, all ON, retrain from scratch (obs/critic/recon/disc dims change):
+# critic Table 3 (critic_paper_obs), decoder Table 3 targets (recon_paper_targets), goal odometry error (goal_odom_noise),
+# discriminator Table 3 obs (disc_obs_table3), ball mass 0.4-0.45 kg, ball perturbation, 60 s episodes. Rewards identical to k27.
+# k27 (E1) = k26 (E0 control) + ONE change: reward_stagnation_w -100 (paper Table 4; k23a stands still ~1 m from the ball for 6+ s, timeout 63%).
+# k23 (stage 5b) = k22 + robot pushes (char_push_enable, 0.3 m/s std every 5-10 s); warm-start k22a. k22 was: k21b + the paper Table 2 randomization: domain_randomization (motor bias/stiffness/damping, action delay, torso+link mass/CoM, foot friction/compliance/restitution) + ball props (friction 0.1-0.3, restitution 0-1). Pushes and terrain stay off (k23). Warm-start k21c; perception fully realistic.
+# k21 = k19b + ONE change: ball_align_baseline 1.0 (the k18 fix: align paid +5/step for standing still facing the ball at ~1 m; k19a trace: valid ball at 0.99 m, robot idle). k20 (head penalties) was worse: 17.6% vs 27.3%.
+# k19b = k19 continued 10M with the perception already fully realistic (ramp done at start): k19a had only ~3.4M samples at full realism; frontal balls stalled at ~1 m (standing still).
+# k19 (stage 4a) = k17 + ONE change: realistic virtual perception (FOV 90 deg, noise, latency, dropout) ramped over 8M samples, last 2M fully realistic. Warm-start k17a. Head gaze reward stays 0 (k20).
+# k17 (stage 2g) = k16 + ONE change: facing-the-ball reward. k16a: 3% for balls >135 deg behind with perfect perception = no turning behaviour; only a turn pays this term.
+# k1 (kick curriculum, stage 0, second try) = k0 env with ONE reward package change. k0 stood beside the ball
+# (kicked 70% but peak 0.46 m/s, median angle 85 deg): no gradient to discover a real kick.
+# Removed: kick_sideways/kick_forward (conflicting foot-direction terms) and head_gaze (not a stage-0 goal).
+# Added (task stream): foot->ball potential while the ball is still, kick-contact bonus (foot within 0.2 m
+# Also: flat ground (isaac_lab_engine_flat_field.yaml; the Lab bumps roll the ball) and no random ball perturbation.
+# and ball speed gain >= 0.3 m/s). The agent changes too (see mcwamp_t1_soccer_enc_k1_agent.yaml).
+# k0 (kick curriculum, stage 0) = su env turned into a clean standing-kick task: dataset = 14 kicks only,
+# ball 0.35-0.6 m ahead, 8 s episodes, perfect perception, no steering command (anneal 0->1 sample), no DR,
+# no pushes, no ball events, no pose penalties (knee/lean/arm 0), no stagnation/waiting penalties.
+# Task terms kept from su: ball approach, goal progress, kick direction/alignment, foot proximity.
+# Pass: kicked >= 90%, falls < 2%, angle within 30 deg, nn near the ball < 0.2 (scripts/evaluate_kick_stage.py).
+# su = st env (arm -2) with the lean penalty -10 (from -5). st: 48.6%, 0.72 m/s, nn 0.267, lean -0.25; near the ball lean is still -0.53.
+# st = ss env with the arm penalty -2 (ss had -1: 49.0%, 0.73 m/s, nn 0.321; sp -3 slowed the robot). Looking for the strongest arm weight that keeps the game.
+# ss = sp env with the arm penalty cut to -1 (from -3); lean -5 and knee kept. Reason: sq/sr (sp base) stayed slow (0.38-0.41 m/s, 12-14%); sp slowed st_sl (0.81 m/s, 48%) when arm -3 was added.
+# sp = sl env (knee -10, lean -5) + the arm pose penalty only (-3, tol 0.3). Lean/arm together (sm, sn, so) imitated the data but killed the approach (timeout 89-97%); arms do not limit walking speed, so test them alone.
+# sl = sk env (knee penalty kept) + ONE change: reward_torso_lean_w -5 (forward lean beyond 0.15 of the up-vector x, about 9 deg).
+# Why: torso lean -0.40 vs -0.06 in the omni data; hips flexed 0.65 vs 0.30. Diagnostic crutch, to be removed afterwards.
+# bx_x1 = d0 (c11 continuation) with ONE change: motion_file = omni ACCAD only (the paper's walking set) instead of walk+run.
+# Bisect from the working policy: does the prior alone break walking-to-the-ball?
+# d0 = c11 env, ONE change: control: c11 continued for another 100M with nothing changed. Every other d* differs from this by ONE variable.
+# Continuation of c11 (1000M consumed); compare against d0.
+# Booster T1 soccer env, measurable-obs variant (Frente F, paper Table 2).
+# Identical to mcwamp_t1_soccer_env.yaml except the actor obs: measurable
+# frame (projected gravity, base angular velocity, joint offsets, joint
+# velocities, previous action, task block) + 1 s of frame history for the
+# encoder. Full state moves to the privileged critic_obs. CONTRACT BREAK:
+# pair with mcwamp_t1_soccer_enc_agent.yaml, train from scratch.
+env_name: "task_soccer"
+
+char_file: "data/assets/t1/t1.xml"
+camera_mode: "track"
+
+episode_length: 60.0 # s: stage 2, far balls need time to walk (8 s in stage 1)
+global_obs: False
+root_height_obs: True
+pose_termination: False
+enable_phase_obs: False
+enable_tar_obs: False
+num_disc_obs_steps: 10
+rand_reset: True
+zero_center_action: True
+
+ref_char_offset: [2.0, 0.0, 0.0] # m
+init_pose: [0, 0, 0.69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+enable_early_termination: True
+key_bodies: ["left_ankle_roll_link", "right_ankle_roll_link", "aahead_pitch_link", "left_elbow_yaw_link", "right_elbow_yaw_link"]
+contact_bodies: ["left_knee_pitch_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_pitch_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
+
+motion_file: "data/datasets/dataset_t1_accad_walk_omni_kick.yaml" # k6 stage 1: walking + kicks
+
+# field geometry (RoboCup Adult, arXiv:2511.03996)
+field_length: 14.0 # m (x)
+field_width: 9.0 # m (y)
+goal_width: 2.6 # m
+ball_radius: 0.11 # m
+spawn_margin: 1.0 # m
+
+# P4 ablation winners carried over from the G1 (see mcwamp_g1_soccer_env.yaml)
+ball_soft_reset_far: false
+kick_direction_min_vel: 0.3
+
+# viewer extras (cosmetic only; ignored in headless training)
+visualize_field: true
+visualize_debug_arrows: true
+ball_spawn_min_dist: 0.3 # m
+
+# auto steering command toward the ball
+steer_speed_max: 1.5 # m/s (steering policy trained on 0.5-2.5)
+steer_stop_dist: 0.45 # m (command zeroed near the ball)
+
+# steering-crutch anneal (Frente D): the paper's actor receives no steering
+# command; the block fades 1 -> 0 inside the 100M experiment budget so the
+# checkpoint at the end is command-free. Negative start disables.
+steer_anneal_start_samples: 0
+steer_anneal_end_samples: 1
+
+# ball spawn in front of the robot (T1-style curriculum)
+ball_spawn_near: true
+ball_spawn_front_min: 0.5
+ball_spawn_front_max: 2.0
+ball_spawn_lateral: 0.25
+
+# perception curriculum (A): perfect camera (360 deg FOV, no misses/latency/
+# noise) until 10M, linear ramp to the realistic parameters by 60M
+percep_curriculum_start_samples: 100000000
+percep_curriculum_end_samples: 100000001
+
+# ball-spawn curriculum (C): share of uniform field-wide spawns grows from 0
+# at 30M to 50% at 100M (the rest stays near frontal)
+ball_curriculum_start_samples: 0
+ball_curriculum_end_samples: 20000000
+ball_curriculum_far_prob: 0.7 # stage 2: ball anywhere
+
+# samples consumed by the run this one resumes from (0 for a fresh run);
+# shifts every schedule above so a 100M continuation picks up where it was
+curriculum_sample_offset: 200000000 # k14: curricula saturated; ONE change: stand_start_prob (gait initiation from rest)
+
+# random ball perturbations (teleport or planar velocity push)
+ball_perturb_time_min: 4.0 # s
+ball_perturb_time_max: 8.0 # s
+ball_perturb_teleport_prob: 0.5
+ball_perturb_speed_min: 1.0 # m/s
+ball_perturb_speed_max: 4.0 # m/s
+
+# static domain randomization (Frente C; ranges are the code defaults, which
+# follow the HTWK T1 deploy stack)
+rand_ball_props: true
+rand_ball_mass_kg: [0.4, 0.45]
+rand_ball_friction: [0.1, 0.3]
+rand_ball_restitution: [0.0, 1.0]
+domain_randomization: true
+dr_seed: 1
+rand_char_props: false
+
+# random planar velocity pushes on the robot (paper: physical confrontation)
+char_push_enable: true
+
+# measurable actor obs + encoder history (Frente F): frame = 6 proprio +
+# 3 * 23 DOF blocks + 12 task = 87 dims; obs = frame + 30 frames (1 s at
+# 30 Hz control; paper: 50 at 50 Hz) = 2697 dims
+measurable_obs: true
+critic_paper_obs: true
+recon_paper_targets: true
+disc_obs_table3: true
+goal_odom_noise: true
+measurable_hist_steps: 30
+
+# virtual perception (Frente E, paper section 9 parameters are the code
+# defaults): the actor's ball slots + mask carry the perceived state; the
+# critic keeps the true state (asymmetric critic). Contract dims unchanged.
+virtual_perception: true
+# FOV cone follows the actuated head (Frente G); 90 deg ~ RealSense on the T1
+percep_fov_body: "aahead_pitch_link"
+percep_fov_deg: 90.0
+
+# head gaze reward (Frente G): keep the ball near the camera boresight
+reward_head_gaze_w: 0.0
+
+# goal-stream reward weights (Table 3)
+reward_goal_scored_w: 15.0
+reward_ball_approach_w: 50.0
+reward_goal_progress_w: 500.0
+
+# aux-stream reward weights (Table 3, signed; env part — the agent adds the
+# AMP style term). Head gaze enabled above (Frente G); the T1 has an actuated
+# head, unlike the G1 baseline.
+reward_survival_w: 3.0
+reward_termination_w: -200.0
+reward_stagnation_w: -100.0
+reward_kick_sideways_w: 0.0
+reward_kick_forward_w: 0.0
+reward_foot_proximity_w: -5.0
+reward_action_rate_w: -1.0
+reward_joint_limit_w: -100.0
+reward_knee_bend_w: 0.0
+knee_bend_min: 0.25
+reward_base_accel_w: -0.001
+
+# waiting penalty: quadratic in ball-still time, saturates at waiting_time_max
+reward_waiting_w: 0.0
+waiting_time_max: 3.0 # s
+
+stagnation_window: 1.0 # s
+stagnation_move_threshold: 0.1 # m
+ball_contact_dist: 0.25 # m (foot body to ball center)
+foot_min_dist: 0.2 # m
+kick_feet_bodies: ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+# deepmimic pose reward weights (test-mode diagnostics)
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+
+# ball-event Gaussian curriculum (c4): random ball events spawn near the
+# robot with growing probability, so a respawn becomes an own-goal threat
+# unless the policy actively re-engages; measured by free_return_step_mean
+ball_event_gauss_start_samples: 0 # relative to the offset: starts immediately
+ball_event_gauss_end_samples: 50000000
+ball_event_gauss_prob: 0.0
+ball_event_gauss_sigma: 1.0 # m
+
+# c5: freeze the approach/progress potentials while the ball is unperceived.
+# A hidden teleport paid the potential gap for free in c3/c4
+# (free_return_step_mean +2.7/step); with the anchor frozen there is no
+# reward until the ball is seen again, and reacquisition is reward-neutral
+# because prev_ball_pos tracks the true ball.
+percep_potential_freeze: true
+
+# c7 active search: while the ball is unperceived, reward head yaw sweep
+# (paper fig. 4D/E). The bonus is earned by moving the head, which the
+# policy measures; no privileged state. Weighted like the gaze term (aux
+# stream, critic scale 0.01).
+search_sweep_w: 0.0
+search_sweep_cap: 1.5 # rad/s
+
+# c8 aiming: dense alignment of the foot velocity with the ball->goal
+# direction at ball contact (cos^4: 30 deg pays 0.56, 60 deg pays 0.06).
+# Separate from kick_direction (speed toward goal): this scores the impact
+# GEOMETRY. Angular error stuck at ~55 deg since c6 (goals 16-21%).
+reward_kick_alignment_w: 15.0  # c11 keeps the weight, sharpens the curve
+
+# c9 aiming (setup): dense shaping for sitting behind the ball (between ball
+# and own goal side) while near it. The aiming bottleneck is WHERE the kick
+# starts (eval: angular error ~51 deg, approach-angle improvement fell
+# c7->c8); this pays the setup, not the impact.
+reward_kick_position_w: 2.0
+kick_position_near_dist: 1.5 # m
+
+# c10 search curriculum: a growing share of spawns lands in the robot's REAR
+# cone (outside the camera FOV), forcing the body-turn search from the
+# paper's fig. 3B/C. Distribution change, not a reward. Ball_Visible_Frac
+# plateaued at ~0.42-0.45 in c7-c9: head sweeps alone cannot find a ball
+# that starts behind the robot.
+ball_behind_start_samples: 0 # relative to the offset: ramps from the start
+ball_behind_end_samples: 20000000
+ball_behind_prob: 0.5 # k16: ONE change vs k15 (0.25): k15a kicks 0% of balls behind the robot (>135 deg)
+ball_behind_dist_min: 1.0 # m
+ball_behind_dist_max: 4.0 # m
+ball_behind_half_cone_deg: 60.0
+
+# c11 aiming (finer): cos^8 alignment at impact (30 deg pays 0.31, 45 deg
+# pays 0.06, 60 deg pays 0.004) instead of cos^4 (0.56/0.13/0.06). The c8-c9
+# curve still paid too much at 30-45 deg, which is why the angular error
+# plateaued at ~45 deg. Same weight, sharper shape.
+kick_alignment_power: 8.0
+reward_torso_lean_w: 0.0
+torso_lean_max: 0.15
+reward_arm_pose_w: 0.0
+arm_pose_tol: 0.3
+arm_pose_target: [0.05, -1.25, 0.08, 1.27]
+near_ball_penalty_extra: 0.0
+
+# k1 stage-0 shaping: potential on the nearest-foot -> ball distance (ball still) and the kick-contact bonus
+reward_foot_ball_w: 50.0
+reward_kick_contact_w: 100.0
+kick_contact_dist: 0.2 # m (ankle origin to ball centre; a toe contact is ~0.2)
+kick_contact_min_gain: 0.3 # m/s
+kick_contact_gain_cap: 2.0 # m/s
+kick_contact_min_height: 0.58 # m, root z at contact (standing ~0.67); k2: dive-kicks gave 93% falls
+kick_contact_hold_steps: 30 # k4: bonus paid only if still up 1 s (30 Hz) after the contact
+reward_kick_overspeed_w: -50.0 # k5: per m/s of ball-speed gain above the limit at contact (dive-kicks hit 7 m/s)
+kick_overspeed_limit: 3.5
+
+# the k0 env kept the default random ball push/teleport every 4-8 s, which pollutes kick metrics: off
+ball_perturb_enable: true
+stand_start_prob: 0.5 # k14: half of the resets start standing at rest (benchmark start); k13a never initiated gait from rest (0% far balls)
+reward_ball_chase_w: 5.0 # k15: ONE change vs k14: dense velocity-tracking chase toward the ball (k14a stands still for balls beyond ~4.5 m)
+reward_ball_align_w: 5.0 # k17: exp(-err^2) of the heading error to the ball bearing, 0 within stop_dist
+ball_align_baseline: 1.0
+

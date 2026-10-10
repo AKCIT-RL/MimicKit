@@ -122,6 +122,27 @@ def compute_ball_chase_reward(root_pos, prev_root_pos, ball_pos, stop_dist, spee
 
 
 @torch.jit.script
+def compute_ball_align_reward(root_pos, root_rot, ball_pos, stop_dist, angle_scale):
+    # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
+    """Facing-the-ball reward: exp(-angle_scale * err^2), err = signed heading
+    error (rad, wrapped) between the root heading and the root->ball bearing.
+    Zero within ``stop_dist`` of the ball (the kick pose owns that range).
+    A pure function of the state: a robot with the ball behind it only gets
+    paid by turning. Returns [N]."""
+    to_ball = ball_pos[..., 0:2] - root_pos[..., 0:2]
+    bearing = torch.atan2(to_ball[..., 1], to_ball[..., 0])
+    ref = torch.zeros_like(root_rot[..., 0:3])
+    ref[..., 0] = 1.0
+    fwd = torch_util.quat_rotate(root_rot, ref)
+    heading = torch.atan2(fwd[..., 1], fwd[..., 0])
+    err = bearing - heading
+    err = torch.atan2(torch.sin(err), torch.cos(err))
+    reward = torch.exp(-angle_scale * err * err)
+    far = torch.norm(to_ball, dim=-1) > stop_dist
+    return torch.where(far, reward, torch.zeros_like(reward))
+
+
+@torch.jit.script
 def compute_kick_direction_reward(ball_pos, ball_vel, goal_pos, min_vel, decay_tau,
                                   ball_moving_time, max_reward):
     # type: (Tensor, Tensor, Tensor, float, float, Tensor, float) -> Tensor
@@ -345,6 +366,34 @@ def compute_knee_bend_penalty(dof_pos, knee_ids, min_angle: float):
     [0, 2.145] rad, so a straight leg sits on the lower limit."""
     knee = dof_pos.index_select(-1, knee_ids)
     return torch.sum(torch.clamp_min(min_angle - knee, 0.0), dim=-1)
+
+
+@torch.jit.script
+def compute_torso_lean_penalty(root_rot, max_lean: float):
+    # type: (Tensor, float) -> Tensor
+    """Forward lean of the torso beyond ``max_lean`` (unit-vector component, about
+    sin(angle)). The lean is the x component of the world vertical in the root frame
+    (xyzw quaternion), the same quantity as utils/imitation_metrics; negative = forward."""
+    lean_x = 2.0 * (root_rot[..., 0] * root_rot[..., 2] - root_rot[..., 3] * root_rot[..., 1])
+    return torch.clamp_min(-lean_x - max_lean, 0.0)
+
+
+@torch.jit.script
+def compute_near_ball_scale(root_pos, ball_pos, radius: float, extra: float):
+    # type: (Tensor, Tensor, float, float) -> Tensor
+    """Penalty multiplier 1 + extra * clamp(1 - d/radius, 0, 1), d = planar distance
+    to the ball. extra = 0 gives exactly 1 (no change)."""
+    d = torch.linalg.norm(root_pos[..., 0:2] - ball_pos[..., 0:2], dim=-1)
+    return 1.0 + extra * torch.clamp(1.0 - d / radius, 0.0, 1.0)
+
+
+@torch.jit.script
+def compute_arm_pose_penalty(dof_pos, arm_ids, arm_target, tol: float):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Total deviation of the chosen arm joints from a target pose beyond ``tol`` rad
+    (0 inside the band). Targets are in the order of ``arm_ids``."""
+    q = dof_pos.index_select(-1, arm_ids)
+    return torch.sum(torch.clamp_min(torch.abs(q - arm_target) - tol, 0.0), dim=-1)
 
 
 @torch.jit.script
@@ -584,3 +633,70 @@ def compute_head_gaze_angles(head_pos, head_rot, ball_pos):
     pitch = torch.abs(torch.atan2(local[..., 2], horiz))
     half_pi = 1.5707963267948966
     return torch.clamp(yaw, max=half_pi), torch.clamp(pitch, max=half_pi)
+
+
+_GATE_OPS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b}
+
+
+def parse_curriculum_gates(raw):
+    """Validate the `curriculum_gates` config. Each gate stops the schedule clock at
+    `at` samples until every condition ({metric: [op, value]}) holds for `hold_iters`
+    consecutive diagnostic windows with at least `min_episodes` finished episodes."""
+    gates = []
+    last_at = -1.0
+    for g in (raw or []):
+        g = dict(g)
+        at = float(g.pop("at"))
+        hold = int(g.pop("hold_iters", 5))
+        min_eps = int(g.pop("min_episodes", 64))
+        assert at > last_at, "curriculum_gates 'at' must be strictly increasing"
+        assert hold >= 1 and min_eps >= 1
+        conds = []
+        for metric, cond in g.items():
+            op, val = cond
+            assert op in _GATE_OPS, "gate op must be one of {}".format(list(_GATE_OPS))
+            conds.append((metric, op, float(val)))
+        assert len(conds) > 0, "a gate needs at least one condition"
+        gates.append({"at": at, "hold": hold, "min_eps": min_eps, "conds": conds})
+        last_at = at
+    return gates
+
+
+class GateClock:
+    """Schedule clock that waits at performance gates. Without gates it is the plain
+    sample count (start + steps * envs)."""
+
+    def __init__(self, gates, start=0.0):
+        self.gates = gates
+        self.clock = float(start)
+        self.idx = 0
+        self.hold = 0
+        self.stalled_iters = 0
+
+    def advance(self, n):
+        cap = self.gates[self.idx]["at"] if self.idx < len(self.gates) else float("inf")
+        self.clock = min(self.clock + n, cap)
+
+    def update(self, metrics, episodes):
+        """Feed one diagnostics window. Returns True when a gate opened. Only the gate
+        the clock is parked at is evaluated; windows with too few episodes are ignored."""
+        if (self.idx >= len(self.gates)):
+            return False
+        gate = self.gates[self.idx]
+        if (self.clock < gate["at"]):
+            return False
+        self.stalled_iters += 1
+        if (episodes < gate["min_eps"]):
+            return False
+        ok = all(_GATE_OPS[op](metrics.get(m, 0.0), v) for m, op, v in gate["conds"])
+        self.hold = self.hold + 1 if ok else 0
+        if (self.hold >= gate["hold"]):
+            self.idx += 1
+            self.hold = 0
+            self.stalled_iters = 0
+            return True
+        return False
+
+    def info(self):
+        return {"gate_clock": self.clock, "gate_idx": float(self.idx),
+                "gate_hold": float(self.hold), "gate_stalled_iters": float(self.stalled_iters)}

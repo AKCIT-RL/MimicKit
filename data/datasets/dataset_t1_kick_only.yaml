@@ -1,0 +1,30 @@
+# Stage 0 dataset: the 14 kick/touch clips only (kick01-14), weight = duration (s). Standing kicks and short steps; no walking set.
+motions:
+  - file: "data/motions/t1_kick/kick01_toque_curto_parado.pkl"
+    weight: 2.35
+  - file: "data/motions/t1_kick/kick02_toque_curto_lateral.pkl"
+    weight: 1.89
+  - file: "data/motions/t1_kick/kick03_toque_suave_giro.pkl"
+    weight: 2.43
+  - file: "data/motions/t1_kick/kick04_chute_lateral_dir.pkl"
+    weight: 2.14
+  - file: "data/motions/t1_kick/kick05_passe_frontal_longo.pkl"
+    weight: 2.36
+  - file: "data/motions/t1_kick/kick06_toque_conducao.pkl"
+    weight: 1.73
+  - file: "data/motions/t1_kick/kick07_toque_lateral_dir_curto.pkl"
+    weight: 1.91
+  - file: "data/motions/t1_kick/kick08_passe_lateral_esq.pkl"
+    weight: 2.95
+  - file: "data/motions/t1_kick/kick09_passada_e_passe.pkl"
+    weight: 2.63
+  - file: "data/motions/t1_kick/kick10_toque_lateral_rapido.pkl"
+    weight: 2.03
+  - file: "data/motions/t1_kick/kick11_passada_e_toque_andando.pkl"
+    weight: 2.09
+  - file: "data/motions/t1_kick/kick12_chute_forte_frontal_dir.pkl"
+    weight: 2.26
+  - file: "data/motions/t1_kick/kick13_toque_pe_interno_curto.pkl"
+    weight: 1.71
+  - file: "data/motions/t1_kick/kick14_passe_frontal_impulso.pkl"
+    weight: 2.48

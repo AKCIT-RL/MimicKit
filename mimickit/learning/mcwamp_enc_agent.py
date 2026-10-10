@@ -86,8 +86,13 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
             pred = self._model.eval_recon(norm_obs)
             sq_err = torch.square(pred - batch["recon_tar"])  # [T, B, 4]
             if (self._enc_recon_gate_halflife > 0):
-                w = self._recon_gate_weights(batch["obs"]).unsqueeze(-1)
-                recon_loss = (w * sq_err).sum() / torch.clamp(w.sum() * sq_err.shape[-1], min=1.0)
+                w = self._recon_gate_weights(batch["obs"]).unsqueeze(-1).expand_as(sq_err)
+                n_gated = int(getattr(self._env, "get_recon_gated_dims", lambda: sq_err.shape[-1])())
+                if (n_gated < sq_err.shape[-1]):
+                    # robot/static targets are observable at all times: no recency gate
+                    w = w.clone()
+                    w[..., n_gated:] = 1.0
+                recon_loss = (w * sq_err).sum() / torch.clamp(w.sum(), min=1.0)
             else:
                 recon_loss = torch.mean(sq_err)
             info["actor_loss"] = info["actor_loss"] + self._enc_recon_weight * recon_loss

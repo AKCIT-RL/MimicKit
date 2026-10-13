@@ -153,6 +153,13 @@ class IsaacGymEngine(engine.Engine):
             for i in range(self._sim_steps):
                 w = self._action_delay_w[:, i].unsqueeze(-1)
                 self._dof_cmd_raw[:] = w * curr_cmd + (1.0 - w) * self._prev_dof_cmd
+                # pos/vel drives are PhysX's: the blended target only reaches
+                # them through set_dof_*_target_tensor, so it is re-sent every
+                # substep. Without this the blend was inert in pos mode -- a
+                # 30 ms delay gave a bit-identical rollout (docs/t1/16 sec. 7).
+                # A no-op for torque/pd_explicit, which read _dof_cmd_raw in
+                # _pre_sim_step.
+                self._apply_cmd()
                 self._pre_sim_step()
                 self._sim_step()
             self._dof_cmd_raw[:] = curr_cmd
@@ -731,8 +738,9 @@ class IsaacGymEngine(engine.Engine):
         """Scale this env's motor gains in place (Table 2).
 
         Must be called AFTER initialize_sim: _obj_kp/_obj_kd only become views
-        of the [num_envs, total_dofs] tensors in _build_control_tensors, and the
-        PD loop reads those tensors directly.
+        of the [num_envs, total_dofs] tensors in _build_control_tensors. The
+        pd_explicit loop reads those tensors; the pos/vel drives are PhysX's
+        and are rewritten below.
         """
         kp = self._obj_kp[obj_id]
         kd = self._obj_kd[obj_id]
@@ -742,6 +750,17 @@ class IsaacGymEngine(engine.Engine):
 
         kp[env_id] *= torch.as_tensor(kp_scales, device=kp.device, dtype=kp.dtype)
         kd[env_id] *= torch.as_tensor(kd_scales, device=kd.device, dtype=kd.dtype)
+
+        # In pos/vel mode the PD is PhysX's drive, configured once in
+        # create_obj; the tensors above are read only by pd_explicit. Without
+        # writing the drive the randomization was inert (docs/t1/16 sec. 7).
+        if (self._control_mode in (engine.ControlMode.pos, engine.ControlMode.vel)):
+            env_ptr = self.get_env(env_id)
+            props = self._gym.get_actor_dof_properties(env_ptr, obj_id)
+            if (self._control_mode == engine.ControlMode.pos):
+                props["stiffness"][:] = kp[env_id].cpu().numpy()
+            props["damping"][:] = kd[env_id].cpu().numpy()
+            self._gym.set_actor_dof_properties(env_ptr, obj_id, props)
         return
 
     def set_action_delay(self, delay_weights):

@@ -36,6 +36,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # keep spawns away from the field border so the ball does not
         # immediately go out of bounds
         self._spawn_margin = float(env_config.get("spawn_margin", 1.0))
+        # ball spawns may reach closer to the border than the robot's (the Fig. 4A grid has balls up to 0.5 m from the goal line);
+        # None keeps the old behaviour (same margin as the robot)
+        _bsm = env_config.get("ball_spawn_margin", None)
+        self._ball_spawn_margin = self._spawn_margin if _bsm is None else float(_bsm)
+        # k64b: share of ball spawns drawn in the strip next to the goal line (field-local x in [strip_min, half_x]), any y; 0 = off
+        self._ball_goal_strip_prob = float(env_config.get("ball_goal_strip_prob", 0.0))
+        self._ball_goal_strip_min = float(env_config.get("ball_goal_strip_min", 4.8))
+        # k64c: half-width in y of that strip (<= 0: the whole field width, as k64b)
+        self._ball_goal_strip_y = float(env_config.get("ball_goal_strip_y", 0.0))
+        # k64d: x = half_x - (half_x - strip_min) * u**pow; pow > 1 concentrates the strip next to the goal line (1 = uniform)
+        self._ball_goal_strip_pow = float(env_config.get("ball_goal_strip_pow", 1.0))
+        # k64e: second, narrow strip (the "core"): share of spawns with x in [core_min, half_x], |y| <= core_y; 0 = off
+        self._ball_goal_core_prob = float(env_config.get("ball_goal_core_prob", 0.0))
+        self._ball_goal_core_min = float(env_config.get("ball_goal_core_min", 5.6))
+        self._ball_goal_core_y = float(env_config.get("ball_goal_core_y", 1.5))
         self._ball_spawn_min_dist = float(env_config.get("ball_spawn_min_dist", 0.5))
 
         # auto steering command toward the ball (T1 kicking-env style); fills
@@ -402,6 +417,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # (violent lunge kicks that end in a fall); 0 = off
         self._reward_kick_overspeed_w = float(env_config.get("reward_kick_overspeed_w", 0.0))
         self._kick_overspeed_limit = float(env_config.get("kick_overspeed_limit", 3.5))  # m/s
+        # k64f: no overspeed penalty while the ball is closer than this to the goal point (m; 0 = always penalised).
+        # Near the goal the ball crosses in 1-3 steps and the goal step zeroes the shaping, so a normal kick pays
+        # less than the penalty and the policy learned to park instead of kicking (grid cells x>=5.5, |y|<=1).
+        self._kick_overspeed_goal_exempt = float(env_config.get("kick_overspeed_goal_exempt", 0.0))
         # True: penalize the ball speed itself while a foot is near (the gain per step misses a hit that
         # spreads over several control steps); False: per-step gain (k5 behaviour)
         self._kick_overspeed_use_speed = bool(env_config.get("kick_overspeed_use_speed", False))
@@ -1424,6 +1443,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._reward_kick_overspeed_w != 0.0):
             over = ball_speed if self._kick_overspeed_use_speed else gain
             overspeed_r = near.float() * torch.clamp(over - self._kick_overspeed_limit, min=0.0, max=10.0)
+            if (self._kick_overspeed_goal_exempt > 0.0):
+                d_goal = torch.linalg.norm(self._goal_pos - ball_pos[:, 0:2], dim=-1)
+                overspeed_r = overspeed_r * (d_goal >= self._kick_overspeed_goal_exempt).float()
         swing_r = torch.zeros_like(kick_contact_r)
         if (self._reward_kick_side_swing_w != 0.0):
             fvel = self._engine.get_body_vel(self._get_char_id())[:, self._foot_body_ids, :]
@@ -2217,8 +2239,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _sample_ball_pos(self, env_ids, near=True, gauss=None):
         n = env_ids.shape[0]
-        half_x = 0.5 * self._field_length - self._spawn_margin
-        half_y = 0.5 * self._field_width - self._spawn_margin
+        half_x = 0.5 * self._field_length - self._ball_spawn_margin
+        half_y = 0.5 * self._field_width - self._ball_spawn_margin
 
         char_id = self._get_char_id()
         root_pos = self._engine.get_root_pos(char_id)[env_ids]
@@ -2286,6 +2308,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 uni[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
                 uni += self._field_offset[env_ids]
                 ball_pos[uni_mask, 0:2] = uni[uni_mask]
+        if (self._ball_goal_strip_prob > 0.0 and near):
+            strip = torch.rand(n, device=self._device) < self._ball_goal_strip_prob
+            sx = half_x - (half_x - self._ball_goal_strip_min) \
+                * torch.rand(n, device=self._device) ** self._ball_goal_strip_pow
+            strip_y = half_y if self._ball_goal_strip_y <= 0.0 else min(half_y, self._ball_goal_strip_y)
+            sy = strip_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            sp = torch.stack([sx, sy], dim=-1) + self._field_offset[env_ids]
+            ball_pos[strip, 0:2] = sp[strip]
+        if (self._ball_goal_core_prob > 0.0 and near):
+            core = torch.rand(n, device=self._device) < self._ball_goal_core_prob
+            cx = self._ball_goal_core_min + (half_x - self._ball_goal_core_min) * torch.rand(n, device=self._device)
+            cy = min(half_y, self._ball_goal_core_y) * (2.0 * torch.rand(n, device=self._device) - 1.0)
+            cp = torch.stack([cx, cy], dim=-1) + self._field_offset[env_ids]
+            ball_pos[core, 0:2] = cp[core]
         if (gauss is not None and gauss[env_ids].any()):
             # c4: close-range event spawns; clamped into the field and kept
             # off the robot by the min-distance check below. g_mask/g are

@@ -27,6 +27,12 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
         # in metres, and the MSE is taken on the RAW target (no normalizer), so
         # this weight does not transfer from the soccer configs
         self._recon_weight = float(config.get("recon_weight", 1.0))
+        # Standardize each target dim (running mean/std, MimicKit's Normalizer,
+        # fitted over the same normalizer_samples window as the obs). Needed
+        # once the target mixes scales: on the 8-dim paper target, height and
+        # mass/CoM have ~1e-3 of the velocity's variance and a raw MSE would
+        # leave them without gradient. False = raw MSE (every earlier run).
+        self._recon_tar_norm = bool(config.get("recon_tar_norm", False))
         return
 
     def _build_model(self, config):
@@ -43,6 +49,15 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
         critic_dtype = torch_util.numpy_dtype_to_torch(critic_space.dtype)
         self._critic_obs_norm = normalizer.Normalizer(
             critic_space.shape, clip=10.0, device=self._device, dtype=critic_dtype)
+        if (self._recon_tar_norm):
+            self._recon_norm = normalizer.Normalizer(
+                (int(self._env.get_recon_tar_size()),), device=self._device)
+        return
+
+    def _update_normalizers(self):
+        super()._update_normalizers()
+        if (self._recon_tar_norm):
+            self._recon_norm.update()
         return
 
     def load_state_dict(self, state_dict):
@@ -59,6 +74,8 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
     def _record_data_pre_step(self, obs, info, action, action_info):
         super()._record_data_pre_step(obs, info, action, action_info)
         self._exp_buffer.record("recon_tar", info["recon_tar"])
+        if (self._recon_tar_norm and self._need_normalizer_update()):
+            self._recon_norm.record(info["recon_tar"])
         return
 
     def _compute_actor_loss(self, batch):
@@ -67,6 +84,9 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
             # the full batch carries a valid target, so no rand-action mask
             norm_obs = self._obs_norm.normalize(batch["obs"])
             tar = batch["recon_tar"]
+            if (self._recon_tar_norm):
+                # the decoder predicts in the standardized space
+                tar = self._recon_norm.normalize(tar)
             pred = self._model.eval_recon(norm_obs)
             recon_loss = torch.mean(torch.square(pred - tar))
             info["actor_loss"] = info["actor_loss"] + self._recon_weight * recon_loss
@@ -79,4 +99,13 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
             tar_var = torch.mean(torch.var(tar.reshape(-1, tar.shape[-1]), dim=0))
             info["recon_tar_var"] = tar_var.detach()
             info["recon_nmse"] = (recon_loss / torch.clamp(tar_var, min=1e-8)).detach()
+            if (tar.shape[-1] == 8):
+                # per component of the paper target: 1.0 = no better than the mean
+                t2 = tar.reshape(-1, 8)
+                se = torch.square(pred - tar).reshape(-1, 8).mean(dim=0)
+                nmse = (se / torch.clamp(torch.var(t2, dim=0), min=1e-8)).detach()
+                info["recon_nmse_vel"] = nmse[0:3].mean()
+                info["recon_nmse_h"] = nmse[3]
+                info["recon_nmse_mass"] = nmse[4]
+                info["recon_nmse_com"] = nmse[5:8].mean()
         return info

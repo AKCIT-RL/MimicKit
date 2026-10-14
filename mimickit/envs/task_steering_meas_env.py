@@ -109,6 +109,12 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # the one-draw-per-env behaviour of every earlier run.
         self._dr_foot_props_per_foot = bool(env_config.get("dr_foot_props_per_foot", False))
 
+        # decoder target (paper Table 2, Reconstruct column). False = base-frame
+        # linear velocity only (every run before 2026-10-14). True = the paper's
+        # three non-ball rows: linear velocity (3), base height above the local
+        # ground (1), mass scale + CoM offset of the base link (4) = 8 dims.
+        self._recon_full_state = bool(env_config.get("recon_full_state", False))
+
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
         assert self._meas_hist_steps > 0, \
             "measurable_hist_steps must be > 0: the encoder has nothing to " \
@@ -747,11 +753,20 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _compute_recon_tar(self):
         char_id = self._get_char_id()
-        return steering_util.compute_root_lin_vel_b(
+        lin_vel = steering_util.compute_root_lin_vel_b(
             self._engine.get_root_rot(char_id),
             self._engine.get_root_vel(char_id))
+        if (not self._recon_full_state):
+            return lin_vel
+        assert self._dr_enabled, \
+            "recon_full_state needs domain_randomization: the mass/CoM rows are the drawn ones"
+        root_pos = self._engine.get_root_pos(char_id)
+        height = (root_pos[:, 2] - self.ground_height(root_pos[:, 0:2])).unsqueeze(-1)
+        return torch.cat([lin_vel, height, self._dr_torso_params], dim=-1)
 
     def get_recon_tar_size(self):
+        if (self._recon_full_state):
+            return RECON_TAR_DIM + 1 + steering_dr.TORSO_PARAM_DIM
         return RECON_TAR_DIM
 
     def _update_reward(self):

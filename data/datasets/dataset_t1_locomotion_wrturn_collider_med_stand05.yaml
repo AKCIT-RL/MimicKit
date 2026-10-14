@@ -1,0 +1,38 @@
+# dataset_t1_locomotion_wrturn_collider_med.yaml + t1_stand (re-clampado no colisor,
+# anchor stance_median, shift +0.0241 m; logs/collider_clamp_stand_report.json) com peso 0.5.
+# Unica diferenca: o ultimo item.
+motions:
+- file: data/motions/t1_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_around.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_around.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_stand.pkl
+  weight: 0.5

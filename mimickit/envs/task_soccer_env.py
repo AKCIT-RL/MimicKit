@@ -13,6 +13,7 @@ import envs.steering_dr as steering_dr
 import envs.steering_reward as steering_reward
 import envs.steering_util as steering_util
 import envs.task_steering_env as task_steering_env
+import util.terrain_util as terrain_util
 import util.torch_util as torch_util
 
 
@@ -317,6 +318,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # engine's ground meshes and the env's field grid cannot diverge;
         # spawns are raised by the bump amplitude
         self._ground_z_offset = 0.0
+        # per-env spawn lift [num_envs] when ground.tile_levels mixes amplitudes (None = the scalar above)
+        self._ground_z_offset_env = None
         self._build_field_offsets = None
         ground_config = engine_config.get("ground", None)
         if (ground_config is not None and ground_config.get("type", "plane") == "uneven"):
@@ -327,6 +330,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 ground_config["tile_size"] = [self._field_length + 2.0 * self._field_sep,
                                               self._field_width + 2.0 * self._field_sep]
             self._ground_z_offset = float(ground_config.get("random_height", 0.02))
+            if (ground_config.get("tile_levels", None) or ground_config.get("step_height_range", None)):
+                # each field is lifted by its own tile's bound (bumps + tallest step), same
+                # round-robin as the engine (env i <-> tile i), so a 1 mm field does not drop
+                # the robot and the ball from the 5 cm one's height
+                tile_cfgs = terrain_util.resolve_tile_configs(ground_config, num_envs)
+                tile_z = [terrain_util.tile_max_height(c) for c in tile_cfgs]
+                self._ground_z_offset = max(tile_z)
+                self._ground_z_offset_env = torch.tensor(tile_z, device=device, dtype=torch.float)  # self._device is set by super().__init__ below
             # uneven ground uses env_spacing 0 (one global mesh region per
             # field); spread actors over their fields already at creation so
             # they are not all piled at the origin, which explodes the PhysX
@@ -361,6 +372,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # ball it just kicked cannot be farmed
         self._ball_rolling_speed = float(env_config.get("ball_rolling_speed", 0.1))
         self._gate_approach_when_rolling = bool(env_config.get("gate_approach_when_rolling", True))
+        # terrain: speed under which the ball still counts as kickable for the kick shaping only
+        # (foot_ball potential, side swing); bumps keep the ball rolling slowly and starve them.
+        # None = ball_rolling_speed (identical to before); the approach gate, the waiting timer and
+        # the kick-direction timer keep using ball_rolling_speed
+        self._kick_still_speed = env_config.get("kick_still_speed", None)
+        if (self._kick_still_speed is not None):
+            self._kick_still_speed = float(self._kick_still_speed)
 
         # quadratic waiting penalty on ball-still time (T1); saturates at
         # waiting_time_max so 60 s episodes cannot blow it up
@@ -509,7 +527,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._init_root_pos = orig_root_pos.clone()
             self._init_root_pos[0] += float(offset[0])
             self._init_root_pos[1] += float(offset[1])
-            self._init_root_pos[2] += self._ground_z_offset
+            self._init_root_pos[2] += self._ground_z(env_id)
             try:
                 super()._build_env(env_id, config)
             finally:
@@ -581,7 +599,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     _STAGE_PARAM_KEYS = {"episode_length", "stand_start_prob", "reward_ball_chase_w", "reward_ball_align_w",
-                         "ball_curriculum_far_prob"}
+                         "ball_curriculum_far_prob", "ball_goal_strip_prob", "ball_goal_core_prob"}
+
+    def _ground_z(self, env_ids, keepdim=False):
+        """Spawn lift of the ground under env_ids (None = all envs): the scalar _ground_z_offset unless
+        ground.tile_levels gives every field its own amplitude."""
+        if (self._ground_z_offset_env is None):
+            return self._ground_z_offset
+        z = self._ground_z_offset_env if (env_ids is None) else self._ground_z_offset_env[env_ids]
+        return z.unsqueeze(-1) if keepdim else z
 
     def _switch_on(self, start_samples):
         """True when a clock switch is open (negative start = always on)."""
@@ -690,7 +716,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _build_ball(self, env_id):
         ball_asset_file = "data/assets/objects/soccer_ball.xml"
-        start_pos = np.array([2.0, 0.0, self._ball_radius + self._ground_z_offset],
+        start_pos = np.array([2.0, 0.0, self._ball_radius + float(self._ground_z(env_id))],
                              dtype=np.float32)
         if (self._build_field_offsets is not None):
             start_pos[0:2] += self._build_field_offsets[env_id]
@@ -1434,8 +1460,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # k1 shaping + live kick diagnostics (the foot distance is always computed)
         foot_d = self._min_foot_ball_dist(ball_pos)
         ball_speed = torch.linalg.norm(ball_vel[:, 0:2], dim=-1)
+        kick_still = ~rolling
+        if (self._kick_still_speed is not None):
+            kick_still = ball_speed < self._kick_still_speed
         foot_ball_r = torch.clamp(self._prev_foot_ball_dist - foot_d, -0.2, 0.2) \
-            * (~rolling).float()
+            * kick_still.float()
         gain = ball_speed - self._prev_ball_speed
         # the ball already left the foot at the end of the kick step: use the closer of the two steps
         near = torch.minimum(self._prev_foot_ball_dist, foot_d) < self._kick_contact_dist
@@ -1472,7 +1501,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             fv = fvel[torch.arange(nearest.shape[0], device=nearest.device), nearest][:, 0:2]
             fspeed = torch.linalg.norm(fv, dim=-1)
             fside, _ = self._nearest_foot_side(ball_pos, fv, fspeed)
-            swing_r = (foot_d < self._kick_side_swing_dist).float() * (~rolling).float() * fside \
+            swing_r = (foot_d < self._kick_side_swing_dist).float() * kick_still.float() * fside \
                 * torch.clamp(fspeed / self._kick_side_swing_speed, max=1.0)
         self._update_kick_diag(ball_pos, ball_vel, ball_speed, foot_d)
         self._prev_foot_ball_dist[:] = foot_d
@@ -1513,6 +1542,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("foot_ball_dist", foot_d)
         d.add_mean("ball_speed", ball_speed)
         d.add_mean("ball_rolling_frac", rolling.float())
+        if (self._kick_still_speed is not None):
+            # rolling for the gates but still kickable for the kick shaping (the terrain tolerance at work)
+            d.add_mean("ball_kick_still_frac", kick_still.float())
+            d.add_mean("ball_rolling_kickable_frac", torch.logical_and(rolling, kick_still).float())
+        if (self._ground_z_offset_env is not None):
+            # mean tile bound (bumps + steps) under the envs: confirms the tile_levels mixture in the log
+            d.add_mean("ground_tile_lift", self._ground_z_offset_env)
         d.add_sum("kick_events", kick_event.float())
         d.add_sum("kick_side_sum", kick_event.float() * side)
         return
@@ -1926,7 +1962,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # comparably; the ball terms stay first (the recency gate only applies to them)
         heading_inv = torch_util.calc_heading_quat_inv(root_rot)
         lin_vel = torch_util.quat_rotate(heading_inv, self._engine.get_root_vel(char_id))
-        height = (root_pos[:, 2:3] - self._ground_z_offset - 0.67) / 0.1
+        height = (root_pos[:, 2:3] - self._ground_z(None, keepdim=True) - 0.67) / 0.1
         if (self._dr_enabled):
             lo, hi = self._dr_ranges["torso_mass_scale"]
             clo, chi = self._dr_ranges["torso_com_m"]
@@ -2097,7 +2133,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         char_id = self._get_char_id()
         root_pos = self._init_root_pos.unsqueeze(0).repeat(n, 1)
         root_pos[:, 0:2] = self._field_offset[env_ids]
-        root_pos[:, 2] += self._ground_z_offset
+        root_pos[:, 2] += self._ground_z(env_ids)
         root_rot = self._init_root_rot.unsqueeze(0).repeat(n, 1)
         dof_pos = self._init_dof_pos.unsqueeze(0).repeat(n, 1)
         zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)
@@ -2114,7 +2150,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball_id = self._get_ball_id()
         ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
         ball_pos[:, 0:2] = ball_local_xy + self._field_offset[env_ids]
-        ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
+        ball_pos[:, 2] = self._ball_radius + self._ground_z(env_ids)
         ball_rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
         ball_rot[:, 3] = 1.0
         self._engine.set_root_pos(env_ids, ball_id, ball_pos)
@@ -2198,7 +2234,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos[:, 0] = half_x * (2.0 * torch.rand(n, device=self._device) - 1.0)
         root_pos[:, 1] = half_y * (2.0 * torch.rand(n, device=self._device) - 1.0)
         root_pos[:, 0:2] += self._field_offset[env_ids]
-        root_pos[:, 2] += self._ground_z_offset
+        root_pos[:, 2] += self._ground_z(env_ids)
 
         theta = 2.0 * np.pi * torch.rand(n, device=self._device) - np.pi
         axis = torch.zeros([n, 3], device=self._device, dtype=torch.float)
@@ -2225,7 +2261,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (m > 0):
                 zero_vel = torch.zeros([m, 3], device=self._device, dtype=torch.float)
                 s_pos = root_pos[stand].clone()
-                s_pos[:, 2] = self._init_root_pos[2] + self._ground_z_offset
+                s_pos[:, 2] = self._init_root_pos[2] + self._ground_z(sid)
                 s_rot = torch_util.quat_mul(rand_rot[stand],
                                             self._init_root_rot.unsqueeze(0).repeat(m, 1))
                 self._engine.set_root_pos(sid, char_id, s_pos)
@@ -2356,7 +2392,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             gp[:, 0] = torch.clamp(gp[:, 0] - self._field_offset[g, 0], -half_x, half_x)
             gp[:, 1] = torch.clamp(gp[:, 1] - self._field_offset[g, 1], -half_y, half_y)
             ball_pos[g_local, 0:2] = gp + self._field_offset[g]
-        ball_pos[:, 2] = self._ball_radius + self._ground_z_offset
+        ball_pos[:, 2] = self._ball_radius + self._ground_z(env_ids)
 
         # keep the ball from spawning inside the robot
         delta = ball_pos[:, 0:2] - root_pos[:, 0:2]

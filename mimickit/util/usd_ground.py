@@ -51,8 +51,10 @@ def build_ground(stage, ground_path, config, env_offset_max):
         assert (tile_centers is not None and tile_size is not None), \
             "ground.tile_centers [N, 2] and ground.tile_size [2] (m) are required for " \
             "uneven ground; the soccer env injects them from its field grid"
-        horizontal_scale = float(config.get("horizontal_scale", 0.5))
-        amplitude = float(config.get("random_height", 0.02))
+        # per-tile amplitude/steps (ground.tile_levels, round-robin); without levels every tile
+        # gets the base random_height/horizontal_scale, as before
+        tile_cfgs = terrain_util.resolve_tile_configs(config, len(tile_centers))
+        amplitude = max(terrain_util.tile_max_height(c) for c in tile_cfgs)
         centers = np.asarray(tile_centers, dtype=np.float64)
         half = float(np.abs(centers).max()) + max(tile_size) + 100.0
         # safety net just below the deepest dip so nothing falls into the void
@@ -61,8 +63,8 @@ def build_ground(stage, ground_path, config, env_offset_max):
         UsdGeom.Scope.Define(stage, ground_path + "/tiles")
         total_tris = 0
         for i, tile_center in enumerate(tile_centers):
-            heights = terrain_util.build_uneven_tile(float(tile_size[0]), float(tile_size[1]),
-                                                     horizontal_scale, amplitude)
+            horizontal_scale = float(tile_cfgs[i]["horizontal_scale"])
+            heights = terrain_util.build_tile(float(tile_size[0]), float(tile_size[1]), tile_cfgs[i])
             nx, ny = heights.shape
             x_offset = float(tile_center[0]) - 0.5 * (nx - 1) * horizontal_scale
             y_offset = float(tile_center[1]) - 0.5 * (ny - 1) * horizontal_scale
@@ -80,6 +82,8 @@ def build_ground(stage, ground_path, config, env_offset_max):
         Logger.print("Built uneven ground: {:d} tiles of {:.0f}x{:.0f} m, +-{:.3f} m bumps, "
                      "{:d} triangles total".format(len(tile_centers), float(tile_size[0]),
                                                    float(tile_size[1]), amplitude, total_tris))
+        if (config.get("tile_levels", None)):
+            Logger.print("Ground tile levels (round-robin): {}".format(config["tile_levels"]))
     else:
         raise ValueError("Unsupported ground type: {}".format(ground_type))
     return

@@ -1,0 +1,22 @@
+# Plan 23, Phase 5 D: Olives' booster_trimesh terrain (isaac_gym_engine_booster_terrain.yaml on origin/main) rebuilt with
+# the per-field tile generator: +-5 cm uniform bumps plus Booster-style step patches (discrete_obstacles: rectangles
+# 1-2 m, 0.2 per m^2, height +-U(1, 2) cm), ground friction 1.0. Booster uses separate sub-terrains for bumps and
+# steps at 0.1 m resolution; here both are on every field at 0.25 m (a step edge is a 0.25 m ramp; 0.1 m would be
+# ~6x the triangles of this file for 2048 fields). Per-foot friction comes from the Table 2 DR, not from here.
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one global ground; the env spreads fields itself (as in the Isaac Gym twin)
+
+ground:
+  type: "uneven"
+  random_height: 0.05 # m (bump amplitude, uniform)
+  horizontal_scale: 0.25 # m (bump spacing)
+  step_height_range: [0.01, 0.02] # m (|step|, sign random)
+  step_size: [1.0, 2.0] # m (patch side)
+  step_density: 0.2 # patches per m^2
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

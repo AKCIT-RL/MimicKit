@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 
@@ -244,6 +245,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # (paper: 50 frames at 50 Hz).
         self._measurable_obs = bool(env_config.get("measurable_obs", False))
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
+        # sensor noise on the actor's measurable frame (docs/t1/13); every std
+        # defaults to 0, which leaves the env bit-identical
+        self._obs_noise_cfg = {k: env_config[k]
+                               for k in steering_util.OBS_NOISE_KEYS + ("obs_noise_scale",)
+                               if k in env_config}
         assert not (self._measurable_obs and self._task_hist_steps > 0), \
             "measurable_obs already carries the task block in its history; " \
             "task_obs_history_steps must be 0"
@@ -475,7 +481,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._motion_kick_w_early is not None):
             assert self._motion_kick_w_end >= 0.0
             lib = self._motion_lib
-            is_kick = torch.tensor(["t1_kick" in f for f in lib._motion_files], device=lib._motion_weights.device)
+            is_kick = torch.tensor(["t1_kick" in f or os.path.basename(f).startswith("kick") for f in lib._motion_files], device=lib._motion_weights.device)
             assert is_kick.any() and (~is_kick).any(), "motion_kick_weight_early needs kick and non-kick clips"
             self._motion_weights_true = lib._motion_weights.clone()
             w = lib._motion_weights.clone()
@@ -814,6 +820,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # measurable-frame history (Frente F): 6 proprio + 3 * D + 12 task
         if (self._measurable_obs):
             self._meas_frame_dim = 6 + 3 * action_dim + 12
+            self._obs_noise_std = steering_util.build_obs_noise_std(
+                self._obs_noise_cfg, action_dim, 12).to(self._device)
+            assert self._obs_noise_std.shape[0] == self._meas_frame_dim
+            self._obs_noise_on = bool(torch.any(self._obs_noise_std > 0))
             self._meas_hist_buf = torch.zeros(
                 [num_envs, self._meas_hist_steps, self._meas_frame_dim],
                 device=self._device, dtype=torch.float)
@@ -1096,6 +1106,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         block = self._compute_task_block(env_ids)
         return torch.cat([proprio, block], dim=-1)
 
+    def _compute_actor_frame(self, env_ids=None):
+        """The frame the actor receives: the measurable frame, corrupted with
+        sensor noise when configured. Called once per step (history roll) and
+        once per reset (refill). The critic never goes through here."""
+        return steering_util.apply_obs_noise(self._compute_measurable_frame(env_ids),
+                                             self._obs_noise_std)
+
     def get_measurable_frame_dim(self):
         assert self._measurable_obs
         return self._meas_frame_dim
@@ -1109,8 +1126,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # history is mutated once per step in _update_task (and refilled
             # on reset), NEVER here: _compute_obs is also used as a shape
             # probe by get_obs_space()
-            frame = self._compute_measurable_frame(env_ids)
             hist = self._meas_hist_buf if env_ids is None else self._meas_hist_buf[env_ids]
+            # with noise the frame was drawn ONCE, when it entered the history;
+            # re-drawing here would differ from hist[-1] on every call
+            frame = hist[:, -1] if self._obs_noise_on else self._compute_measurable_frame(env_ids)
             return torch.cat([frame, hist.flatten(start_dim=1)], dim=-1)
         obs = super()._compute_obs(env_ids)
         block = self._compute_task_block(env_ids)
@@ -1178,7 +1197,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._critic_task_hist_buf[:, -1] = self._compute_task_block(privileged=True)
         if (self._measurable_obs):
             self._meas_hist_buf[:, :-1] = self._meas_hist_buf[:, 1:].clone()
-            self._meas_hist_buf[:, -1] = self._compute_measurable_frame()
+            self._meas_hist_buf[:, -1] = self._compute_actor_frame()
         return
 
     def _reset_goal_odom(self, env_ids):
@@ -2048,7 +2067,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 # after prev_action is zeroed: the refilled history must match
                 # the frame the actor sees on its first post-reset step
                 self._meas_hist_buf[env_ids] = \
-                    self._compute_measurable_frame(env_ids).unsqueeze(1)
+                    self._compute_actor_frame(env_ids).unsqueeze(1)
             self._ball_moving_time[env_ids] = 0.0
             self._ball_still_time[env_ids] = 0.0
             char_id = self._get_char_id()
@@ -2116,7 +2135,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                     self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
         if (self._measurable_obs):
             self._meas_hist_buf[env_ids] = \
-                self._compute_measurable_frame(env_ids).unsqueeze(1)
+                self._compute_actor_frame(env_ids).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
         self._stagnation_anchor_pos[env_ids] = root_pos
@@ -2152,7 +2171,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                     self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
         if (self._measurable_obs):
             self._meas_hist_buf[env_ids] = \
-                self._compute_measurable_frame(env_ids).unsqueeze(1)
+                self._compute_actor_frame(env_ids).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._task_reward_buf[env_ids] = 0.0
         self._goal_scored_buf[env_ids] = False

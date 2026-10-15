@@ -125,6 +125,9 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # backward drift costs what a forward one does
         # (steering_reward.restore_still_tar_reward). False = original reward.
         self._steering_still_symmetric = bool(env_config.get("steering_still_symmetric", False))
+        # commanded speed below which the symmetric rule applies; the default
+        # 1e-6 means exact stops only (the S3 run of 2026-10-15)
+        self._steering_still_speed = float(env_config.get("steering_still_speed", 1e-6))
 
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
         assert self._meas_hist_steps > 0, \
@@ -796,7 +799,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             self._reward_buf[:] = steering_reward.restore_still_tar_reward(
                 self._reward_buf, self._engine.get_root_pos(char_id), self._prev_root_pos,
                 self._tar_dir, self._tar_speed, self._engine.get_timestep(),
-                self._reward_steering_vel_scale, self._reward_steering_tar_w)
+                self._reward_steering_vel_scale, self._reward_steering_tar_w,
+                still_eps=self._steering_still_speed)
         # the looser gate: with every weight at 0 this still fills the buffer
         # and the diagnostics, but _update_info below does not publish the key,
         # so the agent path stays bit-identical. That is the measurement mode.

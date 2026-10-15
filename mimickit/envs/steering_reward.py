@@ -377,12 +377,16 @@ def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed
     all forward, docs/t1/16 / 2026-10-15). Booster Gym has no such rule.
 
     Where tar_speed < still_eps and the rule fired, adds back
-    tar_reward_w * exp(-vel_err_scale * |v_xy|^2), i.e. the term the target
-    velocity (zero) asks for. Everything else is returned unchanged.
+    tar_reward_w * exp(-vel_err_scale * |tar_speed * tar_dir - v_xy|^2), the
+    exact term the rule had zeroed (for tar_speed == 0 it is exp(-k |v|^2)).
+    still_eps 1e-6 = exact stops only; a larger value (e.g. 0.1 m/s) also
+    covers the slow commands the uniform speed sampler draws. Everything else
+    is returned unchanged.
     """
     v = (root_pos - prev_root_pos)[..., 0:2] / dt
     wrong = torch.sum(tar_dir * v, dim=-1) < 0
     still = tar_speed < still_eps
-    term = tar_reward_w * torch.exp(-vel_err_scale * torch.sum(v * v, dim=-1))
+    err = tar_speed.unsqueeze(-1) * tar_dir - v
+    term = tar_reward_w * torch.exp(-vel_err_scale * torch.sum(err * err, dim=-1))
     return reward + torch.where(wrong & still, term, torch.zeros_like(term))
 

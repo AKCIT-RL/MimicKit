@@ -363,3 +363,26 @@ def compute_location_reward(root_pos, prev_root_pos, tar_pos, tar_speed, dt,
     inside = dist_sq < stop_radius * stop_radius
     vel_r = torch.where(inside, torch.ones_like(vel_r), vel_r)
     return pos_w * pos_r + vel_w * vel_r
+
+
+def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed, dt,
+                             vel_err_scale, tar_reward_w, still_eps=1e-6):
+    """Undo compute_steering_reward's wrong-direction rule on STOP commands.
+
+    task_steering_env.compute_steering_reward zeroes the velocity-tracking term
+    whenever the base moves against tar_dir. With tar_speed > 0 that is a
+    sensible "do not walk backwards"; with tar_speed == 0 it makes any backward
+    drift cost the whole term while a forward drift only costs exp(-k v^2), a
+    standing incentive to creep forward (measured: still-test drift is almost
+    all forward, docs/t1/16 / 2026-10-15). Booster Gym has no such rule.
+
+    Where tar_speed < still_eps and the rule fired, adds back
+    tar_reward_w * exp(-vel_err_scale * |v_xy|^2), i.e. the term the target
+    velocity (zero) asks for. Everything else is returned unchanged.
+    """
+    v = (root_pos - prev_root_pos)[..., 0:2] / dt
+    wrong = torch.sum(tar_dir * v, dim=-1) < 0
+    still = tar_speed < still_eps
+    term = tar_reward_w * torch.exp(-vel_err_scale * torch.sum(v * v, dim=-1))
+    return reward + torch.where(wrong & still, term, torch.zeros_like(term))
+

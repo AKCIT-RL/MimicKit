@@ -182,6 +182,22 @@ def compute_gait_clock_obs(phase, freq):
     return torch.stack([torch.cos(ang) * on, torch.sin(ang) * on], dim=-1)
 
 
+def apply_still_commands(tar_speed, tar_dir, face_dir, heading, still):
+    """Booster Gym's still commands (envs/t1.py _resample_commands,
+    still_proportion), on the steering command.
+
+    tar_speed [N], tar_dir/face_dir [N, 2], heading [N] (rad, the robot's
+    current yaw), still [N] bool. Where still: speed 0 AND both directions set
+    to the CURRENT heading, so "stop" asks for no turn either -- a zero speed
+    with a random face direction (the plain sampler) still makes the robot
+    turn in place. Returns new (tar_speed, tar_dir, face_dir); inputs untouched.
+    """
+    h = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1)
+    m = still.unsqueeze(-1)
+    return (torch.where(still, torch.zeros_like(tar_speed), tar_speed),
+            torch.where(m, h, tar_dir), torch.where(m, h, face_dir))
+
+
 def compute_floor_tile_grid(num_envs, tile_size):
     """Centers of a contiguous, origin-centered square grid of floor tiles,
     one per env, as float32 [N, 2] (numpy).

@@ -115,6 +115,17 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         # ground (1), mass scale + CoM offset of the base link (4) = 8 dims.
         self._recon_full_state = bool(env_config.get("recon_full_state", False))
 
+        # Booster Gym still commands (T1.yaml commands.still_proportion 0.1):
+        # this fraction of command draws is a real stop -- speed 0, facing the
+        # current heading (steering_util.apply_still_commands). 0 = the plain
+        # U(min, max) sampler of every earlier run, with no extra RNG draw.
+        self._still_proportion = float(env_config.get("still_proportion", 0.0))
+        assert 0.0 <= self._still_proportion <= 1.0, "still_proportion must be in [0, 1]"
+        # On stop commands, drop the steering reward's wrong-direction rule so a
+        # backward drift costs what a forward one does
+        # (steering_reward.restore_still_tar_reward). False = original reward.
+        self._steering_still_symmetric = bool(env_config.get("steering_still_symmetric", False))
+
         self._meas_hist_steps = int(env_config.get("measurable_hist_steps", 30))
         assert self._meas_hist_steps > 0, \
             "measurable_hist_steps must be > 0: the encoder has nothing to " \
@@ -661,6 +672,15 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _reset_task(self, env_ids):
         super()._reset_task(env_ids)
+        if (self._still_proportion > 0.0 and len(env_ids) > 0):
+            # before the gait clock below, which must see the stop
+            still = torch.rand(len(env_ids), device=self._device) < self._still_proportion
+            heading = torch_util.calc_heading(self._engine.get_root_rot(self._get_char_id())[env_ids])
+            sp, td, fd = steering_util.apply_still_commands(
+                self._tar_speed[env_ids], self._tar_dir[env_ids], self._face_dir[env_ids], heading, still)
+            self._tar_speed[env_ids] = sp
+            self._tar_dir[env_ids] = td
+            self._face_dir[env_ids] = fd
         if (self._gait_clock and len(env_ids) > 0):
             # resampled with the command, as Booster Gym does; stopped when the
             # commanded speed is a stand
@@ -771,6 +791,12 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _update_reward(self):
         super()._update_reward()
+        if (self._steering_still_symmetric):
+            char_id = self._get_char_id()
+            self._reward_buf[:] = steering_reward.restore_still_tar_reward(
+                self._reward_buf, self._engine.get_root_pos(char_id), self._prev_root_pos,
+                self._tar_dir, self._tar_speed, self._engine.get_timestep(),
+                self._reward_steering_vel_scale, self._reward_steering_tar_w)
         # the looser gate: with every weight at 0 this still fills the buffer
         # and the diagnostics, but _update_info below does not publish the key,
         # so the agent path stays bit-identical. That is the measurement mode.

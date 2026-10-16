@@ -1,0 +1,47 @@
+# Braco 3 (2026-10-15): os 16 clipes de dataset_t1_locomotion_wrturn_collider_med + todos os retos crus re-clampados
+# (logs/collider_clamp_straight_report.json; walk_to_stand ja existia). 22 clipes.
+motions:
+- file: data/motions/t1_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_around.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_around.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_stand_to_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_to_stand.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_stand.pkl
+  weight: 1.0

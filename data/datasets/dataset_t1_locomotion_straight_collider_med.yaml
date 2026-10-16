@@ -1,0 +1,6 @@
+# Ablacao de curvas (2026-10-15), braco 1: so os 2 clipes retos do dataset_t1_locomotion_wrturn_collider_med.
+motions:
+- file: data/motions/t1_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_run.pkl
+  weight: 1.0

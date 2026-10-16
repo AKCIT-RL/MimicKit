@@ -1,0 +1,14 @@
+# Ablacao de curvas (2026-10-15), braco 2: os 2 retos + as curvas de 90 graus (caminhada e corrida, esquerda e direita).
+motions:
+- file: data/motions/t1_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_to_run.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_walk_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_collider_med/t1_run_turn_right90.pkl
+  weight: 1.0

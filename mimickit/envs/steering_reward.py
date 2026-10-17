@@ -390,3 +390,25 @@ def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed
     term = tar_reward_w * torch.exp(-vel_err_scale * torch.sum(err * err, dim=-1))
     return reward + torch.where(wrong & still, term, torch.zeros_like(term))
 
+
+# Hip roll sign, measured by FK on t1_firmware_derated.xml (2026-10-16): a
+# POSITIVE hip roll moves the foot to +y on BOTH legs, i.e. abduction on the
+# left and adduction on the right. Adduction = -q on the left, +q on the right.
+
+
+@torch.jit.script
+def compute_hip_roll_adduction_penalty(hip_roll, thresh):
+    # type: (Tensor, float) -> Tensor
+    """sum over legs of max(0, adduction - thresh)^2, hip_roll [N, 2] (left,
+    right) rad -> [N].
+
+    One-sided: abduction (leg out) and any adduction up to thresh cost
+    nothing. Meant for the COMMANDED hip roll (the action): in position control
+    the realized angle is filtered by the actuator and barely reaches the tail
+    the policy asks for (measured: target p05 -10..-13 deg vs realized -6..-9
+    deg), which is the same reason joint_limit_on_action exists.
+    """
+    sign = torch.tensor([-1.0, 1.0], device=hip_roll.device, dtype=hip_roll.dtype)
+    add = hip_roll * sign
+    return torch.sum(torch.square(torch.clamp(add - thresh, min=0.0)), dim=-1)
+

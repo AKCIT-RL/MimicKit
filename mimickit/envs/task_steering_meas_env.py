@@ -226,6 +226,13 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._collision_exempt_bodies = list(env_config.get(
             "collision_exempt_bodies", DEFAULT_COLLISION_EXEMPT))
 
+        # hip roll adduction on the COMMANDED target, beyond a threshold
+        # (steering_reward.compute_hip_roll_adduction_penalty). 0 = off. The
+        # default threshold, 8 deg, sits above the policy's normal commanded
+        # adduction and below the reference's running tail (-11.5 deg p05).
+        self._reward_hip_roll_add_w = float(env_config.get("reward_hip_roll_add_w", 0.0))
+        self._hip_roll_add_thresh = float(env_config.get("hip_roll_add_thresh", 0.1396))
+
         # every weight has to flip the gate. An OR that forgot one would leave
         # _aux_reward_buf unallocated and info["aux_reward"] unpublished, and
         # that config would train as if the term were not there.
@@ -238,7 +245,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                              self._reward_feet_slip_w,
                              self._reward_feet_yaw_diff_w,
                              self._reward_feet_lat_dist_w,
-                             self._reward_feet_swing_w)
+                             self._reward_feet_swing_w,
+                             self._reward_hip_roll_add_w)
         self._aux_reward_enabled = any(w != 0.0 for w in self._reg_weights)
 
         # measure-before-you-spend: logs every raw term with ALL weights at 0,
@@ -434,6 +442,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             self._leg_dof_ids = torch.tensor(
                 steering_util.build_dof_group_ids(self._kin_char_model,
                                                   self._leg_dof_bodies),
+                device=self._device, dtype=torch.long)
+            self._hip_roll_dof_ids = torch.tensor(
+                steering_util.build_dof_group_ids(self._kin_char_model,
+                                                  ["left_hip_roll_link", "right_hip_roll_link"]),
                 device=self._device, dtype=torch.long)
 
             # read once from env 0: domain randomization does not randomize
@@ -884,6 +896,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         feet_swing = steering_reward.compute_feet_swing_reward(
             self._gait_phase, self._gait_freq, contact_geo, self._feet_swing_period)
 
+        # _prev_action holds a_t here (see joint_lim above): the commanded target
+        hip_roll_add = steering_reward.compute_hip_roll_adduction_penalty(
+            self._prev_action.index_select(-1, self._hip_roll_dof_ids), self._hip_roll_add_thresh)
+
         # one in-place write at the end. _update_info published this buffer's
         # REFERENCE before _update_reward ran, so rebinding it here would leave
         # stale zeros there and nothing would report it.
@@ -897,7 +913,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             + self._reward_feet_slip_w * feet_slip
             + self._reward_feet_yaw_diff_w * feet_yaw_diff
             + self._reward_feet_lat_dist_w * feet_lat
-            + self._reward_feet_swing_w * feet_swing)
+            + self._reward_feet_swing_w * feet_swing
+            + self._reward_hip_roll_add_w * hip_roll_add)
         self._diag.add_mean("rew_feet_swing", self._reward_feet_swing_w * feet_swing)
         self._diag.add_mean("feet_swing", feet_swing)
 
@@ -933,6 +950,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._diag.add_mean("rew_joint_limit", self._reward_joint_limit_w * joint_lim)
         self._diag.add_mean("rew_base_accel", self._reward_base_accel_w * base_accel)
         self._diag.add_mean("rew_collision", self._reward_collision_w * collision)
+        self._diag.add_mean("rew_hiproll_add", self._reward_hip_roll_add_w * hip_roll_add)
+        self._diag.add_mean("hiproll_add_raw", hip_roll_add)
 
         self._diag.add_mean("head_act_rate", self._head_act_rate_buf)
         self._diag.add_mean("leg_act_rate", self._leg_act_rate_buf)

@@ -1,0 +1,12 @@
+# k77zf: fine-tune of k75b (580M), flat field, k75b env, low-KL agent (k77z), +60M (640M total). Doc 25 M1.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_flat_field.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k75b_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k77z_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 640000000
+--out_dir output/t1_soccer_k77zf/

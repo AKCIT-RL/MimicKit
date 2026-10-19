@@ -122,6 +122,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # k14: share of resets that start from the standing default pose at rest
         # (gait initiation, the deployment start) instead of a mid-motion RSI state
         self._stand_start_prob = float(env_config.get("stand_start_prob", 0.0))
+        # doc 25 M6: optional pose of the stand starts (the deploy config's default_joint_pos, dof order of the
+        # asset) and root height; None = init_pose. Eval-only by default (deploy spawn check).
+        sdp = env_config.get("stand_start_dof_pos", None)
+        self._stand_start_dof_pos = None if sdp is None else torch.tensor(sdp, device=device, dtype=torch.float)
+        sz = env_config.get("stand_start_root_z", None)
+        self._stand_start_root_z = None if sz is None else float(sz)
         self._ball_behind_start_samples = \
             float(env_config.get("ball_behind_start_samples", -1.0))
         self._ball_behind_end_samples = \
@@ -156,6 +162,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # sampler, same ranges). Replaces rand_char_props when on: the two draw
         # the same friction/mass/CoM with different ranges and must not stack.
         self._dr_enabled = bool(env_config.get("domain_randomization", False))
+        # evaluation only: one fixed action delay (ms) for every env, with no other DR (doc 25, goal M4)
+        self._fixed_action_delay_ms = env_config.get("fixed_action_delay_ms", None)
         self._dr_static_pending = []
         self._ball_props_pending = []
         self._dr_static_deferred = False  # set once the engine is known (see the post-init props loop)
@@ -201,6 +209,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # random velocity pushes on the robot (paper: physical confrontation;
         # magnitude matches the HTWK T1 push: ~10 N x 1 s / ~30 kg)
         self._char_push_enable = bool(env_config.get("char_push_enable", False))
+        # Booster Gym world perturbations, as Olives' e80tonn1 (task_steering_meas_env, envs/t1.py _kick_robots /
+        # _push_robots): ONE step counter shared by all envs; a velocity kick every kick_interval_s and a base-frame
+        # force + torque held for push_duration_s every push_interval_s. push_impulse_scale 0.1 = Booster's pulse of
+        # F x 0.002 s every 0.02 s held continuously over the substeps (scripts/probe_force_persistence.py).
+        # Off unless an interval is set; switched on with the pushes (char_push_start_samples). doc 25 item 3.
+        self._kick_interval_s = float(env_config.get("kick_interval_s", 0.0))
+        self._kick_lin_vel_std = float(env_config.get("kick_lin_vel_std", 0.1))
+        self._kick_ang_vel_std = float(env_config.get("kick_ang_vel_std", 0.02))
+        self._push_interval_s = float(env_config.get("push_interval_s", 0.0))
+        self._push_duration_s = float(env_config.get("push_duration_s", 1.0))
+        self._push_force_std = float(env_config.get("push_force_std", 10.0))
+        self._push_torque_std = float(env_config.get("push_torque_std", 2.0))
+        self._push_impulse_scale = float(env_config.get("push_impulse_scale", 0.1))
+        # Booster Gym draws foot friction / compliance / restitution per foot shape (doc 25 item 2)
+        self._dr_foot_props_per_foot = bool(env_config.get("dr_foot_props_per_foot", False))
+        # Table 3/4 joint-limit penalty on the commanded target instead of dof_pos (dof_pos is clamped by the
+        # sim and almost never exceeds the limit), as Olives' base P (doc 25 item 4)
+        self._joint_limit_on_action = bool(env_config.get("joint_limit_on_action", False))
         self._char_push_time_min = float(env_config.get("char_push_time_min", 5.0))
         self._char_push_time_max = float(env_config.get("char_push_time_max", 10.0))
         self._char_push_vel_std = float(env_config.get("char_push_vel_std", 0.3))
@@ -452,6 +478,65 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # side = |sin| of the angle between the nearest foot's horizontal long axis and the ball launch
         # direction (0 = toe poke, 1 = inside of the foot); 0 = off, the bonus is unchanged
         self._kick_side_foot_mix = float(env_config.get("kick_side_foot_mix", 0.0))
+        # foot-pitch gate on the kick bonus (doc 25, goal M13): the bonus is scaled by (1 - mix) + mix * g,
+        # g = exp(-(excess / sigma)^2), excess = max(|pitch| - tol, 0) in degrees of the nearest foot's long axis
+        # above the horizontal at the kick step (toe pointing down = toe poke; the dataset's kicks are within 35 deg).
+        # 0 = off, the bonus is unchanged
+        self._kick_pitch_mix = float(env_config.get("kick_pitch_mix", 0.0))
+        self._kick_pitch_tol_deg = float(env_config.get("kick_pitch_tol_deg", 35.0))
+        # aim gate on the kick bonus (doc 25, M1): the bonus is scaled by (1 - mix) + mix * g, g = exp(-(excess / sigma)^2),
+        # excess = max(err - half, 0) in degrees, err = angle between the ball velocity at the kick step and ball->goal,
+        # half = atan((goal_width / 2 - margin) / dist_to_goal) (the shot's angular tolerance; ~5 deg at 12 m).
+        # The contact bonus is otherwise blind to direction. 0 = off, the bonus is unchanged
+        self._kick_aim_mix = float(env_config.get("kick_aim_mix", 0.0))
+        self._kick_aim_margin = float(env_config.get("kick_aim_margin", 0.3))
+        self._kick_aim_sigma_deg = float(env_config.get("kick_aim_sigma_deg", 3.0))
+        self._kick_pitch_sigma_deg = float(env_config.get("kick_pitch_sigma_deg", 25.0))
+        self._kick_pitch_gate_prev = bool(env_config.get("kick_pitch_gate_prev", False))
+        # dense foot-pitch shaping (doc 25, M13): the gate above only acts at the kick step and the k74T
+        # policies almost never reach it (|pitch| ~65 deg), so it gives no direction. This pays
+        # w * (excess / 45 deg) on every step the nearest foot is within kick_pitch_dense_dist of a still
+        # ball, excess as in the gate. w <= 0; 0 = off (the raw value is logged anyway)
+        self._reward_kick_pitch_dense_w = float(env_config.get("reward_kick_pitch_dense_w", 0.0))
+        self._kick_pitch_dense_dist = float(env_config.get("kick_pitch_dense_dist", 0.4))
+        # doc 25 C(b): style gain near the ball. The agent multiplies the disc reward of a step by
+        # info["style_gain"] = style_near_ball_gain while the nearest foot is within style_near_ball_dist of the
+        # ball (C0: k75b style score 0.16-0.38 there vs 0.93 far away), else 1. 1.0 = off
+        self._style_near_ball_gain = float(env_config.get("style_near_ball_gain", 1.0))
+        self._style_near_ball_dist = float(env_config.get("style_near_ball_dist", 0.4))
+        # doc 25 C(c): demo windows of the kick critic (agent kick_disc_weight). {clip basename: strike frame}
+        # (scripts/lab/kick_foot_profile.py peak_frame); the window's last frame is drawn in
+        # [strike - kick_disc_pre_s, strike + kick_disc_post_s]. Only read by fetch_kick_disc_obs_demo
+        self._kick_disc_peak_frames = dict(env_config.get("kick_disc_peak_frames", {}))
+        self._kick_disc_pre_s = float(env_config.get("kick_disc_pre_s", 0.1))
+        self._kick_disc_post_s = float(env_config.get("kick_disc_post_s", 0.3))
+        self._kick_disc_ids = None
+        # k75: side-foot ("chapa") bonus at kick events, from the foot state of the step BEFORE the event:
+        # |sin| between the foot's planar velocity and its planar long axis, times the pitch gate of that
+        # step's pitch (at the event step the foot is already flattened: k74b -29 deg there vs -65 deg before)
+        self._reward_kick_chapa_w = float(env_config.get("reward_kick_chapa_w", 0.0))
+        # doc 25 C(a): foot-pitch target (dataset kicks: instep, pitch ~ -15 deg). g = exp(-((pitch - target) / sigma)^2);
+        # event term pays g of the nearest foot's pitch on the step BEFORE each kick event, dense term pays g every
+        # step the nearest foot is within kick_pitch_dense_dist of a still ball. 0 = off (raw values logged anyway)
+        self._reward_kick_pitch_target_w = float(env_config.get("reward_kick_pitch_target_w", 0.0))
+        self._reward_kick_pitch_target_dense_w = float(env_config.get("reward_kick_pitch_target_dense_w", 0.0))
+        self._kick_pitch_target_deg = float(env_config.get("kick_pitch_target_deg", -15.0))
+        self._kick_pitch_target_sigma_deg = float(env_config.get("kick_pitch_target_sigma_deg", 20.0))
+        # arm-speed penalty (aux stream, doc 25, goal M12): mean over the arm joints of max(|qd| - tol, 0)^2;
+        # tol 1.0 rad/s leaves the dataset's own arm motion (RMS 0.78 walking) free. 0 = off
+        self._reward_arm_vel_w = float(env_config.get("reward_arm_vel_w", 0.0))
+        # torque-saturation penalty (aux stream, doc 25 goal M7): mean over the joints of max(|tau|/limit - frac, 0)^2,
+        # tau = the applied (clipped) drive torque. k73b on the firmware limits sits >= 95% of the hip-pitch/knee
+        # limit ~30% of the steps. 0 = off; the raw value and the >=95% fraction are logged anyway.
+        self._reward_torque_sat_w = float(env_config.get("reward_torque_sat_w", 0.0))
+        self._torque_sat_frac = float(env_config.get("torque_sat_frac", 0.9))
+        # optional joint subset for the penalty, by body name (doc 25, M7: the saturation sits on the hip pitch;
+        # the mean over all 23 joints dilutes it ~11x). None = all joints (the k79b..k81 behaviour)
+        self._torque_sat_dof_bodies = env_config.get("torque_sat_dof_bodies", None)
+        self._arm_vel_tol = float(env_config.get("arm_vel_tol", 1.0))
+        self._arm_vel_dof_bodies = list(env_config.get("arm_vel_dof_bodies", [
+            "left_shoulder_pitch_link", "left_shoulder_roll_link", "left_elbow_pitch_link", "left_elbow_yaw_link",
+            "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_elbow_pitch_link", "right_elbow_yaw_link"]))
         # dense version (task stream): while a still ball is within kick_side_swing_dist of the nearest foot,
         # pay side * min(foot speed, kick_side_swing_speed) / kick_side_swing_speed, with side = |sin| of the
         # angle between the foot's horizontal long axis and its horizontal velocity (the inside of the foot
@@ -576,11 +661,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         char_id = self._get_char_id()
         self._engine.scale_obj_masses(env_id, char_id, params["mass_scales"], params["com_offsets"])
         foot_ids = [self._engine.find_obj_body_id(char_id, n) for n in self._dr_foot_bodies]
-        self._engine.set_obj_shape_props(env_id, char_id,
-                                         friction=params["foot_friction"],
-                                         restitution=params["foot_restitution"],
-                                         compliance=params["foot_compliance"],
-                                         body_ids=foot_ids)
+        if ("foot_props_per_foot" in params):
+            for foot_id, (fr, co, re) in zip(foot_ids, params["foot_props_per_foot"]):
+                self._engine.set_obj_shape_props(env_id, char_id, friction=fr, restitution=re,
+                                                 compliance=co, body_ids=[foot_id])
+        else:
+            self._engine.set_obj_shape_props(env_id, char_id,
+                                             friction=params["foot_friction"],
+                                             restitution=params["foot_restitution"],
+                                             compliance=params["foot_compliance"],
+                                             body_ids=foot_ids)
 
     def _apply_dr_motors(self):
         char_id = self._get_char_id()
@@ -690,6 +780,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             num_dofs = self._engine.get_obj_num_dofs(char_id)
             params = steering_dr.sample_env_params(self._get_dr_rng(), self._dr_ranges,
                                                    num_bodies, num_dofs)
+            if (self._dr_foot_props_per_foot):
+                # one draw per foot, Booster order (friction, compliance, restitution), after the env draw
+                rng = self._get_dr_rng()
+                params["foot_props_per_foot"] = [
+                    (float(rng.uniform(*self._dr_ranges["foot_friction"])),
+                     float(rng.uniform(*self._dr_ranges["foot_compliance"])),
+                     float(rng.uniform(*self._dr_ranges["foot_restitution"])))
+                    for _ in self._dr_foot_bodies]
             self._dr_samples.append(params)
             if (self._dr_static_deferred):
                 # gated run: the draw happens now (same RNG order), the sim props change when the DR gate opens
@@ -787,6 +885,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         # aux-stream state
         self._aux_reward_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._style_gain_buf = torch.ones([num_envs], device=self._device, dtype=torch.float)
+        self._kick_near_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._prev_root_vel = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._stagnation_anchor_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._stagnation_anchor_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -822,6 +922,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_speed = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._kick_pending_r = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._kick_pending_t = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._prev_foot_pos = None  # [N, feet, 3], [N, feet, 4], [N, feet, 3]; set on reset
+        self._prev_foot_rot = None
+        self._prev_foot_vel = None
         self._ep_peak_ball_speed = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._ep_peak_ball_angle = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._ep_min_foot_dist = torch.full([num_envs], 10.0, device=self._device, dtype=torch.float)
@@ -841,6 +944,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
+        self._world_step = 0
+        self._push_active = False
+        self._push_force_b = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
+        self._push_torque_b = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._action_rate_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
         # measurable-frame history (Frente F): 6 proprio + 3 * D + 12 task
@@ -874,6 +981,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             device=self._device, dtype=torch.long)
         self._arm_pose_target = torch.tensor(self._arm_pose_target_cfg, device=self._device,
                                              dtype=torch.float)
+        self._torque_lim = torch.as_tensor(self._engine.get_obj_torque_limits(0, self._get_char_id()),
+                                           device=self._device, dtype=torch.float).clamp_min(1e-3)
+        self._torque_sat_dof_ids = None
+        if (self._torque_sat_dof_bodies is not None):
+            self._torque_sat_dof_ids = torch.tensor(
+                steering_util.build_dof_group_ids(self._kin_char_model, list(self._torque_sat_dof_bodies)),
+                device=self._device, dtype=torch.long)
+        self._arm_vel_dof_ids = torch.tensor(
+            steering_util.build_dof_group_ids(self._kin_char_model, self._arm_vel_dof_bodies),
+            device=self._device, dtype=torch.long)
         self._knee_dof_ids = torch.tensor(
             steering_util.build_dof_group_ids(self._kin_char_model, self._knee_dof_bodies),
             device=self._device, dtype=torch.long)
@@ -894,6 +1011,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._randomize_env_props(env_id, self._ball_id)
         if (self._dr_enabled):
             self._apply_dr_runtime()
+        if (self._fixed_action_delay_ms is not None):
+            assert not self._dr_enabled, "fixed_action_delay_ms is for runs without domain_randomization"
+            blend = steering_dr.substep_action_blend(float(self._fixed_action_delay_ms),
+                                                     self._engine.get_num_sim_steps(),
+                                                     self._engine.get_timestep())
+            self._engine.set_action_delay(np.tile(blend[None, :], [num_envs, 1]))
 
         self._foot_body_ids = self._build_body_ids_tensor(self._kick_feet_bodies)
         if (self._percep_fov_body != ""):
@@ -1035,6 +1158,57 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._head_act_rate_buf[:] = torch.where(first, zero, head)
         self._leg_act_rate_buf[:] = torch.where(first, zero, leg)
         self._prev_action[:] = actions
+        if (self._push_interval_s > 0.0):
+            self._apply_world_push()
+        return
+
+    def _world_perturb_on(self):
+        return self._switch_on(self._char_push_start_samples)
+
+    def _apply_world_push(self):
+        """The held push, base frame -> world with this step's base rotation (Booster applies it in LOCAL_SPACE).
+        Re-issued every control step; one explicit zero when the push ends (Isaac Lab keeps a wrench)."""
+        char_id = self._get_char_id()
+        if (self._push_active):
+            rot = self._engine.get_root_rot(char_id)
+            f = torch_util.quat_rotate(rot, self._push_force_b) * self._push_impulse_scale
+            t = torch_util.quat_rotate(rot, self._push_torque_b) * self._push_impulse_scale
+            self._engine.set_body_wrench(None, char_id, 0, f, t)
+        return
+
+    def _every(self, interval_s):
+        return max(1, int(round(interval_s / self._engine.get_timestep())))
+
+    def _update_world_perturbations(self):
+        """Booster Gym's post-step block: counter += 1, kick, push (Olives' task_steering_meas_env)."""
+        self._world_step += 1
+        # diag keys every step (the logger fixes its columns on the first iteration)
+        on = self._world_perturb_on()
+        kick_now = on and self._kick_interval_s > 0.0 and self._world_step % self._every(self._kick_interval_s) == 0
+        self._diag.add_mean("world_kick_rate", torch.tensor(float(kick_now), device=self._device))
+        self._diag.add_mean("world_push_force_n", torch.linalg.norm(self._push_force_b, dim=-1)
+                            * (self._push_impulse_scale if self._push_active else 0.0))
+        if (not on):
+            return
+        char_id = self._get_char_id()
+        if (kick_now):
+            vel = self._engine.get_root_vel(char_id)
+            ang = self._engine.get_root_ang_vel(char_id)
+            self._engine.set_root_vel(None, char_id, vel + self._kick_lin_vel_std * torch.randn_like(vel))
+            self._engine.set_root_ang_vel(None, char_id, ang + self._kick_ang_vel_std * torch.randn_like(ang))
+        if (self._push_interval_s > 0.0):
+            k = self._world_step % self._every(self._push_interval_s)
+            if (k == 0):
+                self._push_force_b.normal_(0.0, self._push_force_std)
+                self._push_torque_b.normal_(0.0, self._push_torque_std)
+                self._push_active = True
+            elif (k == self._every(self._push_duration_s) and self._push_active):
+                self._push_force_b.zero_()
+                self._push_torque_b.zero_()
+                self._push_active = False
+                char_id = self._get_char_id()
+                z = torch.zeros([self.get_num_envs(), 3], device=self._device)
+                self._engine.set_body_wrench(None, char_id, 0, z, z)
         return
 
     def _record_prev_states(self):
@@ -1209,6 +1383,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # 4. random ball perturbations + robot pushes
         self._update_ball_perturb()
         self._update_char_push()
+        if (self._kick_interval_s > 0.0 or self._push_interval_s > 0.0):
+            self._update_world_perturbations()
         self._update_goal_odom()
         if (self._virtual_perception):
             self._update_perception()
@@ -1476,6 +1652,26 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._kick_side_foot_mix != 0.0):
             kick_contact_r = kick_contact_r * ((1.0 - self._kick_side_foot_mix)
                                                + self._kick_side_foot_mix * side)
+        pitch_deg = self._nearest_foot_pitch_deg(ball_pos)
+        if (self._prev_foot_pos is None):
+            self._store_prev_foot_state(torch.arange(ball_pos.shape[0], device=self._device))
+        chapa_score, chapa_side, prev_pitch = self._prev_foot_chapa(ball_pos)
+        excess = torch.clamp_min(torch.abs(pitch_deg) - self._kick_pitch_tol_deg, 0.0)
+        # the foot rotates ~35 deg inside the contact step (doc 25, M13): gate on the step before it
+        gate_pitch = prev_pitch if self._kick_pitch_gate_prev else pitch_deg
+        excess_gate = torch.clamp_min(torch.abs(gate_pitch) - self._kick_pitch_tol_deg, 0.0)
+        pitch_gate = torch.exp(-torch.square(excess_gate / self._kick_pitch_sigma_deg))
+        if (self._kick_pitch_mix != 0.0):
+            kick_contact_r = kick_contact_r * ((1.0 - self._kick_pitch_mix) + self._kick_pitch_mix * pitch_gate)
+        aim_gate = self._kick_aim_gate(ball_pos, ball_vel, ball_speed)
+        if (self._kick_aim_mix != 0.0):
+            kick_contact_r = kick_contact_r * ((1.0 - self._kick_aim_mix) + self._kick_aim_mix * aim_gate)
+        pitch_near = torch.logical_and(foot_d < self._kick_pitch_dense_dist, kick_still).float()
+        pitch_dense_r = pitch_near * excess / 45.0
+        chapa_r = kick_event.float() * chapa_score
+        sig = self._kick_pitch_target_sigma_deg
+        ptarget_r = kick_event.float() * torch.exp(-torch.square((prev_pitch - self._kick_pitch_target_deg) / sig))
+        ptarget_dense_r = pitch_near * torch.exp(-torch.square((pitch_deg - self._kick_pitch_target_deg) / sig))
         if (self._kick_contact_hold_steps > 0):
             new = torch.logical_and(kick_event, self._kick_pending_t == 0)
             self._kick_pending_r = torch.where(new, kick_contact_r, self._kick_pending_r)
@@ -1506,6 +1702,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._update_kick_diag(ball_pos, ball_vel, ball_speed, foot_d)
         self._prev_foot_ball_dist[:] = foot_d
         self._prev_ball_speed[:] = ball_speed
+        self._store_prev_foot_state(None)
 
         # on the goal step the ball crosses past the potential's minimum, so
         # the shaping terms would fire a large negative spike that cancels the
@@ -1521,7 +1718,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                    + self._reward_foot_ball_w * foot_ball_r
                                                    + self._reward_kick_contact_w * kick_contact_r
                                                    + self._reward_kick_overspeed_w * overspeed_r
-                                                   + self._reward_kick_side_swing_w * swing_r) \
+                                                   + self._reward_kick_side_swing_w * swing_r
+                                                   + self._reward_kick_pitch_dense_w * pitch_dense_r
+                                                   + self._reward_kick_chapa_w * chapa_r
+                                                   + self._reward_kick_pitch_target_w * ptarget_r
+                                                   + self._reward_kick_pitch_target_dense_w * ptarget_dense_r) \
             + self._reward_goal_scored_w * goal_r \
             + self._reward_ball_oob_w * self._ball_oob_buf.float()
 
@@ -1551,7 +1752,104 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             d.add_mean("ground_tile_lift", self._ground_z_offset_env)
         d.add_sum("kick_events", kick_event.float())
         d.add_sum("kick_side_sum", kick_event.float() * side)
+        # pitch of the nearest foot at kick events (diagnostic whether or not the gate is on)
+        # per-step means (episode logs have no sums): events/step and, among them, the pitch statistics
+        d.add_mean("kick_event_rate", kick_event.float())
+        d.add_mean("kick_pitch_abs_deg_x_event", kick_event.float() * torch.abs(pitch_deg))
+        d.add_mean("kick_pitch_ok_x_event", kick_event.float() * (torch.abs(pitch_deg) <= self._kick_pitch_tol_deg).float())
+        d.add_mean("kick_pitch_gate_x_event", kick_event.float() * pitch_gate)
+        d.add_mean("kick_aim_g_x_event", kick_event.float() * aim_gate)
+        d.add_mean("kick_pitch_near_frac", pitch_near)
+        d.add_mean("kick_pitch_dense_raw", pitch_dense_r)
+        d.add_mean("reward_kick_pitch_dense", shaping_mask * self._reward_kick_pitch_dense_w * pitch_dense_r)
+        d.add_mean("kick_chapa_side_x_event", kick_event.float() * chapa_side)
+        d.add_mean("kick_pitch_prev_abs_x_event", kick_event.float() * torch.abs(prev_pitch))
+        d.add_mean("kick_chapa_x_event", chapa_r)
+        d.add_mean("reward_kick_chapa", shaping_mask * self._reward_kick_chapa_w * chapa_r)
+        d.add_mean("kick_pitch_target_x_event", ptarget_r)
+        d.add_mean("kick_pitch_target_dense_raw", ptarget_dense_r)
+        d.add_mean("reward_kick_pitch_target", shaping_mask * self._reward_kick_pitch_target_w * ptarget_r)
+        d.add_mean("reward_kick_pitch_target_dense",
+                   shaping_mask * self._reward_kick_pitch_target_dense_w * ptarget_dense_r)
         return
+
+    def _store_prev_foot_state(self, env_ids):
+        char_id = self._get_char_id()
+        pos = self._engine.get_body_pos(char_id)[:, self._foot_body_ids, :]
+        rot = self._engine.get_body_rot(char_id)[:, self._foot_body_ids, :]
+        vel = self._engine.get_body_vel(char_id)[:, self._foot_body_ids, 0:3]
+        if (self._prev_foot_pos is None):
+            self._prev_foot_pos = pos.clone()
+            self._prev_foot_rot = rot.clone()
+            self._prev_foot_vel = vel.clone()
+        elif (env_ids is None):
+            self._prev_foot_pos[:] = pos
+            self._prev_foot_rot[:] = rot
+            self._prev_foot_vel[:] = vel
+        else:
+            self._prev_foot_pos[env_ids] = pos[env_ids]
+            self._prev_foot_rot[env_ids] = rot[env_ids]
+            self._prev_foot_vel[env_ids] = 0.0
+        return
+
+    def _prev_foot_chapa(self, ball_pos):
+        """(chapa score, |sin| foot velocity vs foot long axis, pitch deg) of the foot nearest the ball,
+        all from the previous step's foot state."""
+        d = torch.linalg.norm(self._prev_foot_pos - ball_pos.unsqueeze(1), dim=-1)
+        nearest = d.argmin(dim=1)
+        idx = torch.arange(nearest.shape[0], device=nearest.device)
+        rot = self._prev_foot_rot[idx, nearest]
+        vel = self._prev_foot_vel[idx, nearest][:, 0:2]
+        axis = torch_util.quat_rotate(rot, torch.tensor([1.0, 0.0, 0.0], device=rot.device).expand(rot.shape[0], 3))
+        pitch = torch.rad2deg(torch.asin(torch.clamp(axis[:, 2], -1.0, 1.0)))
+        ah = axis[:, 0:2] / torch.clamp(torch.linalg.norm(axis[:, 0:2], dim=-1, keepdim=True), min=1e-6)
+        vh = vel / torch.clamp(torch.linalg.norm(vel, dim=-1, keepdim=True), min=1e-6)
+        cos = torch.sum(ah * vh, dim=-1).abs().clamp(max=1.0)
+        side = torch.sqrt(1.0 - cos * cos)
+        excess = torch.clamp_min(torch.abs(pitch) - self._kick_pitch_tol_deg, 0.0)
+        gate = torch.exp(-torch.square(excess / self._kick_pitch_sigma_deg))
+        return side * gate, side, pitch
+
+    def fetch_kick_disc_obs_demo(self, num_samples):
+        """Disc obs of the dataset kick clips around the strike (doc 25 C(c))."""
+        if (self._kick_disc_ids is None):
+            lib = self._motion_lib
+            ids, peaks = [], []
+            for m in range(lib.get_num_motions()):
+                name = os.path.basename(lib.get_motion_file(m))
+                if (name in self._kick_disc_peak_frames):
+                    ids.append(m)
+                    peaks.append(float(self._kick_disc_peak_frames[name]) / float(lib._motion_fps[m]))
+            assert len(ids) == len(self._kick_disc_peak_frames), "kick_disc_peak_frames clips missing from the dataset"
+            self._kick_disc_ids = torch.tensor(ids, device=self._device, dtype=torch.long)
+            self._kick_disc_peaks = torch.tensor(peaks, device=self._device, dtype=torch.float)
+        k = torch.randint(0, len(self._kick_disc_ids), [num_samples], device=self._device)
+        motion_ids = self._kick_disc_ids[k]
+        t = self._kick_disc_peaks[k] + (torch.rand(num_samples, device=self._device)
+                                        * (self._kick_disc_pre_s + self._kick_disc_post_s) - self._kick_disc_pre_s)
+        t = torch.minimum(torch.clamp_min(t, 0.0), self._motion_lib.get_motion_length(motion_ids))
+        return self._compute_disc_obs_demo(motion_ids, t)
+
+    def _nearest_foot_pitch_deg(self, ball_pos):
+        """Pitch (deg) of the nearest foot's long (x) axis above the horizontal; negative = toe down."""
+        char_id = self._get_char_id()
+        body_pos = self._engine.get_body_pos(char_id)[:, self._foot_body_ids, :]
+        body_rot = self._engine.get_body_rot(char_id)[:, self._foot_body_ids, :]
+        nearest = torch.linalg.norm(body_pos - ball_pos.unsqueeze(1), dim=-1).argmin(dim=1)
+        idx = torch.arange(nearest.shape[0], device=nearest.device)
+        rot = body_rot[idx, nearest]
+        axis = torch_util.quat_rotate(rot, torch.tensor([1.0, 0.0, 0.0], device=rot.device).expand(rot.shape[0], 3))
+        return torch.rad2deg(torch.asin(torch.clamp(axis[:, 2], -1.0, 1.0)))
+
+    def _kick_aim_gate(self, ball_pos, ball_vel, ball_speed):
+        """exp(-(excess / sigma)^2) of the ball launch direction outside the goal's angular half-width, in [0, 1]."""
+        to_goal = self._goal_pos - ball_pos[:, 0:2]
+        d_goal = torch.clamp(torch.linalg.norm(to_goal, dim=-1), min=1e-6)
+        cos = torch.sum(ball_vel[:, 0:2] * to_goal, dim=-1) / (torch.clamp(ball_speed, min=1e-6) * d_goal)
+        err = torch.rad2deg(torch.acos(cos.clamp(-1.0, 1.0)))
+        half = torch.rad2deg(torch.atan(torch.clamp_min(torch.full_like(d_goal, 0.5 * self._goal_width - self._kick_aim_margin), 0.05) / d_goal))
+        excess = torch.clamp_min(err - half, 0.0)
+        return torch.exp(-torch.square(excess / self._kick_aim_sigma_deg))
 
     def _kick_side_factor(self, ball_pos, ball_vel, ball_speed):
         """|sin| of the angle between the nearest foot's horizontal x axis and the ball velocity, in [0, 1]."""
@@ -1637,6 +1935,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                               self._goal_pos, contact,
                                                               self._kick_alignment_power)
         aux_r += kick_side_r + kick_fwd_r + kick_align_r
+        foot_ball_d = torch.stack([torch.linalg.norm(body_pos[:, f, :] - ball_pos, dim=-1)
+                                   for f in self._foot_body_ids], dim=-1).min(dim=-1).values
+        style_near = (foot_ball_d < self._style_near_ball_dist).float()
+        self._style_gain_buf[:] = 1.0 + (self._style_near_ball_gain - 1.0) * style_near
+        self._kick_near_buf[:] = style_near
+        self._diag.add_mean("style_near_ball_frac", style_near)
 
         # regularizations
         left_foot_pos = body_pos[:, self._foot_body_ids[0], :]
@@ -1689,7 +1993,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             aux_r += self._reward_collision_w * collision
 
         dof_pos = self._engine.get_dof_pos(char_id)
-        joint_limit = soccer_util.compute_joint_limit_penalty(dof_pos, self._dof_limits_low,
+        joint_limit = soccer_util.compute_joint_limit_penalty(
+            self._prev_action if self._joint_limit_on_action else dof_pos, self._dof_limits_low,
                                                               self._dof_limits_high)
         aux_r += self._reward_joint_limit_w * joint_limit
         if (self._reward_knee_bend_w != 0.0):
@@ -1707,6 +2012,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 dof_pos, self._arm_dof_ids, self._arm_pose_target, self._arm_pose_tol)
             aux_r += self._reward_arm_pose_w * arm
             self._diag.add_mean("reward_arm_pose", self._reward_arm_pose_w * arm)
+        # arm speed: raw diagnostics always (smoke before the weight is raised), penalty only with the weight on
+        arm_qd = self._engine.get_dof_vel(char_id).index_select(-1, self._arm_vel_dof_ids)
+        arm_vel_pen = torch.mean(torch.square(torch.clamp_min(torch.abs(arm_qd) - self._arm_vel_tol, 0.0)), dim=-1)
+        self._diag.add_mean("arm_speed_rms", torch.sqrt(torch.mean(torch.square(arm_qd), dim=-1)))
+        self._diag.add_mean("arm_vel_pen_raw", arm_vel_pen)
+        tau_ratio = torch.abs(self._engine.get_dof_forces(char_id)) / self._torque_lim
+        self._diag.add_mean("torque_sat95_frac", torch.mean((tau_ratio >= 0.95).float(), dim=-1))
+        if (self._torque_sat_dof_ids is not None):
+            tau_ratio = tau_ratio.index_select(-1, self._torque_sat_dof_ids)
+            self._diag.add_mean("torque_sat95_sel_frac", torch.mean((tau_ratio >= 0.95).float(), dim=-1))
+        torque_sat_pen = torch.mean(torch.square(torch.clamp_min(tau_ratio - self._torque_sat_frac, 0.0)), dim=-1)
+        self._diag.add_mean("torque_sat_pen_raw", torque_sat_pen)
+        if (self._reward_torque_sat_w != 0.0):
+            aux_r += self._reward_torque_sat_w * torque_sat_pen
+            self._diag.add_mean("reward_torque_sat", self._reward_torque_sat_w * torque_sat_pen)
+        if (self._reward_arm_vel_w != 0.0):
+            aux_r += self._reward_arm_vel_w * arm_vel_pen
+            self._diag.add_mean("reward_arm_vel", self._reward_arm_vel_w * arm_vel_pen)
         if (self._reward_torso_lean_w != 0.0):
             lean = near_scale * soccer_util.compute_torso_lean_penalty(
                 self._engine.get_root_rot(char_id), self._torso_lean_max)
@@ -1827,6 +2150,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
         self._info["aux_reward"] = self._aux_reward_buf
+        self._info["style_gain"] = self._style_gain_buf
+        self._info["kick_near"] = self._kick_near_buf
         if (self.has_critic_obs()):
             # asymmetric critic (paper Table 2): the critic trains on the
             # TRUE ball state while the actor only ever sees the perceived
@@ -2088,7 +2413,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._action_rate_buf[env_ids] = 0.0
             self._head_act_rate_buf[env_ids] = 0.0
             self._leg_act_rate_buf[env_ids] = 0.0
-            if (self._dr_enabled):
+            if (self._dr_enabled or self._fixed_action_delay_ms is not None):
                 self._engine.reset_action_delay(env_ids)
             self._prev_action[env_ids] = 0.0
             self._prev_ball_touch[env_ids] = False
@@ -2132,10 +2457,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         n = len(env_ids)
         char_id = self._get_char_id()
         root_pos = self._init_root_pos.unsqueeze(0).repeat(n, 1)
+        if (self._stand_start_root_z is not None):
+            root_pos[:, 2] = self._stand_start_root_z
         root_pos[:, 0:2] = self._field_offset[env_ids]
         root_pos[:, 2] += self._ground_z(env_ids)
         root_rot = self._init_root_rot.unsqueeze(0).repeat(n, 1)
-        dof_pos = self._init_dof_pos.unsqueeze(0).repeat(n, 1)
+        init_dof = self._init_dof_pos if self._stand_start_dof_pos is None else self._stand_start_dof_pos
+        dof_pos = init_dof.unsqueeze(0).repeat(n, 1)
         zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)
         self._engine.set_root_pos(env_ids, char_id, root_pos)
         self._engine.set_root_rot(env_ids, char_id, root_rot)
@@ -2261,14 +2589,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (m > 0):
                 zero_vel = torch.zeros([m, 3], device=self._device, dtype=torch.float)
                 s_pos = root_pos[stand].clone()
-                s_pos[:, 2] = self._init_root_pos[2] + self._ground_z(sid)
+                s_z = self._init_root_pos[2] if self._stand_start_root_z is None else self._stand_start_root_z
+                s_pos[:, 2] = s_z + self._ground_z(sid)
                 s_rot = torch_util.quat_mul(rand_rot[stand],
                                             self._init_root_rot.unsqueeze(0).repeat(m, 1))
                 self._engine.set_root_pos(sid, char_id, s_pos)
                 self._engine.set_root_rot(sid, char_id, s_rot)
                 self._engine.set_root_vel(sid, char_id, zero_vel)
                 self._engine.set_root_ang_vel(sid, char_id, zero_vel)
-                self._engine.set_dof_pos(sid, char_id, self._init_dof_pos.unsqueeze(0).repeat(m, 1))
+                s_dof = self._init_dof_pos if self._stand_start_dof_pos is None else self._stand_start_dof_pos
+                self._engine.set_dof_pos(sid, char_id, s_dof.unsqueeze(0).repeat(m, 1))
                 self._engine.set_dof_vel(sid, char_id, 0.0)
                 self._engine.set_body_vel(sid, char_id, 0.0)
                 self._engine.set_body_ang_vel(sid, char_id, 0.0)
@@ -2288,6 +2618,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         body_pos = self._engine.get_body_pos(self._get_char_id())[env_ids]
         d = torch.linalg.norm(body_pos[:, self._foot_body_ids, :] - ball_pos.unsqueeze(1), dim=-1)
         self._prev_foot_ball_dist[env_ids] = d.min(dim=1).values
+        if (self._prev_foot_pos is not None):
+            self._store_prev_foot_state(env_ids)
         self._prev_ball_speed[env_ids] = 0.0
         self._kick_pending_r[env_ids] = 0.0
         self._kick_pending_t[env_ids] = 0

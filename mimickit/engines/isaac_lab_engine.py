@@ -508,6 +508,19 @@ class IsaacLabEngine(engine.Engine):
             obj.data.body_link_vel_w[env_id, :, 3:] = body_ang_vel
         return
     
+    def set_body_wrench(self, env_id, obj_id, body_id, forces, torques):
+        """World-frame force AND torque on one body (set_body_forces writes zero torque). Isaac Lab keeps the
+        wrench until it is overwritten, so a caller ending a push must write zeros (task_soccer_env does)."""
+        obj = self._objs[obj_id]
+        if (self.get_obj_type(obj_id) == engine.ObjType.articulated):
+            forces = forces.unsqueeze(-2)
+            torques = torques.unsqueeze(-2)
+        # 1-D body ids: a 0-d index tensor breaks warp.from_torch inside Isaac Lab
+        sim_body_id = torch.as_tensor(self._body_order_sim2common[obj_id][body_id]).reshape(-1)
+        obj.set_external_force_and_torque(forces=forces, torques=torques, positions=None,
+                                          env_ids=env_id, body_ids=sim_body_id, is_global=True)
+        return
+
     def set_body_forces(self, env_id, obj_id, body_id, forces):
         if (env_id is None or len(env_id) > 0):
             assert(len(forces.shape) == 2)

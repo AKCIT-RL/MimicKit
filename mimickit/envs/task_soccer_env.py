@@ -474,6 +474,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # True: penalize the ball speed itself while a foot is near (the gain per step misses a hit that
         # spreads over several control steps); False: per-step gain (k5 behaviour)
         self._kick_overspeed_use_speed = bool(env_config.get("kick_overspeed_use_speed", False))
+        # impulsive kick (user 2026-10-21 "chapa mais forte, menos empurrao"): at a kick event pays
+        # aim_gate * min(gain, kick_impulse_cap)^2, convex in the one-step ball-speed gain, so one sharp
+        # strike pays more than the same speed added over several pushing steps; 0 = off
+        self._reward_kick_impulse_w = float(env_config.get("reward_kick_impulse_w", 0.0))
+        self._kick_impulse_cap = float(env_config.get("kick_impulse_cap", 8.0))  # m/s
         # inside-foot (side-foot) kick: the contact bonus is scaled by (1 - mix) + mix * side, with
         # side = |sin| of the angle between the nearest foot's horizontal long axis and the ball launch
         # direction (0 = toe poke, 1 = inside of the foot); 0 = off, the bonus is unchanged
@@ -491,6 +496,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_aim_mix = float(env_config.get("kick_aim_mix", 0.0))
         self._kick_aim_margin = float(env_config.get("kick_aim_margin", 0.3))
         self._kick_aim_sigma_deg = float(env_config.get("kick_aim_sigma_deg", 3.0))
+        # the positive kick-style terms (pitch target, toe out, contact side) pay only for an aimed launch
+        self._kick_style_aim_mix = float(env_config.get("kick_style_aim_mix", 0.0))
         self._kick_pitch_sigma_deg = float(env_config.get("kick_pitch_sigma_deg", 25.0))
         self._kick_pitch_gate_prev = bool(env_config.get("kick_pitch_gate_prev", False))
         # dense foot-pitch shaping (doc 25, M13): the gate above only acts at the kick step and the k74T
@@ -522,6 +529,32 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_kick_pitch_target_dense_w = float(env_config.get("reward_kick_pitch_target_dense_w", 0.0))
         self._kick_pitch_target_deg = float(env_config.get("kick_pitch_target_deg", -15.0))
         self._kick_pitch_target_sigma_deg = float(env_config.get("kick_pitch_target_sigma_deg", 20.0))
+        # doc 25 M13 (2026-10-19): kick like the dataset clips, no toe poke. From the previous step's nearest foot
+        # and ball, at kick events: toe-face indicator (the point of the foot collision box nearest the ball centre
+        # lies on the front face, MuJoCo foot_face rule) and toe-out g = exp(-((toe_out - target) / sigma)^2), toe_out = foot yaw - root
+        # heading, outward positive (dataset kicks +9..+38, ~+20 deg; scripts/lab/kick_foot_profile.py). The dense
+        # term pays g of the nearest foot every step it is within kick_pitch_dense_dist of a still ball. 0 = off
+        self._reward_kick_toe_face_w = float(env_config.get("reward_kick_toe_face_w", 0.0))
+        self._reward_kick_toe_out_w = float(env_config.get("reward_kick_toe_out_w", 0.0))
+        self._reward_kick_toe_out_dense_w = float(env_config.get("reward_kick_toe_out_dense_w", 0.0))
+        self._kick_toe_out_target_deg = float(env_config.get("kick_toe_out_target_deg", 20.0))
+        self._kick_toe_out_sigma_deg = float(env_config.get("kick_toe_out_sigma_deg", 12.0))
+        # strike direction (doc 25 M13, 2026-10-19): at kick events, |cos| between the nearest foot's previous-step
+        # horizontal velocity and its long axis; the dataset strikes at median 0.85 (0.53..1.0; 1.0 = straight
+        # along the foot = toe poke). Pays exp(-((|cos| - target) / sigma)^2). 0 = off
+        self._reward_kick_dir_w = float(env_config.get("reward_kick_dir_w", 0.0))
+        self._kick_dir_cos_target = float(env_config.get("kick_dir_cos_target", 0.85))
+        self._kick_dir_cos_sigma = float(env_config.get("kick_dir_cos_sigma", 0.15))
+        # contact side (doc 25 M13): the k85b already strikes at the dataset |cos| (0.85, k90s smoke) and still
+        # pokes with the toe (84%), so the face comes from where the ball sits on the foot. medial = cosine between
+        # the horizontal foot -> ball direction (foot frame, from the box centre) and the foot's inner side axis,
+        # clamped at 0 (1 = ball on the inner side, chapa; 0 = ahead of the toe or outside). Event term at kick
+        # events (previous step), dense term every step within kick_pitch_dense_dist of a still ball. 0 = off
+        self._reward_kick_medial_w = float(env_config.get("reward_kick_medial_w", 0.0))
+        self._reward_kick_medial_dense_w = float(env_config.get("reward_kick_medial_dense_w", 0.0))
+        # ankle_roll_link collision box of data/assets/t1_deploy/t1.xml (centre, half sizes; foot frame)
+        self._kick_foot_box_center = list(env_config.get("kick_foot_box_center", [0.0101079, 0.0, -0.0214208]))
+        self._kick_foot_box_half = list(env_config.get("kick_foot_box_half", [0.112434, 0.05, 0.02183]))
         # arm-speed penalty (aux stream, doc 25, goal M12): mean over the arm joints of max(|qd| - tol, 0)^2;
         # tol 1.0 rad/s leaves the dataset's own arm motion (RMS 0.78 walking) free. 0 = off
         self._reward_arm_vel_w = float(env_config.get("reward_arm_vel_w", 0.0))
@@ -1656,6 +1689,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._prev_foot_pos is None):
             self._store_prev_foot_state(torch.arange(ball_pos.shape[0], device=self._device))
         chapa_score, chapa_side, prev_pitch = self._prev_foot_chapa(ball_pos)
+        heading = torch_util.calc_heading(self._engine.get_root_rot(char_id))
+        toe_face, toe_out, medial = self._foot_strike(self._prev_foot_pos, self._prev_foot_rot, self._prev_ball_pos,
+                                                      heading)
+        char_body_pos = self._engine.get_body_pos(char_id)[:, self._foot_body_ids, :]
+        char_body_rot = self._engine.get_body_rot(char_id)[:, self._foot_body_ids, :]
+        _, toe_out_now, medial_now = self._foot_strike(char_body_pos, char_body_rot, ball_pos, heading)
         excess = torch.clamp_min(torch.abs(pitch_deg) - self._kick_pitch_tol_deg, 0.0)
         # the foot rotates ~35 deg inside the contact step (doc 25, M13): gate on the step before it
         gate_pitch = prev_pitch if self._kick_pitch_gate_prev else pitch_deg
@@ -1666,12 +1705,29 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         aim_gate = self._kick_aim_gate(ball_pos, ball_vel, ball_speed)
         if (self._kick_aim_mix != 0.0):
             kick_contact_r = kick_contact_r * ((1.0 - self._kick_aim_mix) + self._kick_aim_mix * aim_gate)
+        impulse_r = torch.zeros_like(kick_contact_r)
+        if (self._reward_kick_impulse_w != 0.0):
+            impulse_r = kick_event.float() * aim_gate * torch.clamp(gain, min=0.0, max=self._kick_impulse_cap) ** 2
         pitch_near = torch.logical_and(foot_d < self._kick_pitch_dense_dist, kick_still).float()
         pitch_dense_r = pitch_near * excess / 45.0
         chapa_r = kick_event.float() * chapa_score
         sig = self._kick_pitch_target_sigma_deg
         ptarget_r = kick_event.float() * torch.exp(-torch.square((prev_pitch - self._kick_pitch_target_deg) / sig))
         ptarget_dense_r = pitch_near * torch.exp(-torch.square((pitch_deg - self._kick_pitch_target_deg) / sig))
+        tsig = self._kick_toe_out_sigma_deg
+        toe_face_r = kick_event.float() * toe_face
+        toe_out_r = kick_event.float() * torch.exp(-torch.square((toe_out - self._kick_toe_out_target_deg) / tsig))
+        toe_out_dense_r = pitch_near * torch.exp(-torch.square((toe_out_now - self._kick_toe_out_target_deg) / tsig))
+        medial_r = kick_event.float() * medial
+        medial_dense_r = pitch_near * medial_now
+        if (self._kick_style_aim_mix != 0.0):
+            style_gate = (1.0 - self._kick_style_aim_mix) + self._kick_style_aim_mix * aim_gate
+            ptarget_r = ptarget_r * style_gate
+            toe_out_r = toe_out_r * style_gate
+            medial_r = medial_r * style_gate
+        strike_cos = torch.sqrt(torch.clamp(1.0 - chapa_side * chapa_side, min=0.0))
+        strike_dir_r = kick_event.float() * torch.exp(-torch.square((strike_cos - self._kick_dir_cos_target)
+                                                             / self._kick_dir_cos_sigma))
         if (self._kick_contact_hold_steps > 0):
             new = torch.logical_and(kick_event, self._kick_pending_t == 0)
             self._kick_pending_r = torch.where(new, kick_contact_r, self._kick_pending_r)
@@ -1718,11 +1774,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                    + self._reward_foot_ball_w * foot_ball_r
                                                    + self._reward_kick_contact_w * kick_contact_r
                                                    + self._reward_kick_overspeed_w * overspeed_r
+                                                   + self._reward_kick_impulse_w * impulse_r
                                                    + self._reward_kick_side_swing_w * swing_r
                                                    + self._reward_kick_pitch_dense_w * pitch_dense_r
                                                    + self._reward_kick_chapa_w * chapa_r
                                                    + self._reward_kick_pitch_target_w * ptarget_r
-                                                   + self._reward_kick_pitch_target_dense_w * ptarget_dense_r) \
+                                                   + self._reward_kick_pitch_target_dense_w * ptarget_dense_r
+                                                   + self._reward_kick_toe_face_w * toe_face_r
+                                                   + self._reward_kick_toe_out_w * toe_out_r
+                                                   + self._reward_kick_toe_out_dense_w * toe_out_dense_r
+                                                   + self._reward_kick_dir_w * strike_dir_r
+                                                   + self._reward_kick_medial_w * medial_r
+                                                   + self._reward_kick_medial_dense_w * medial_dense_r) \
             + self._reward_goal_scored_w * goal_r \
             + self._reward_ball_oob_w * self._ball_oob_buf.float()
 
@@ -1739,6 +1802,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("reward_foot_ball", shaping_mask * self._reward_foot_ball_w * foot_ball_r)
         d.add_mean("reward_kick_contact", shaping_mask * self._reward_kick_contact_w * kick_contact_r)
         d.add_mean("reward_kick_overspeed", shaping_mask * self._reward_kick_overspeed_w * overspeed_r)
+        d.add_mean("reward_kick_impulse", shaping_mask * self._reward_kick_impulse_w * impulse_r)
         d.add_mean("reward_kick_side_swing", shaping_mask * self._reward_kick_side_swing_w * swing_r)
         d.add_mean("foot_ball_dist", foot_d)
         d.add_mean("ball_speed", ball_speed)
@@ -1771,7 +1835,50 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("reward_kick_pitch_target", shaping_mask * self._reward_kick_pitch_target_w * ptarget_r)
         d.add_mean("reward_kick_pitch_target_dense",
                    shaping_mask * self._reward_kick_pitch_target_dense_w * ptarget_dense_r)
+        toe_out_ok = torch.logical_and(toe_out >= 9.0, toe_out <= 38.0)
+        pitch_ok = torch.logical_and(prev_pitch >= -30.0, prev_pitch <= 0.0)
+        d.add_mean("kick_toe_face_x_event", toe_face_r)
+        d.add_mean("kick_toe_out_x_event", kick_event.float() * toe_out)
+        d.add_mean("kick_m13_pose_ok_x_event", kick_event.float() * torch.logical_and(toe_out_ok, pitch_ok).float())
+        d.add_mean("kick_toe_out_g_x_event", toe_out_r)
+        d.add_mean("kick_toe_out_dense_raw", toe_out_dense_r)
+        d.add_mean("reward_kick_toe_face", shaping_mask * self._reward_kick_toe_face_w * toe_face_r)
+        d.add_mean("reward_kick_toe_out", shaping_mask * self._reward_kick_toe_out_w * toe_out_r)
+        d.add_mean("reward_kick_toe_out_dense", shaping_mask * self._reward_kick_toe_out_dense_w * toe_out_dense_r)
+        d.add_mean("kick_dir_cos_x_event", kick_event.float() * strike_cos)
+        d.add_mean("kick_dir_g_x_event", strike_dir_r)
+        d.add_mean("reward_kick_dir", shaping_mask * self._reward_kick_dir_w * strike_dir_r)
+        d.add_mean("kick_medial_x_event", medial_r)
+        d.add_mean("kick_medial_dense_raw", medial_dense_r)
+        d.add_mean("reward_kick_medial", shaping_mask * self._reward_kick_medial_w * medial_r)
+        d.add_mean("reward_kick_medial_dense", shaping_mask * self._reward_kick_medial_dense_w * medial_dense_r)
         return
+
+    def _foot_strike(self, foot_pos, foot_rot, ball_pos, heading):
+        """(toe-face indicator, toe-out deg, medial) of the foot nearest the ball: the point of the foot collision box
+        nearest the ball centre lies on the front (+x) face; foot yaw - root heading,
+        outward positive (left foot +, right foot -), as kick_foot_profile.py measures the dataset; medial =
+        max(cos(horizontal box centre -> ball, inner side axis), 0), inner side = -y on the left foot, +y on the right."""
+        if (getattr(self, "_foot_out_sign", None) is None):
+            self._foot_out_sign = torch.tensor([1.0 if "left" in b else -1.0 for b in self._kick_feet_bodies],
+                                               device=self._device)
+            self._foot_box_c = torch.tensor(self._kick_foot_box_center, device=self._device, dtype=torch.float)
+            self._foot_box_h = torch.tensor(self._kick_foot_box_half, device=self._device, dtype=torch.float)
+        nearest = torch.linalg.norm(foot_pos - ball_pos.unsqueeze(1), dim=-1).argmin(dim=1)
+        idx = torch.arange(nearest.shape[0], device=nearest.device)
+        rot, pos = foot_rot[idx, nearest], foot_pos[idx, nearest]
+        r = torch_util.quat_rotate(torch_util.quat_conjugate(rot), ball_pos - pos) - self._foot_box_c
+        # contact point estimate = point of the box nearest the ball centre; its face as scripts/mujoco_soccer_eval.py
+        # foot_face (argmax |p_i| / half_i): the top-front edge where the T1 pokes the ball counts as toe
+        p = torch.maximum(torch.minimum(r, self._foot_box_h), -self._foot_box_h)
+        ax = (torch.abs(p) / self._foot_box_h).argmax(dim=-1)
+        toe = torch.logical_and(ax == 0, p[:, 0] > 0.0).float()
+        axis = torch_util.quat_rotate(rot, torch.tensor([1.0, 0.0, 0.0], device=rot.device).expand(rot.shape[0], 3))
+        dyaw = torch.atan2(axis[:, 1], axis[:, 0]) - heading
+        dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))
+        sign = self._foot_out_sign[nearest]
+        medial = torch.clamp_min(-sign * r[:, 1] / torch.clamp(torch.linalg.norm(r[:, 0:2], dim=-1), min=1e-6), 0.0)
+        return toe, torch.rad2deg(dyaw) * sign, medial
 
     def _store_prev_foot_state(self, env_ids):
         char_id = self._get_char_id()

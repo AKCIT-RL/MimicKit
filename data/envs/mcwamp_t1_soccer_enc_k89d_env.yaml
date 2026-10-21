@@ -1,0 +1,248 @@
+# k89d = k89a with the M13 weights x10 (toe face -1000, toe out 1000): k89a/b/c at ~60M kept the toe contact at 92-98% in MuJoCo (doc 25 sec 4.2); fine-tune of k85b final (~1229M) +100M, terrain.
+# k85b = k83b unchanged (control for k85a) (doc 25, onda 5): fine-tune of k83b final (~1129M) +100M, terrain.
+# k83b = k81b + prev-step pitch gate (mix 1.0, sigma 15) + dense foot-pitch penalty -2500.0 (doc 25, onda 4, M13): k81e at -100 cost ~50 per toe-poke vs ~1160 of goal progress; fine-tune of k81b final (~1029M) +100M, terrain.
+# k81b = k80b + arm pose on all 8 arm joints (elbows added; targets = median p10-p90 center of the dataset clips) tol 0.2 -> 0.15 (M12: k80b range 0.70, elbows 0.8/1.25) (doc 25, onda 3): fine-tune of k80b final (~929M, grid 92.5%, M11 ok, arm RMS 1.00) +100M, terrain.
+# k80b = k79b + soft arm terms: arm pose -2 (tol 0.2) + arm vel -0.25 (M12; k79c at -5/-0.5 cut speed and grid) (doc 25, onda 2): fine-tune of k79b final (~829M, grid 94.8%) +100M, terrain.
+# k79b = k79a + torque saturation -1000 (M7 with the M11 fix; k76d alone: sat 0.37 -> 0.19 but far speed 0.28) (doc 25, onda 1 das metas restantes): fine-tune of k78f750 (k78f iteration 750, ~729M) +100M, terrain. One change vs k78f.
+# k78f: k78c + reward_kick_alignment_w 45 -> 90 (doc 25, M1), fine-tune of k78c (680M, grid 82.0%); control = k78e (same start, k78c env).
+# k78c: k78b + reward_kick_alignment_w 15 -> 45 (doc 25, M1): the sharper alignment term at a weight comparable to the
+# direction-blind contact reward (100 x gain, cap 2).
+# k75b: d0 (control) + reward_kick_chapa_w 100 (isolates the chapa term vs d0). Side-foot score from the foot state of the step BEFORE the kick event (doc 25, M13).
+# k74 (doc 25) = k73a (deploy torque t1_deploy + action delay U(0, 33.3) ms) + the e80tonn1 robustness package (items 1-7 approved
+# 2026-10-16, gait terms excluded by the user): 1 running clips in the dataset + steer_speed_max 2.0 (chase cap), 2 per-foot contact DR,
+# 3 Booster world kicks/pushes, 4 calibrated Table 3/4 regularization (joint limit on the action, head/leg action rate, collision),
+# 5 real floor = the terrain stage k74T (mixture incl. Booster D), 6 mirror 10 and 7 recon_tar_norm (agent k74). From scratch, flat, 480M.
+# New movement terms stay OFF (kick_pitch_mix 0, reward_arm_vel_w 0, reward_kick_sideways_w 0): ablations on top of k74.
+# k73a (doc 25, phase 2) = k72 on the DEPLOY torque asset (data/assets/t1_deploy: T1_23DOF_CFG.effort_limit, knee 60 Nm, hip pitch 45,
+# ankle pitch 24, arms 18) with the action delay widened to U(0, 33.3) ms (Olives doc 17: d33 = 1.7% falls at 30 ms vs 5.6% for 0-20 ms).
+# Same recipe otherwise (stage 5 never opens, strip/core near the goal, overspeed exemption). Used from scratch (k73b) and as the base env
+# of the fine-tune of k72x (k73a1). New reward terms stay OFF here (kick_pitch_mix 0, reward_arm_vel_w 0).
+# k72 = k70 + the three k63/k64 lessons that made k64f (docs/t1/22), from scratch:
+#  1) stage 5 (ball perturbation + 60 s episodes) never opens: gate 4 unreachable (kicked_ep_frac >= 2), as k63a..k64f.
+#     In k62 that stage dropped the kick 77% -> 34-46%; kept in stage 4 the chain reached kick 98%.
+#  2) ball spawns next to the goal (k64e/f): ball_spawn_margin 0.4, strip 0.15 (x >= 4.8, all y) + core 0.15
+#     (x in [5.6, 6.6], |y| <= 1.5). Switched on with stage 2 (ball anywhere) via stage_params, not in the kick-only stage.
+#  3) kick_overspeed_goal_exempt 2.5 (k64f): no overspeed penalty within 2.5 m of the goal, so kicking next to it pays.
+# k62 = k61 with gates 3-4 set to what the training metric reaches under DR (k61 plateaued at fall 0.19-0.24 for 40M samples with gate 3 at 0.15;
+# k61b then opened both at fall 0.145-0.17 after ~25M more samples). Gate 3 fall<=0.24, gate 4 fall<=0.22. Perception and goal odometry are OUT (other team's scope):
+# ball/goal positions are privileged, the percep curriculum never starts, goal_odom_noise is off. virtual_perception stays true ONLY to keep the obs layout.
+# k61 = k60 without vision/odometry (that scope is another team's): ball and goal positions are privileged (percep curriculum never starts -> p=0,
+# 360 deg, no latency/noise; no goal odometry error). Everything else as k60: ONE continuous from-scratch run, stages open by GateClock.
+#  stage 0 kick-only, 8 s, ball 0.35-0.6, no DR | stage 1 (G0) dataset ramps to its own weights, ball 0.5-2.0, 15 s | stage 2 (G1) ball anywhere/behind, stand starts, chase/align
+#  stage 3 (G2) DR Table 2 + pushes + ball mass 0.4-0.45 | stage 4 (G3) stagnation -100 | stage 5 (G4) ball perturbation, 60 s episodes
+# Gates on TRAINING metrics (see k60 header for calibration); falls relaxed after k60/k60b showed the train-metric floor (docs/t1/21). Table 3 flags stay OFF.
+env_name: task_soccer
+char_file: data/assets/t1_deploy/t1.xml
+camera_mode: track
+episode_length: 8.0
+global_obs: false
+root_height_obs: true
+pose_termination: false
+enable_phase_obs: false
+enable_tar_obs: false
+num_disc_obs_steps: 10
+rand_reset: true
+zero_center_action: true
+ref_char_offset: [2.0, 0.0, 0.0]
+init_pose: [0, 0, 0.69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0]
+enable_early_termination: true
+key_bodies: [left_ankle_roll_link, right_ankle_roll_link, aahead_pitch_link, left_elbow_yaw_link,
+  right_elbow_yaw_link]
+contact_bodies: [left_knee_pitch_link, left_ankle_pitch_link, left_ankle_roll_link,
+  right_knee_pitch_link, right_ankle_pitch_link, right_ankle_roll_link]
+motion_file: data/datasets/dataset_t1_accad_walk_omni_kick_run_collider_med.yaml
+field_length: 14.0
+field_width: 9.0
+goal_width: 2.6
+ball_radius: 0.11
+spawn_margin: 1.0
+ball_soft_reset_far: false
+kick_direction_min_vel: 0.3
+visualize_field: true
+visualize_debug_arrows: true
+ball_spawn_min_dist: 0.3
+ball_spawn_margin: 0.4
+ball_goal_strip_prob: 0.0
+ball_goal_strip_min: 4.8
+ball_goal_core_prob: 0.0
+ball_goal_core_min: 5.6
+ball_goal_core_y: 1.5
+steer_speed_max: 2.0
+steer_stop_dist: 0.45
+steer_anneal_start_samples: 0
+steer_anneal_end_samples: 1
+ball_spawn_near: true
+ball_spawn_front_min: 0.5
+ball_spawn_front_max: 2.0
+ball_spawn_lateral: 0.25
+percep_curriculum_start_samples: 1000000000000
+percep_curriculum_end_samples: 1000000000001
+ball_curriculum_start_samples: 10000001
+ball_curriculum_end_samples: 15000000
+ball_curriculum_far_prob: 0.0
+curriculum_sample_offset: 0
+ball_perturb_time_min: 4.0
+ball_perturb_time_max: 8.0
+ball_perturb_teleport_prob: 0.5
+ball_perturb_speed_min: 1.0
+ball_perturb_speed_max: 4.0
+rand_ball_props: true
+rand_ball_friction: [0.1, 0.3]
+rand_ball_restitution: [0.0, 1.0]
+domain_randomization: true
+dr_seed: 1
+rand_char_props: false
+char_push_enable: false
+measurable_obs: true
+measurable_hist_steps: 30
+virtual_perception: true
+percep_fov_body: aahead_pitch_link
+percep_fov_deg: 90.0
+reward_head_gaze_w: 0.0
+reward_goal_scored_w: 15.0
+reward_ball_approach_w: 50.0
+reward_goal_progress_w: 500.0
+reward_survival_w: 3.0
+reward_termination_w: -200.0
+reward_stagnation_w: -100.0
+reward_kick_sideways_w: 0.0
+reward_kick_forward_w: 0.0
+reward_foot_proximity_w: -5.0
+reward_action_rate_w: -1.0
+reward_joint_limit_w: -0.110531
+reward_knee_bend_w: 0.0
+knee_bend_min: 0.25
+reward_base_accel_w: -0.00073277
+reward_waiting_w: 0.0
+waiting_time_max: 3.0
+stagnation_window: 1.0
+stagnation_move_threshold: 0.1
+ball_contact_dist: 0.25
+foot_min_dist: 0.2
+kick_feet_bodies: [left_ankle_roll_link, right_ankle_roll_link]
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+ball_event_gauss_start_samples: 20000001
+ball_event_gauss_end_samples: 25000000
+ball_event_gauss_prob: 0.0
+ball_event_gauss_sigma: 1.0
+percep_potential_freeze: true
+search_sweep_w: 0.0
+search_sweep_cap: 1.5
+reward_kick_alignment_w: 90.0
+reward_kick_position_w: 2.0
+kick_position_near_dist: 1.5
+ball_behind_start_samples: 20000001
+ball_behind_end_samples: 25000000
+ball_behind_prob: 0.5
+ball_behind_dist_min: 1.0
+ball_behind_dist_max: 4.0
+ball_behind_half_cone_deg: 60.0
+kick_alignment_power: 64.0
+reward_torso_lean_w: 0.0
+torso_lean_max: 0.15
+reward_arm_pose_w: -2.0
+arm_pose_tol: 0.15
+arm_pose_target: [0.05, -1.25, -0.09, -0.56, 0.08, 1.27, 0.01, 0.60]
+near_ball_penalty_extra: 0.0
+reward_foot_ball_w: 50.0
+reward_kick_contact_w: 100.0
+kick_contact_dist: 0.2
+kick_contact_min_gain: 0.3
+kick_contact_gain_cap: 2.0
+kick_contact_min_height: 0.58
+kick_contact_hold_steps: 30
+reward_kick_overspeed_w: -50.0
+kick_overspeed_limit: 3.5
+kick_overspeed_goal_exempt: 2.5
+ball_perturb_enable: true
+stand_start_prob: 0.0
+reward_ball_chase_w: 0.0
+reward_ball_align_w: 0.0
+ball_align_baseline: 1.0
+motion_kick_weight_early: 1.0
+motion_kick_weight_end_samples: 10000001
+motion_kick_weight_ramp_samples: 5000000
+ball_spawn_front_early: [0.35, 0.6]
+dr_runtime_start_samples: 30000001
+char_push_start_samples: 30000001
+rand_ball_mass_kg: [0.4, 0.45]
+reward_stagnation_start_samples: 40000001
+ball_perturb_start_samples: 50000001
+goal_odom_noise: false
+episode_length_late: 60.0
+episode_length_late_start_samples: 50000001
+stage_params:
+- {at: 10000001, episode_length: 15.0}
+- {at: 20000001, ball_curriculum_far_prob: 0.7, stand_start_prob: 0.5, reward_ball_chase_w: 20.0,
+  reward_ball_align_w: 5.0, ball_goal_strip_prob: 0.15, ball_goal_core_prob: 0.15}
+curriculum_gates:
+- {at: 10000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.3], ep_fall_rate: [<=, 0.2]}
+- {at: 20000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.22], ep_fall_rate: [<=, 0.12]}
+- {at: 30000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.33], ep_fall_rate: [<=, 0.14]}
+- {at: 40000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.22], ep_fall_rate: [<=, 0.24]}
+- {at: 50000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 2.0]}  # k72: never opens (stage 5 off)
+
+# k70: k62 do zero + itens do paper (docs/t1/22): critico/decoder Table 3 (sem disc_obs_table3, que colapsou),
+# ruido de sensor no ator (doc 13 sec. 3) e dataset re-clampado no colisor do pe (collider_clamp_motions.py).
+critic_paper_obs: true
+recon_paper_targets: true
+dr_critic_torso_obs: true
+obs_noise_gravity: 0.01   # adimensional
+obs_noise_ang_vel: 0.1    # rad/s
+obs_noise_dof_pos: 0.01   # rad
+obs_noise_dof_vel: 0.1    # rad/s
+
+# doc 25: deploy conditions
+dr_ranges:
+  action_delay_ms: [0.0, 33.3]
+  foot_friction: [0.1, 2.0]       # doc 25 item 2: Booster per-foot contact (e80tonn1)
+  foot_compliance: [0.5, 1.5]
+  foot_restitution: [0.1, 0.9]
+dr_foot_props_per_foot: true
+
+# doc 25 item 3: Booster Gym world perturbations (e80tonn1) replace the soccer velocity pushes (char_push_enable false);
+# they switch on with char_push_start_samples (stage 3, with the DR)
+kick_interval_s: 2.0
+kick_lin_vel_std: 0.1
+kick_ang_vel_std: 0.02
+push_interval_s: 5.0
+push_duration_s: 1.0
+push_force_std: 10.0
+push_torque_std: 2.0
+push_impulse_scale: 0.1
+
+# doc 25 item 4: Table 3/4 regularization calibrated by Olives (base P, e80tonn1); the global action rate -1 stays
+# (it is the only rate term on the arms, goal M12). joint limit and base accel replaced above.
+joint_limit_on_action: true
+reward_head_action_rate_w: -0.451349
+reward_leg_action_rate_w: -0.041542
+reward_collision_w: -0.089033
+
+# k74T stage (doc 25): fine-tune of the k74 checkpoint on the terrain mixture (engine isaac_lab_engine_terrain_all.yaml,
+# +-1 mm | +-5 mm | +-2 cm | Booster D, the k72Tft recipe that gave the best MuJoCo transfer), with the terrain kick tolerance of k72T.
+kick_still_speed: 0.5
+reward_kick_chapa_w: 100.0   # k75b
+reward_torque_sat_w: -1000.0
+reward_arm_vel_w: -0.25
+arm_dof_bodies: [left_shoulder_pitch_link, left_shoulder_roll_link, left_elbow_pitch_link, left_elbow_yaw_link, right_shoulder_pitch_link, right_shoulder_roll_link, right_elbow_pitch_link, right_elbow_yaw_link]
+kick_pitch_gate_prev: true
+kick_pitch_mix: 1.0
+kick_pitch_sigma_deg: 15.0
+reward_kick_pitch_dense_w: -2500.0
+reward_kick_toe_face_w: -1000.0
+reward_kick_toe_out_w: 1000.0
+kick_toe_out_target_deg: 20.0
+kick_toe_out_sigma_deg: 12.0
+reward_kick_pitch_target_w: 200.0
+kick_pitch_target_deg: -15.0
+kick_pitch_target_sigma_deg: 20.0

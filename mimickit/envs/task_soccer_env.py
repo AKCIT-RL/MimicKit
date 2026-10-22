@@ -60,6 +60,49 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._steer_speed_max = float(env_config.get("steer_speed_max", 1.5))
         self._steer_stop_dist = float(env_config.get("steer_stop_dist", 0.45))
 
+        # velocity-command (navigation) mode (doc 26, MK1): a fraction of the
+        # episodes follow a (vx, vy, wz) command written into the steering
+        # slots instead of playing the ball; the ball is parked far away and
+        # hidden (zero slots, mask 0). Off by default (nav_cmd_prob 0).
+        self._nav_cmd_prob = float(env_config.get("nav_cmd_prob", 0.0))
+        self._nav_vx_range = [float(v) for v in env_config.get("nav_vx_range", [-0.6, 2.0])]
+        self._nav_vy_range = [float(v) for v in env_config.get("nav_vy_range", [-0.5, 0.5])]
+        self._nav_yaw_range = [float(v) for v in env_config.get("nav_yaw_range", [-1.0, 1.0])]
+        self._nav_still_prob = float(env_config.get("nav_still_prob", 0.1))
+        self._nav_resample_s = [float(v) for v in env_config.get("nav_resample_s", [2.0, 5.0])]
+        self._nav_face_horizon_s = float(env_config.get("nav_face_horizon_s", 1.0))
+        self._nav_switch_prob = float(env_config.get("nav_switch_prob", 0.0))
+        self._kick_to_nav_rate = float(env_config.get("kick_to_nav_rate", 0.0))
+        self._kick_to_nav_dist = float(env_config.get("kick_to_nav_dist", 0.0))
+        # event-triggered kick -> nav: after a real kick (foot near ball, ball fast) with prob
+        # k2n_post_prob after a delay in k2n_delay_s; abandoning the chase with prob
+        # k2n_abandon_prob at a time in k2n_abandon_s after the kick episode starts
+        self._k2n_post_prob = float(env_config.get("k2n_post_prob", 0.0))
+        self._k2n_delay_s = env_config.get("k2n_delay_s", [0.0, 1.0])
+        self._k2n_abandon_prob = float(env_config.get("k2n_abandon_prob", 0.0))
+        self._k2n_abandon_s = env_config.get("k2n_abandon_s", [1.0, 6.0])
+        self._k2n_kick_dist = float(env_config.get("k2n_kick_dist", 0.3))
+        self._k2n_kick_speed = float(env_config.get("k2n_kick_speed", 1.0))
+        self._nav_cmd_scale = float(env_config.get("nav_cmd_scale", 1.0))
+        # AMP style gain in nav episodes (1.0 = unchanged): the mocaps have no backward/lateral gait, so the
+        # style term can cancel the vy / negative-vx tracking reward.
+        # fraction of nav commands drawn as a single backward or lateral axis (others 0): pure back/lateral
+        # commands are rare in the uniform draw and the policy stays standing for them (k94k/k94l probes).
+        self._nav_axis_prob = float(env_config.get("nav_axis_prob", 0.0))
+        self._nav_style_gain = float(env_config.get("nav_style_gain", 1.0))
+        self._reward_nav_lin_w = float(env_config.get("reward_nav_lin_w", 0.0))
+        self._reward_nav_yaw_w = float(env_config.get("reward_nav_yaw_w", 0.0))
+        self._nav_lin_sigma = float(env_config.get("nav_lin_sigma", 0.25))
+        self._nav_yaw_sigma = float(env_config.get("nav_yaw_sigma", 0.25))
+        # low-pass (EMA, time constant in s) of the tracked velocity; 0 = raw.
+        # With action noise the raw yaw rate is mostly jitter (train err ~1.3
+        # vs ~0.3 deterministic), which flattens the yaw reward (k94a-c)
+        self._nav_vel_filter_s = float(env_config.get("nav_vel_filter_s", 0.0))
+        # evaluation hooks: None = sample; True/False = force nav/kick on
+        # every (re)draw; _nav_fixed_cmd [3] replaces the sampled command
+        self._nav_force = None
+        self._nav_fixed_cmd = None
+
         # spawn the ball in front of the robot (T1: "closer ball so robot can
         # actually reach and kick it") instead of uniformly over the field
         self._ball_spawn_near = bool(env_config.get("ball_spawn_near", True))
@@ -722,7 +765,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     _STAGE_PARAM_KEYS = {"episode_length", "stand_start_prob", "reward_ball_chase_w", "reward_ball_align_w",
-                         "ball_curriculum_far_prob", "ball_goal_strip_prob", "ball_goal_core_prob"}
+                         "ball_curriculum_far_prob", "ball_goal_strip_prob", "ball_goal_core_prob",
+                         "nav_cmd_prob", "nav_switch_prob", "nav_cmd_scale",
+                         "reward_nav_lin_w", "reward_nav_yaw_w"}
 
     def _ground_z(self, env_ids, keepdim=False):
         """Spawn lift of the ground under env_ids (None = all envs): the scalar _ground_z_offset unless
@@ -910,6 +955,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_ball_event_step = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._post_goal_steps_left = torch.zeros([num_envs], device=self._device, dtype=torch.long)
         self._head_yaw_prev = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._nav_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._nav_cmd = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
+        self._nav_cmd_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._k2n_decided = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._k2n_left = torch.full([num_envs], float("inf"), device=self._device)
+        self._k2n_abandon_left = torch.full([num_envs], float("inf"), device=self._device)
+        self._nav_vel_filt = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -1299,6 +1351,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         task_obs = soccer_util.compute_soccer_observations(root_pos, root_rot, ball_pos,
                                                            goal_pos, goal_dir)
+        nav = None
+        if (self._nav_active()):
+            nav = self._nav_mode if env_ids is None else self._nav_mode[env_ids]
+            if (nav.any()):
+                cmd = self._nav_cmd if env_ids is None else self._nav_cmd[env_ids]
+                nav_obs = compute_nav_cmd_obs(cmd, self._nav_face_horizon_s)
+                steer_obs = torch.where(nav.unsqueeze(-1), nav_obs, steer_obs)
+                # the ball is not part of the navigation task: hidden slots
+                task_obs = task_obs.clone()
+                task_obs[nav, 0:2] = 0.0
+                ball_mask = torch.where(nav.unsqueeze(-1), torch.zeros_like(ball_mask), ball_mask)
         if (self._goal_odom_noise and not privileged):
             # the goal comes from the odometry pose estimate, not the true pose
             odom_scale = self._schedule_progress(self._goal_odom_start_samples, self._goal_odom_end_samples)
@@ -1315,6 +1378,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             est_obs = soccer_util.compute_soccer_observations(
                 est_pos, torch_util.quat_mul(yaw_q, root_rot), ball_pos, goal_pos, goal_dir)
             task_obs = torch.cat([task_obs[:, 0:2], est_obs[:, 2:6]], dim=-1)
+            if (nav is not None and nav.any()):
+                task_obs[nav, 0:2] = 0.0
         # ball detection mask (Table 2); real dropout when the virtual
         # perception pipeline is enabled, constant 1 otherwise
         return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
@@ -1393,6 +1458,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             goal_pos_local, self._goal_dir, self._goal_width, self._ball_radius)
         # a scored ball is also outside the field; count it only as a goal
         self._ball_oob_buf &= ~self._goal_scored_buf
+        # navigation episodes ignore the (parked) ball
+        self._goal_scored_buf &= ~self._nav_mode
+        self._ball_oob_buf &= ~self._nav_mode
 
         # ball motion timers (before reward caching: the decay and gating of
         # this step must see the up-to-date times)
@@ -1408,6 +1476,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         #    potentials or the contact geometry
         self._cache_task_reward(ball_pos, ball_vel, rolling)
         self._cache_aux_reward(ball_pos)
+        if (self._nav_active()):
+            self._cache_nav_reward()
 
         # 3. goal / out of bounds terminate the episode (paper 4.1); the
         #    flags become dones in _update_done and the reset keeps the
@@ -1422,6 +1492,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._virtual_perception):
             self._update_perception()
         self._post_goal_steps_left = torch.clamp(self._post_goal_steps_left - 1, min=0)
+        if (self._nav_active()):
+            self._update_nav_cmd()
         if (self._task_hist_steps > 0):
             # exactly one roll per physics step, after the perception tick so
             # the newest history entry matches what the actor sees this step
@@ -2013,7 +2085,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         stagnant = soccer_util.compute_stagnation_flags(root_pos, self._stagnation_anchor_pos,
                                                         self._stagnation_move_threshold)
         stagnant = torch.logical_and(stagnant, window_done)
-        aux_r += self._stagnation_w_now() * stagnant.float()
+        kick_m = (~self._nav_mode).float()
+        aux_r += self._stagnation_w_now() * stagnant.float() * kick_m
         if (window_done.any()):
             self._stagnation_anchor_pos[window_done] = root_pos[window_done]
             self._stagnation_anchor_time[window_done] = self._time_buf[window_done]
@@ -2046,6 +2119,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                    for f in self._foot_body_ids], dim=-1).min(dim=-1).values
         style_near = (foot_ball_d < self._style_near_ball_dist).float()
         self._style_gain_buf[:] = 1.0 + (self._style_near_ball_gain - 1.0) * style_near
+        if (self._nav_style_gain != 1.0):
+            self._style_gain_buf[:] = torch.where(self._nav_mode, self._style_gain_buf * self._nav_style_gain,
+                                                  self._style_gain_buf)
         self._kick_near_buf[:] = style_near
         self._diag.add_mean("style_near_ball_frac", style_near)
 
@@ -2062,7 +2138,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             head_pos = body_pos[:, self._fov_body_id, :]
             head_rot = body_rot[:, self._fov_body_id, :]
             gaze_r = soccer_util.compute_head_gaze_reward(head_pos, head_rot, ball_pos)
-            aux_r += self._reward_head_gaze_w * gaze_r
+            aux_r += self._reward_head_gaze_w * gaze_r * kick_m
 
         # c7 active search: while the ball is unperceived, reward head yaw
         # sweep rate (finite difference of the heading angle). No privileged
@@ -2078,7 +2154,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             dt = self._engine.get_timestep()
             sweep = torch.clamp(torch.abs(dyaw) / dt, max=self._search_sweep_cap) \
                 / self._search_sweep_cap
-            aux_r += hidden.float() * (self._search_sweep_w * sweep)
+            aux_r += hidden.float() * (self._search_sweep_w * sweep) * kick_m
             self._head_yaw_prev[:] = head_yaw
 
         aux_r += self._reward_action_rate_w * self._action_rate_buf
@@ -2150,7 +2226,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # waiting penalty (T1): grows quadratically with ball-still time,
         # saturating at waiting_time_max; zero while the ball rolls
         wait_frac = torch.clamp(self._ball_still_time / self._waiting_time_max, max=1.0)
-        waiting_r = self._reward_waiting_w * wait_frac * wait_frac
+        waiting_r = self._reward_waiting_w * wait_frac * wait_frac * kick_m
         aux_r += waiting_r
 
         self._aux_reward_buf[:] = aux_r
@@ -2203,7 +2279,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # diagnostics: termination term + per-episode event counters
         d = self._diag
         d.add_mean("reward_termination", self._reward_termination_w * fall_mask.float())
-        d.add_sum("ep_falls", fall_mask.float())
+        kick_ep = ~self._nav_mode
+        d.add_sum("ep_falls", torch.logical_and(fall_mask, kick_ep).float())
+        if (self._nav_active()):
+            nav_end = torch.logical_and(self._nav_mode, self._done_buf != base_env.DoneFlags.NULL.value)
+            d.add_sum("nav_ep_done", nav_end.float())
+            d.add_sum("nav_ep_falls", torch.logical_and(fall_mask, self._nav_mode).float())
         d.add_sum("ep_goals", self._goal_scored_buf.float())
         d.add_sum("ep_oob", self._ball_oob_buf.float())
         d.add_sum("goal_time", self._time_buf * self._goal_scored_buf.float())
@@ -2214,7 +2295,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             base_env.DoneFlags.FAIL.value)
         self._done_buf[:] = done
         self._soft_done_buf[:] = soft
-        ended = (done != base_env.DoneFlags.NULL.value)
+        ended = torch.logical_and(done != base_env.DoneFlags.NULL.value, kick_ep)
         kicked = torch.logical_and(self._ep_min_foot_dist < self._kick_contact_dist,
                                    self._ep_peak_ball_speed > 1.0)
         d.add_sum("ep_kicked", torch.logical_and(ended, kicked).float())
@@ -2228,7 +2309,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ep_peak_ball_speed[ended] = 0.0
         self._ep_peak_ball_angle[ended] = 0.0
         self._ep_min_foot_dist[ended] = 10.0
-        d.add_sum("ep_done", (done != base_env.DoneFlags.NULL.value).float())
+        d.add_sum("ep_done", ended.float())
 
         # free-return hack probe: robot sits on the respawn spot between a
         # random ball event (perturb/soft respawn, NOT a fall or episode
@@ -2284,6 +2365,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         diags["ep_goal_rate"] = goals / eps if eps > 0.0 else 0.0
         diags["ep_fall_rate"] = sums.get("ep_falls", 0.0) / eps if eps > 0.0 else 0.0
         diags["ep_oob_rate"] = sums.get("ep_oob", 0.0) / eps if eps > 0.0 else 0.0
+        if (self._nav_active()):
+            nav_eps = sums.get("nav_ep_done", 0.0)
+            nav_steps = sums.get("nav_steps", 0.0)
+            diags["nav_ep_fall_rate"] = sums.get("nav_ep_falls", 0.0) / nav_eps if nav_eps > 0.0 else 0.0
+            diags["nav_lin_err"] = sums.get("nav_lin_err", 0.0) / nav_steps if nav_steps > 0.0 else 0.0
+            diags["nav_yaw_err"] = sums.get("nav_yaw_err", 0.0) / nav_steps if nav_steps > 0.0 else 0.0
+            diags["nav_yaw_err_raw"] = sums.get("nav_yaw_err_raw", 0.0) / nav_steps if nav_steps > 0.0 else 0.0
         diags["ep_touches"] = sums.get("touch_events", 0.0) / eps if eps > 0.0 else 0.0
         kicked_n = sums.get("ep_kicked", 0.0)
         diags["kicked_ep_frac"] = kicked_n / eps if eps > 0.0 else 0.0
@@ -2503,6 +2591,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # key-body obs will mix the old pose with the new root position
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
+            self._reset_nav_mode(env_ids)
             if (self._virtual_perception):
                 self._reset_perception(env_ids)
             if (self._task_hist_steps > 0):
@@ -2559,7 +2648,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # Goal/OOB normally use a soft reset. Every benchmark trial instead
         # starts from the same complete robot state.
         self._soft_done_buf[env_ids] = False
+        if (self._nav_cmd_prob > 0.0 and self._nav_force is None):
+            # the spatial benchmark is a kick benchmark: no nav draws, also
+            # on the soft resets after a goal
+            self._nav_force = False
         self._reset_envs(env_ids)
+        self._nav_mode[env_ids] = False
 
         n = len(env_ids)
         char_id = self._get_char_id()
@@ -2630,6 +2724,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._done_buf[env_ids] = base_env.DoneFlags.NULL.value
         self._reset_ball(env_ids, near=not self._ball_soft_reset_far,
                          gauss=self._ball_event_gauss())
+        self._reset_nav_mode(env_ids)
         self._post_goal_steps_left[:] = 0
         self._post_goal_steps_left[env_ids] = 16  # ~0.5 s at 30 Hz
         self._goal_odom_next_redraw[env_ids] = self._time_buf[env_ids] + self._goal_odom_redraw
@@ -2709,6 +2804,171 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._engine.set_dof_vel(sid, char_id, 0.0)
                 self._engine.set_body_vel(sid, char_id, 0.0)
                 self._engine.set_body_ang_vel(sid, char_id, 0.0)
+        return
+
+    def _nav_active(self):
+        return self._nav_cmd_prob > 0.0 or self._nav_force is not None
+
+    def _reset_nav_mode(self, env_ids):
+        """Draw the episode mode (navigate vs kick) and, for navigation, a
+        fresh command with the ball parked far away. Called after _reset_ball
+        and before the history refill, so the refilled frames carry the mode."""
+        if (not self._nav_active() or len(env_ids) == 0):
+            self._nav_mode[env_ids] = False
+            return
+        if (self._nav_force is not None):
+            nav = torch.full([len(env_ids)], bool(self._nav_force), device=self._device, dtype=torch.bool)
+        else:
+            nav = torch.rand([len(env_ids)], device=self._device) < self._nav_cmd_prob
+        self._nav_mode[env_ids] = nav
+        self._nav_vel_filt[env_ids] = 0.0
+        nav_ids = env_ids[nav]
+        if (len(nav_ids) > 0):
+            self._reset_ball(nav_ids, near=False)
+            self._resample_nav_cmd(nav_ids)
+        return
+
+    def _resample_nav_cmd(self, env_ids):
+        n = len(env_ids)
+        if (self._nav_fixed_cmd is not None):
+            cmd = torch.as_tensor(self._nav_fixed_cmd, device=self._device, dtype=torch.float)
+            cmd = cmd.reshape(-1, 3).expand(n, 3).clone()
+        else:
+            u = torch.rand([n, 3], device=self._device)
+            lo = torch.tensor([self._nav_vx_range[0], self._nav_vy_range[0], self._nav_yaw_range[0]],
+                              device=self._device)
+            hi = torch.tensor([self._nav_vx_range[1], self._nav_vy_range[1], self._nav_yaw_range[1]],
+                              device=self._device)
+            cmd = (lo + u * (hi - lo)) * self._nav_cmd_scale
+            if (self._nav_axis_prob > 0.0):
+                axis = torch.rand([n], device=self._device) < self._nav_axis_prob
+                back = torch.rand([n], device=self._device) < 0.5
+                mag = 0.1 + 0.9 * torch.rand([n], device=self._device)
+                sgn = torch.where(torch.rand([n], device=self._device) < 0.5, -1.0, 1.0)
+                cmd[axis, 2] = 0.0
+                cmd[axis & back, 0] = -mag[axis & back] * abs(self._nav_vx_range[0]) * self._nav_cmd_scale
+                cmd[axis & back, 1] = 0.0
+                lat = axis & ~back
+                cmd[lat, 0] = 0.0
+                cmd[lat, 1] = sgn[lat] * mag[lat] * self._nav_vy_range[1] * self._nav_cmd_scale
+            still = torch.rand([n], device=self._device) < self._nav_still_prob
+            cmd[still] = 0.0
+        self._nav_cmd[env_ids] = cmd
+        lo_t, hi_t = self._nav_resample_s
+        self._nav_cmd_time[env_ids] = self._time_buf[env_ids] + lo_t \
+            + (hi_t - lo_t) * torch.rand([n], device=self._device)
+        return
+
+    def _update_nav_cmd(self):
+        """Command resampling; on a resample a nav episode may hand over to
+        kick mode (nav -> kick transition), with the ball placed near."""
+        if (self._kick_to_nav_rate > 0.0 and self._nav_force is None):
+            # kick -> nav mid-episode (per second rate), robot state kept
+            p_step = self._kick_to_nav_rate * self._engine.get_timestep()
+            k2n = torch.logical_and(~self._nav_mode, torch.rand([self.get_num_envs()], device=self._device) < p_step)
+            if (self._kick_to_nav_dist > 0.0):
+                # only near the ball: the far-ball chase must not be cut short
+                root_xy = self._engine.get_root_pos(self._get_char_id())[:, 0:2]
+                k2n = torch.logical_and(k2n, torch.linalg.norm(self._get_ball_pos()[:, 0:2] - root_xy, dim=-1)
+                                        < self._kick_to_nav_dist)
+            k2n_ids = k2n.nonzero(as_tuple=False).flatten()
+            if (len(k2n_ids) > 0):
+                self.set_nav_mode(k2n_ids, True)
+        if ((self._k2n_post_prob > 0.0 or self._k2n_abandon_prob > 0.0) and self._nav_force is None):
+            self._update_k2n_events()
+        due = torch.logical_and(self._nav_mode, self._time_buf >= self._nav_cmd_time)
+        ids = due.nonzero(as_tuple=False).flatten()
+        if (len(ids) == 0):
+            return
+        if (self._nav_switch_prob > 0.0 and self._nav_force is None):
+            sw = torch.rand([len(ids)], device=self._device) < self._nav_switch_prob
+            sw_ids = ids[sw]
+            ids = ids[~sw]
+            if (len(sw_ids) > 0):
+                self.set_nav_mode(sw_ids, False)
+        if (len(ids) > 0):
+            self._resample_nav_cmd(ids)
+        return
+
+    def _update_k2n_events(self):
+        """Event-triggered kick -> nav hand-over (kick episodes only): the first real kick
+        of the episode arms a delayed switch with prob k2n_post_prob; independently the chase
+        may be abandoned at a random time. The robot state is kept."""
+        dt = self._engine.get_timestep()
+        kick_mode = ~self._nav_mode
+        char_id = self._get_char_id()
+        if (self._k2n_post_prob > 0.0):
+            body = self._engine.get_body_pos(char_id)
+            ball = self._get_ball_pos()
+            fd = torch.stack([torch.linalg.norm(body[:, f, :] - ball, dim=-1) for f in self._foot_body_ids],
+                             -1).min(-1).values
+            sp = torch.linalg.norm(self._engine.get_root_vel(self._get_ball_id())[:, 0:2], dim=-1)
+            kicked = kick_mode & ~self._k2n_decided & (fd < self._k2n_kick_dist) & (sp > self._k2n_kick_speed)
+            k_ids = kicked.nonzero(as_tuple=False).flatten()
+            if (len(k_ids) > 0):
+                self._k2n_decided[k_ids] = True
+                lo_d, hi_d = self._k2n_delay_s
+                delay = lo_d + (hi_d - lo_d) * torch.rand([len(k_ids)], device=self._device)
+                take = torch.rand([len(k_ids)], device=self._device) < self._k2n_post_prob
+                self._k2n_left[k_ids] = torch.where(take, delay, torch.full_like(delay, float("inf")))
+        self._k2n_left -= dt
+        self._k2n_abandon_left -= dt
+        fire = kick_mode & ((self._k2n_left <= 0.0) | (self._k2n_abandon_left <= 0.0))
+        f_ids = fire.nonzero(as_tuple=False).flatten()
+        if (len(f_ids) > 0):
+            self.set_nav_mode(f_ids, True)
+        return
+
+    def set_nav_mode(self, env_ids, nav):
+        """Mid-episode mode switch (training transitions and evaluation):
+        kick mode gets a ball placed near, nav mode parks it far and draws a
+        command. The robot keeps its state; the histories roll on."""
+        if (len(env_ids) == 0):
+            return
+        self._nav_mode[env_ids] = bool(nav)
+        self._reset_ball(env_ids, near=not nav)
+        if (nav):
+            self._resample_nav_cmd(env_ids)
+        if (self._virtual_perception):
+            self._reset_perception(env_ids)
+        char_id = self._get_char_id()
+        self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
+        self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
+        self._record_reset_prev_states(env_ids)
+        return
+
+    def _cache_nav_reward(self):
+        """Velocity tracking reward of nav episodes (heading-frame planar
+        velocity and yaw rate); replaces the kick task reward there."""
+        char_id = self._get_char_id()
+        root_rot = self._engine.get_root_rot(char_id)
+        root_vel = self._engine.get_root_vel(char_id)
+        wz = self._engine.get_root_ang_vel(char_id)[:, 2]
+        heading_inv = torch_util.calc_heading_quat_inv(root_rot)
+        v_local = torch_util.quat_rotate(heading_inv, root_vel)[:, 0:2]
+        raw_yaw_err = self._nav_cmd[:, 2] - wz
+        if (self._nav_vel_filter_s > 0.0):
+            alpha = min(1.0, self._engine.get_timestep() / self._nav_vel_filter_s)
+            vel = torch.cat([v_local, wz.unsqueeze(-1)], dim=-1)
+            self._nav_vel_filt.mul_(1.0 - alpha).add_(alpha * vel)
+            v_local = self._nav_vel_filt[:, 0:2]
+            wz = self._nav_vel_filt[:, 2]
+        lin_err2 = torch.sum(torch.square(self._nav_cmd[:, 0:2] - v_local), dim=-1)
+        yaw_err = self._nav_cmd[:, 2] - wz
+        lin_r = torch.exp(-lin_err2 / self._nav_lin_sigma)
+        yaw_r = torch.exp(-torch.square(yaw_err) / self._nav_yaw_sigma)
+        nav_r = self._reward_nav_lin_w * lin_r + self._reward_nav_yaw_w * yaw_r
+        nav = self._nav_mode
+        self._task_reward_buf[:] = torch.where(nav, nav_r, self._task_reward_buf)
+        navf = nav.float()
+        d = self._diag
+        d.add_mean("nav_frac", navf)
+        d.add_mean("reward_nav_lin", navf * self._reward_nav_lin_w * lin_r)
+        d.add_mean("reward_nav_yaw", navf * self._reward_nav_yaw_w * yaw_r)
+        d.add_sum("nav_steps", navf)
+        d.add_sum("nav_lin_err", navf * torch.sqrt(lin_err2))
+        d.add_sum("nav_yaw_err", navf * torch.abs(yaw_err))
+        d.add_sum("nav_yaw_err_raw", navf * torch.abs(raw_yaw_err))
         return
 
     def _record_reset_prev_states(self, env_ids):
@@ -2870,4 +3130,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_moving_time[env_ids] = 0.0
         self._ball_still_time[env_ids] = 0.0
         self._resample_ball_perturb_times(env_ids)
+        self._k2n_decided[env_ids] = False
+        self._k2n_left[env_ids] = float("inf")
+        self._k2n_abandon_left[env_ids] = float("inf")
+        if (near and self._k2n_abandon_prob > 0.0):
+            lo_a, hi_a = self._k2n_abandon_s
+            t_ab = lo_a + (hi_a - lo_a) * torch.rand([n], device=self._device)
+            take = torch.rand([n], device=self._device) < self._k2n_abandon_prob
+            self._k2n_abandon_left[env_ids] = torch.where(take, t_ab, self._k2n_abandon_left[env_ids])
         return
+
+
+
+@torch.jit.script
+def compute_nav_cmd_obs(cmd, face_horizon):
+    # type: (Tensor, float) -> Tensor
+    """Velocity command in the steering-slot layout (heading frame):
+    [vx/|v|, vy/|v|, |v|, cos(wz*T), sin(wz*T)]; zero direction when still."""
+    speed = torch.linalg.norm(cmd[:, 0:2], dim=-1, keepdim=True)
+    direction = cmd[:, 0:2] / torch.clamp(speed, min=1.0e-6)
+    ang = cmd[:, 2:3] * face_horizon
+    return torch.cat([direction, speed, torch.cos(ang), torch.sin(ang)], dim=-1)

@@ -5,3 +5,8 @@ __pycache__/
 output/
 .vscode/
 wandb/
+
+# crash dumps do Kit
+crash_*.txt
+*.dmp.zip
+*.dmp.zip.toml

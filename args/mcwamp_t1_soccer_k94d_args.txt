@@ -1,0 +1,12 @@
+# k94d: k94c + EMA (0.3 s) velocity filter in the nav reward, same prepped k93r 700 seed.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k94d_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1629000000
+--out_dir output/t1_soccer_k94d/

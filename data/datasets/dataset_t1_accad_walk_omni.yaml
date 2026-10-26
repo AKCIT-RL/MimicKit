@@ -1,0 +1,43 @@
+# Booster T1 - omnidirectional walking from ACCAD Male2 (forward, backward,
+# turns, side-steps), the paper's walking categories (arXiv:2511.03996 sec 4.4).
+# No running, no stand clip. Retargeted with scripts/retarget_accad_to_t1.py,
+# ground-clamped to 2 cm. Weight = clip duration in seconds, so clips are drawn
+# in proportion to their frames (B3 is a 1.02 s WRAP cycle of a 4.42 s capture
+# and keeps the capture's weight). Everything else is CLAMP.
+motions:
+  - file: "data/motions/t1_accad/Male2_B1_StandToWalk.pkl"
+    weight: 3.62
+  - file: "data/motions/t1_accad/Male2_B2_WalkToStand.pkl"
+    weight: 3.63
+  - file: "data/motions/t1_accad/Male2_B3_Walk.pkl"
+    weight: 4.42
+  - file: "data/motions/t1_accad/Male2_B4_StandToWalkBackwards.pkl"
+    weight: 4.60
+  - file: "data/motions/t1_accad/Male2_B5_WalkBackwards.pkl"
+    weight: 6.30
+  - file: "data/motions/t1_accad/Male2_B6_WalkBackwardsToStand.pkl"
+    weight: 6.23
+  - file: "data/motions/t1_accad/Male2_B7_WalkBackwardsTurnForward.pkl"
+    weight: 6.07
+  - file: "data/motions/t1_accad/Male2_B8_WalkBackwardsStopForward.pkl"
+    weight: 6.40
+  - file: "data/motions/t1_accad/Male2_B9_WalkTurnLeft90.pkl"
+    weight: 5.03
+  - file: "data/motions/t1_accad/Male2_B10_WalkTurnLeft45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B11_WalkTurnLeft135.pkl"
+    weight: 5.53
+  - file: "data/motions/t1_accad/Male2_B12_WalkTurnRight90.pkl"
+    weight: 5.37
+  - file: "data/motions/t1_accad/Male2_B13_WalkTurnRight135.pkl"
+    weight: 6.33
+  - file: "data/motions/t1_accad/Male2_B14_WalkTurnRight45.pkl"
+    weight: 4.93
+  - file: "data/motions/t1_accad/Male2_B15_WalkTurnAround.pkl"
+    weight: 6.87
+  - file: "data/motions/t1_accad/Male2_B16_WalkTurnChange.pkl"
+    weight: 7.17
+  - file: "data/motions/t1_accad/Male2_B22_SideStepLeft.pkl"
+    weight: 2.47
+  - file: "data/motions/t1_accad/Male2_B23_SideStepRight.pkl"
+    weight: 3.00

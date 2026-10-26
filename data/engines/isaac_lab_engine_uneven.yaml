@@ -1,0 +1,17 @@
+# Isaac Lab twin of isaac_gym_engine_uneven.yaml: slightly uneven terrain (paper sec 4.2),
+# one static triangle mesh per field tile. The soccer env injects ground.tile_centers and
+# ground.tile_size from its field grid and raises spawns by random_height.
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one global ground; the env spreads fields itself (as in the Isaac Gym twin)
+
+ground:
+  type: "uneven"
+  random_height: 0.02 # m (bump amplitude, uniform)
+  horizontal_scale: 0.5 # m (bump spacing)
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

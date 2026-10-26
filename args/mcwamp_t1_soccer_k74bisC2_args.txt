@@ -1,0 +1,13 @@
+# BISECT ONLY (mirror 1 agent k74b): k74b minus one item, 60M from scratch; fall rate in stage 0 vs k74b/k73b.
+# k74b = k74 with mirror 1 (bisect: mirror 10 froze the kick) = k73b + the e80tonn1 robustness package (doc 25 sec. 6, items 1-7), from scratch, flat, 480M.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_flat_field.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k74bisC_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_k74bisC2/

@@ -1,0 +1,22 @@
+# Plan 23, Phase 5 B: amplitude mixture per field (the ground is one static mesh, so a runtime ramp 1 mm -> 5 mm -> 2 cm
+# is impossible; every field gets one fixed level instead). tile_levels is round-robin on the env index: env i -> level
+# i % 3, i.e. 1/3 of the fields at +-1 mm, 1/3 at +-5 mm, 1/3 at +-2 cm (the isaac_lab_engine_uneven.yaml amplitude).
+# The soccer env lifts each field's spawns by its own tile bound. Everything else as isaac_lab_engine_uneven.yaml.
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one global ground; the env spreads fields itself (as in the Isaac Gym twin)
+
+ground:
+  type: "uneven"
+  random_height: 0.02 # m (base; each level below overrides it)
+  horizontal_scale: 0.5 # m (bump spacing)
+  tile_levels:
+  - {random_height: 0.001}
+  - {random_height: 0.005}
+  - {random_height: 0.02}
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

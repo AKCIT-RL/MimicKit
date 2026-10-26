@@ -1,0 +1,12 @@
+# k74Td3: fine-tune of k74b (480M) on the terrain mixture, +100M (580M total). d3 = d0 + reward_arm_vel_w -0.5 (arm joint speed above 1 rad/s penalized).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k74Td3_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 580000000
+--out_dir output/t1_soccer_k74Td3/

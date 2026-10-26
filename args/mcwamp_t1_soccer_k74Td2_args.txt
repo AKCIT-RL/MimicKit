@@ -1,0 +1,12 @@
+# k74Td2: fine-tune of k74b (480M) on the terrain mixture, +100M (580M total). d2 = d0 + kick_pitch_mix 0.5 (kick bonus scaled down when the foot points toe-down beyond 35 deg).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k74Td2_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 580000000
+--out_dir output/t1_soccer_k74Td2/

@@ -1,0 +1,15 @@
+# Flat-ground twin of isaac_lab_engine_uneven.yaml for the kick curriculum (stages 0-1): the ±2 cm bumps make
+# the 0.11 m ball roll by itself (~0.2 m/s on average in Lab), which breaks "ball still" gating and the kick
+# diagnostics. One global plane; the soccer env spreads its fields itself (env_spacing 0, like the uneven twin).
+engine_name: "isaac_lab"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0
+
+ground:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

@@ -1,0 +1,161 @@
+# k62 = k61 with gates 3-4 set to what the training metric reaches under DR (k61 plateaued at fall 0.19-0.24 for 40M samples with gate 3 at 0.15;
+# k61b then opened both at fall 0.145-0.17 after ~25M more samples). Gate 3 fall<=0.24, gate 4 fall<=0.22. Perception and goal odometry are OUT (other team's scope):
+# ball/goal positions are privileged, the percep curriculum never starts, goal_odom_noise is off. virtual_perception stays true ONLY to keep the obs layout.
+# k61 = k60 without vision/odometry (that scope is another team's): ball and goal positions are privileged (percep curriculum never starts -> p=0,
+# 360 deg, no latency/noise; no goal odometry error). Everything else as k60: ONE continuous from-scratch run, stages open by GateClock.
+#  stage 0 kick-only, 8 s, ball 0.35-0.6, no DR | stage 1 (G0) dataset ramps to its own weights, ball 0.5-2.0, 15 s | stage 2 (G1) ball anywhere/behind, stand starts, chase/align
+#  stage 3 (G2) DR Table 2 + pushes + ball mass 0.4-0.45 | stage 4 (G3) stagnation -100 | stage 5 (G4) ball perturbation, 60 s episodes
+# Gates on TRAINING metrics (see k60 header for calibration); falls relaxed after k60/k60b showed the train-metric floor (docs/t1/21). Table 3 flags stay OFF.
+env_name: task_soccer
+char_file: data/assets/t1/t1.xml
+camera_mode: track
+episode_length: 8.0
+global_obs: false
+root_height_obs: true
+pose_termination: false
+enable_phase_obs: false
+enable_tar_obs: false
+num_disc_obs_steps: 10
+rand_reset: true
+zero_center_action: true
+ref_char_offset: [2.0, 0.0, 0.0]
+init_pose: [0, 0, 0.69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0]
+enable_early_termination: true
+key_bodies: [left_ankle_roll_link, right_ankle_roll_link, aahead_pitch_link, left_elbow_yaw_link,
+  right_elbow_yaw_link]
+contact_bodies: [left_knee_pitch_link, left_ankle_pitch_link, left_ankle_roll_link,
+  right_knee_pitch_link, right_ankle_pitch_link, right_ankle_roll_link]
+motion_file: data/datasets/dataset_t1_accad_walk_omni_kick.yaml
+field_length: 14.0
+field_width: 9.0
+goal_width: 2.6
+ball_radius: 0.11
+spawn_margin: 1.0
+ball_soft_reset_far: false
+kick_direction_min_vel: 0.3
+visualize_field: true
+visualize_debug_arrows: true
+ball_spawn_min_dist: 0.3
+steer_speed_max: 1.5
+steer_stop_dist: 0.45
+steer_anneal_start_samples: 0
+steer_anneal_end_samples: 1
+ball_spawn_near: true
+ball_spawn_front_min: 0.5
+ball_spawn_front_max: 2.0
+ball_spawn_lateral: 0.25
+percep_curriculum_start_samples: 1000000000000
+percep_curriculum_end_samples: 1000000000001
+ball_curriculum_start_samples: 10000001
+ball_curriculum_end_samples: 15000000
+ball_curriculum_far_prob: 0.0
+curriculum_sample_offset: 0
+ball_perturb_time_min: 4.0
+ball_perturb_time_max: 8.0
+ball_perturb_teleport_prob: 0.5
+ball_perturb_speed_min: 1.0
+ball_perturb_speed_max: 4.0
+rand_ball_props: true
+rand_ball_friction: [0.1, 0.3]
+rand_ball_restitution: [0.0, 1.0]
+domain_randomization: true
+dr_seed: 1
+rand_char_props: false
+char_push_enable: true
+measurable_obs: true
+measurable_hist_steps: 30
+virtual_perception: true
+percep_fov_body: aahead_pitch_link
+percep_fov_deg: 90.0
+reward_head_gaze_w: 0.0
+reward_goal_scored_w: 15.0
+reward_ball_approach_w: 50.0
+reward_goal_progress_w: 500.0
+reward_survival_w: 3.0
+reward_termination_w: -200.0
+reward_stagnation_w: -100.0
+reward_kick_sideways_w: 0.0
+reward_kick_forward_w: 0.0
+reward_foot_proximity_w: -5.0
+reward_action_rate_w: -1.0
+reward_joint_limit_w: -100.0
+reward_knee_bend_w: 0.0
+knee_bend_min: 0.25
+reward_base_accel_w: -0.001
+reward_waiting_w: 0.0
+waiting_time_max: 3.0
+stagnation_window: 1.0
+stagnation_move_threshold: 0.1
+ball_contact_dist: 0.25
+foot_min_dist: 0.2
+kick_feet_bodies: [left_ankle_roll_link, right_ankle_roll_link]
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+ball_event_gauss_start_samples: 20000001
+ball_event_gauss_end_samples: 25000000
+ball_event_gauss_prob: 0.0
+ball_event_gauss_sigma: 1.0
+percep_potential_freeze: true
+search_sweep_w: 0.0
+search_sweep_cap: 1.5
+reward_kick_alignment_w: 15.0
+reward_kick_position_w: 2.0
+kick_position_near_dist: 1.5
+ball_behind_start_samples: 20000001
+ball_behind_end_samples: 25000000
+ball_behind_prob: 0.5
+ball_behind_dist_min: 1.0
+ball_behind_dist_max: 4.0
+ball_behind_half_cone_deg: 60.0
+kick_alignment_power: 8.0
+reward_torso_lean_w: 0.0
+torso_lean_max: 0.15
+reward_arm_pose_w: 0.0
+arm_pose_tol: 0.3
+arm_pose_target: [0.05, -1.25, 0.08, 1.27]
+near_ball_penalty_extra: 0.0
+reward_foot_ball_w: 50.0
+reward_kick_contact_w: 100.0
+kick_contact_dist: 0.2
+kick_contact_min_gain: 0.3
+kick_contact_gain_cap: 2.0
+kick_contact_min_height: 0.58
+kick_contact_hold_steps: 30
+reward_kick_overspeed_w: -50.0
+kick_overspeed_limit: 3.5
+ball_perturb_enable: true
+stand_start_prob: 0.0
+reward_ball_chase_w: 0.0
+reward_ball_align_w: 0.0
+ball_align_baseline: 1.0
+motion_kick_weight_early: 1.0
+motion_kick_weight_end_samples: 10000001
+motion_kick_weight_ramp_samples: 5000000
+ball_spawn_front_early: [0.35, 0.6]
+dr_runtime_start_samples: 30000001
+char_push_start_samples: 30000001
+rand_ball_mass_kg: [0.4, 0.45]
+reward_stagnation_start_samples: 40000001
+ball_perturb_start_samples: 50000001
+goal_odom_noise: false
+episode_length_late: 60.0
+episode_length_late_start_samples: 50000001
+stage_params:
+- {at: 10000001, episode_length: 15.0}
+- {at: 20000001, ball_curriculum_far_prob: 0.7, stand_start_prob: 0.5, reward_ball_chase_w: 5.0,
+  reward_ball_align_w: 5.0}
+curriculum_gates:
+- {at: 10000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.3], ep_fall_rate: [<=, 0.2]}
+- {at: 20000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.22], ep_fall_rate: [<=, 0.12]}
+- {at: 30000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.33], ep_fall_rate: [<=, 0.14]}
+- {at: 40000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.22], ep_fall_rate: [<=, 0.24]}
+- {at: 50000000, hold_iters: 5, min_episodes: 64, kicked_ep_frac: ['>=', 0.24], ep_goal_rate: ['>=', 0.09], ep_fall_rate: [<=, 0.22]}

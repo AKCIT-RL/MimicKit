@@ -1,0 +1,14 @@
+# k72Tft = fine-tune of k72 (330M, flat, all gates through stage 4) on the k72T terrain mixture, +80M (410M total).
+# Literature recipe (flat first, then terrain with every difficulty in each batch): fields round-robin +-1 mm (~flat) |
+# +-5 mm | +-2 cm | Booster D. k24a/k25a continuations failed with 100% 2 cm terrain and no flat share. Gate 4 stays unreachable.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k72T_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 410000000
+--out_dir output/t1_soccer_k72Tft/

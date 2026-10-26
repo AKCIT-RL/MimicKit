@@ -73,6 +73,11 @@ class Engine:
     def get_timestep(self):
         return 0.0
 
+    def supports_build_time_props(self):
+        """True if per-env mass/shape properties may be set before initialize_sim()
+        (Isaac Gym). False means the env must apply them after initialize_sim()."""
+        return True
+
     def get_num_sim_steps(self):
         """Physics substeps per control step."""
         raise NotImplementedError("get_num_sim_steps not supported by engine {}".format(self.get_name()))

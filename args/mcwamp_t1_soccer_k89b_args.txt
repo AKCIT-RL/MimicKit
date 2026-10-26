@@ -1,0 +1,12 @@
+# k89b: fine-tune of k85b final (~1229M) +100M, terrain (doc 25 sec 4.2, M13).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k89b_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k77c_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1329000000
+--out_dir output/t1_soccer_k89b/

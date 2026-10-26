@@ -79,8 +79,15 @@ class IsaacLabEngine(engine.Engine):
         self._create_simulator(sim_timestep, visualize, record_video)
 
         self._env_spacing = config["env_spacing"]
+        self._ground_config = config.get("ground", None)
         self._obj_cfgs = []
         self._obj_control_modes = []
+
+        # Table 2 action delay, off unless set_action_delay() is called
+        self._action_delay_w = None
+        self._latest_cmd = dict()
+        self._prev_cmd = dict()
+        self._shape_counts = dict()
         
         if ("control_mode" in config):
             self._control_mode = engine.ControlMode[config["control_mode"]]
@@ -139,12 +146,33 @@ class IsaacLabEngine(engine.Engine):
         if (self.enabled_record_video() and self._recording):
             self._video_recorder.capture_frame()
         
+        if (self._action_delay_w is None):
+            for i in range(self._sim_steps):
+                self._pre_sim_step()
+                self._sim_step()
+                self._post_sim_step()
+        else:
+            self._step_with_action_delay()
+            
+        self._clear_forces()
+        return
+
+    def _step_with_action_delay(self):
+        # Table 2 action delay: the joint target is held across the control step, so a
+        # sub-step delay blends this step's command with the previous one, substep by
+        # substep (same scheme as the Isaac Gym engine).
         for i in range(self._sim_steps):
+            w = self._action_delay_w[:, i].unsqueeze(-1)
+            for obj_id, curr in self._latest_cmd.items():
+                blend = w * curr + (1.0 - w) * self._prev_cmd[obj_id]
+                self._objs[obj_id].set_joint_position_target(blend)
             self._pre_sim_step()
             self._sim_step()
             self._post_sim_step()
-            
-        self._clear_forces()
+
+        for obj_id, curr in self._latest_cmd.items():
+            self._objs[obj_id].set_joint_position_target(curr)
+            self._prev_cmd[obj_id] = curr.clone()
         return
 
     def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
@@ -187,6 +215,7 @@ class IsaacLabEngine(engine.Engine):
             pass
         elif (self._control_mode == engine.ControlMode.pos):
             obj.set_joint_position_target(sim_cmd)
+            self._latest_cmd[obj_id] = sim_cmd.clone()
         elif (self._control_mode == engine.ControlMode.vel):
             obj.set_joint_velocity_target(sim_cmd)
         elif (self._control_mode == engine.ControlMode.torque):
@@ -479,6 +508,19 @@ class IsaacLabEngine(engine.Engine):
             obj.data.body_link_vel_w[env_id, :, 3:] = body_ang_vel
         return
     
+    def set_body_wrench(self, env_id, obj_id, body_id, forces, torques):
+        """World-frame force AND torque on one body (set_body_forces writes zero torque). Isaac Lab keeps the
+        wrench until it is overwritten, so a caller ending a push must write zeros (task_soccer_env does)."""
+        obj = self._objs[obj_id]
+        if (self.get_obj_type(obj_id) == engine.ObjType.articulated):
+            forces = forces.unsqueeze(-2)
+            torques = torques.unsqueeze(-2)
+        # 1-D body ids: a 0-d index tensor breaks warp.from_torch inside Isaac Lab
+        sim_body_id = torch.as_tensor(self._body_order_sim2common[obj_id][body_id]).reshape(-1)
+        obj.set_external_force_and_torque(forces=forces, torques=torques, positions=None,
+                                          env_ids=env_id, body_ids=sim_body_id, is_global=True)
+        return
+
     def set_body_forces(self, env_id, obj_id, body_id, forces):
         if (env_id is None or len(env_id) > 0):
             assert(len(forces.shape) == 2)
@@ -539,7 +581,9 @@ class IsaacLabEngine(engine.Engine):
         meta_data = obj.root_physx_view.shared_metatype
         body_names = meta_data.link_names
         sim_body_id = body_names.index(body_name)
-        body_id = self._body_order_common2sim[obj_id][sim_body_id]
+        # a python int, like the Isaac Gym engine: envs put these in sets and compare them with
+        # ints (e.g. the collision-exempt bodies), which a 0-d tensor silently never matches
+        body_id = int(self._body_order_common2sim[obj_id][sim_body_id])
         return body_id
     
     def get_obj_type(self, obj_id):
@@ -577,6 +621,140 @@ class IsaacLabEngine(engine.Engine):
     
     def get_control_mode(self):
         return self._control_mode
+
+    def supports_build_time_props(self):
+        # per-env mass/material live in the PhysX views, which only exist after sim.reset()
+        return False
+
+    def get_num_sim_steps(self):
+        return self._sim_steps
+
+    def set_action_delay(self, delay_weights):
+        num_envs = self.get_num_envs()
+        weights = torch.as_tensor(delay_weights, device=self._device, dtype=torch.float32)
+        assert weights.shape == (num_envs, self._sim_steps), \
+            "action delay weights must be [num_envs, {}], got {}".format(
+                self._sim_steps, tuple(weights.shape))
+        self._action_delay_w = weights
+
+        for obj_id in range(self.get_objs_per_env()):
+            if (self.get_obj_type(obj_id) == engine.ObjType.articulated):
+                dof_pos = self._objs[obj_id].data.joint_pos
+                self._latest_cmd[obj_id] = dof_pos.clone()
+                self._prev_cmd[obj_id] = dof_pos.clone()
+        return
+
+    def reset_action_delay(self, env_ids=None):
+        """Point the delayed command at the current joint positions, so the first step of
+        an episode does not replay the previous episode's command."""
+        if (self._action_delay_w is None):
+            return
+        for obj_id in self._prev_cmd.keys():
+            dof_pos = self._objs[obj_id].data.joint_pos
+            if (env_ids is None):
+                self._prev_cmd[obj_id][:] = dof_pos
+            else:
+                self._prev_cmd[obj_id][env_ids] = dof_pos[env_ids]
+        return
+
+    def scale_obj_pd_gains(self, env_id, obj_id, kp_scales, kd_scales):
+        """Scale this env's motor gains in place (Table 2). Scales come in the common
+        DOF order; the implicit actuator and the PhysX drive are both updated."""
+        obj = self._objs[obj_id]
+        order = self._dof_order_common2sim[obj_id]
+        kp_s = torch.as_tensor(kp_scales, device=self._device, dtype=torch.float32)[order]
+        kd_s = torch.as_tensor(kd_scales, device=self._device, dtype=torch.float32)[order]
+
+        actuator = obj.actuators["actuators"]
+        actuator.stiffness[env_id] *= kp_s
+        actuator.damping[env_id] *= kd_s
+
+        env_ids = torch.tensor([env_id], device=self._device, dtype=torch.int32)
+        obj.write_joint_stiffness_to_sim(actuator.stiffness[env_id].unsqueeze(0), env_ids=env_ids)
+        obj.write_joint_damping_to_sim(actuator.damping[env_id].unsqueeze(0), env_ids=env_ids)
+        return
+
+    def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
+        """Per-env body mass/CoM randomization. Inertia scales with mass, as the Isaac Gym
+        engine recomputes it from the scaled mass. Inputs are in the common body order."""
+        view = self._objs[obj_id].root_physx_view
+        order = self._body_order_common2sim[obj_id].cpu()
+        idx = torch.tensor([env_id], dtype=torch.int32)
+
+        scales = torch.as_tensor(np.asarray(mass_scales), dtype=torch.float32)
+        scales = scales.reshape(-1)[order] if (scales.numel() > 1) else scales.reshape(1)
+
+        masses = view.get_masses().clone()
+        inertias = view.get_inertias().clone()
+        masses[env_id] *= scales
+        if (inertias.dim() == 2):  # single rigid body view: [num_envs, 9]
+            inertias[env_id] *= scales.reshape(-1)[0]
+        else:                      # articulation view: [num_envs, num_bodies, 9]
+            inertias[env_id] *= scales.unsqueeze(-1)
+        view.set_masses(masses, idx)
+        view.set_inertias(inertias, idx)
+
+        if (com_offsets is not None):
+            offsets = torch.as_tensor(np.asarray(com_offsets), dtype=torch.float32)
+            offsets = offsets.reshape(-1, 3)[order] if (offsets.shape[0] > 1) else offsets.reshape(1, 3)
+            coms = view.get_coms().clone()
+            if (coms.dim() == 2):  # single rigid body view: [num_envs, 7]
+                coms[env_id, :3] += offsets.reshape(-1, 3)[0]
+            else:
+                coms[env_id, :, :3] += offsets
+            view.set_coms(coms, idx)
+        return
+
+    def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
+                            compliance=None, body_ids=None):
+        """Per-env contact material of the object's shapes (restricted to body_ids when
+        given, in the common order). PhysX has one friction coefficient per direction, so
+        the Isaac Gym single friction is written as static = dynamic. `compliance` has no
+        PhysX counterpart here and is ignored."""
+        view = self._objs[obj_id].root_physx_view
+        idx = torch.tensor([env_id], dtype=torch.int32)
+        shape_ids = self._get_shape_ids(obj_id, body_ids)
+        if (len(shape_ids) == 0):
+            return
+
+        materials = view.get_material_properties().clone()
+        if (friction is not None):
+            materials[env_id, shape_ids, 0] = float(friction)
+            materials[env_id, shape_ids, 1] = float(friction)
+        if (restitution is not None):
+            materials[env_id, shape_ids, 2] = float(restitution)
+        view.set_material_properties(materials, idx)
+        return
+
+    def get_obj_body_shape_ids(self, env_id, obj_id, body_ids):
+        return self._get_shape_ids(obj_id, body_ids)
+
+    def _get_shape_ids(self, obj_id, body_ids):
+        """Flat shape indices (PhysX body-major order) for the given common body ids."""
+        obj = self._objs[obj_id]
+        view = obj.root_physx_view
+        if (self.get_obj_type(obj_id) != engine.ObjType.articulated):
+            return list(range(view.max_shapes))
+        if (body_ids is None):
+            return list(range(view.max_shapes))
+
+        if (obj_id not in self._shape_counts):
+            counts = []
+            for link_path in view.link_paths[0]:
+                link_view = obj._physics_sim_view.create_rigid_body_view(link_path)
+                counts.append(link_view.max_shapes)
+            assert sum(counts) == view.max_shapes, \
+                "shape count mismatch: {} vs {}".format(sum(counts), view.max_shapes)
+            self._shape_counts[obj_id] = counts
+        counts = self._shape_counts[obj_id]
+        starts = np.concatenate([[0], np.cumsum(counts)])
+
+        common2sim = self._body_order_sim2common[obj_id].cpu().tolist()  # common id -> sim id
+        shape_ids = []
+        for b in body_ids:
+            sim_b = common2sim[int(b)]
+            shape_ids.extend(range(int(starts[sim_b]), int(starts[sim_b + 1])))
+        return shape_ids
     
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
         env_offset = self._env_offsets[env_id].cpu().numpy()
@@ -615,31 +793,13 @@ class IsaacLabEngine(engine.Engine):
         return self._sim
     
     def _build_ground(self):
-        import isaaclab.sim as sim_utils
-        from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-        import omni.kit.commands
-        from pxr import UsdPhysics
-
-        ground_col = np.array([1.0, 0.9, 0.75])
-        ground_col *= 0.017
-        ground_path = GROUND_PATH
+        """Ground built locally (no Nucleus asset, so no network at runtime); see
+        util/usd_ground.py. The ground root is a kinematic rigid body so the contact
+        sensors can filter against it."""
+        import util.usd_ground as usd_ground
 
         env_offset_max = torch.max(torch.abs(self._env_offsets)).item()
-        texture_width = 2.0 * env_offset_max + 100.0
-
-        physics_material = sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0,
-                                                          restitution=0.0)
-        plane_cfg = GroundPlaneCfg(physics_material=physics_material, color=ground_col,
-                                    size=(texture_width, texture_width))
-        self._ground = spawn_ground_plane(prim_path=ground_path, cfg=plane_cfg)
-
-        # add rigid body schema to terrain to enable contact sensors
-        UsdPhysics.RigidBodyAPI.Apply(self._stage.GetPrimAtPath(ground_path))
-        UsdPhysics.RigidBodyAPI.Get(self._stage, ground_path).GetKinematicEnabledAttr().Set(True)
-
-        shader_path = ground_path + "/Looks/theGrid/Shader"
-        shader_prim = self._stage.GetPrimAtPath(shader_path)
-        shader_prim.GetAttribute("inputs:albedo_add").Set(10.0)
+        usd_ground.build_ground(self._stage, GROUND_PATH, self._ground_config, env_offset_max)
         return
     
     def _compute_env_offsets(self, num_envs):
@@ -1079,7 +1239,8 @@ class IsaacLabEngine(engine.Engine):
     def _build_ground_contact_sensors(self):
         from isaaclab.sensors import ContactSensorCfg, ContactSensor
 
-        ground_prim_paths = [GROUND_PATH + ".*"]
+        # exact path: only the ground ROOT is a rigid body (its tiles/floor are shapes of it)
+        ground_prim_paths = [GROUND_PATH]
         
         self._ground_contact_sensors = []
         objs_per_env = self.get_objs_per_env()

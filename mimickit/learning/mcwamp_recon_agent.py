@@ -68,6 +68,7 @@ class MCWAMPReconAgent(mcwamp_agent.MCWAMPAgent):
         for key in own_state.keys():
             if (key.startswith("_critic_obs_norm.") and key not in state_dict):
                 state_dict[key] = own_state[key].clone()
+        self._fill_missing_kick_disc(state_dict)
         super(mcwamp_agent.MCWAMPAgent, self).load_state_dict(state_dict)
         return
 

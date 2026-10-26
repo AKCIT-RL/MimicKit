@@ -1,0 +1,12 @@
+# k94a: k93r + nav mode (doc 26), seeded from k93r 700 after prep_cmd_warmstart.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k94a_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1629000000
+--out_dir output/t1_soccer_k94a/

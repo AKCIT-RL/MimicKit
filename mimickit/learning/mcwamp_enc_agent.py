@@ -24,6 +24,11 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
         # recon gating: exponential decay of the per-sample weight by frames
         # since the ball was last seen; <= 0 disables (c5 behavior)
         self._enc_recon_gate_halflife = float(config.get("enc_recon_gate_halflife", 0.0))
+        # standardize each recon target dim (running mean/std over the obs normalizer window), as Olives'
+        # MCWAMPReconAgent (e80tonn1): the paper target mixes metres, m/s, a mass scale and CoM offsets, and a raw
+        # MSE leaves the small-variance dims without gradient. The decoder then predicts in the standardized space;
+        # recon_unnormalize() maps a prediction back. False = raw MSE (every earlier run).
+        self._recon_tar_norm = bool(config.get("recon_tar_norm", False))
         return
 
     def _build_model(self, config):
@@ -40,7 +45,20 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
         critic_dtype = torch_util.numpy_dtype_to_torch(critic_space.dtype)
         self._critic_obs_norm = normalizer.Normalizer(
             critic_space.shape, clip=10.0, device=self._device, dtype=critic_dtype)
+        if (self._recon_tar_norm):
+            self._recon_norm = normalizer.Normalizer(
+                (int(self._env.get_recon_tar_size()),), device=self._device)
         return
+
+    def _update_normalizers(self):
+        super()._update_normalizers()
+        if (self._recon_tar_norm):
+            self._recon_norm.update()
+        return
+
+    def recon_unnormalize(self, pred):
+        """Decoder output -> target units (identity without recon_tar_norm)."""
+        return self._recon_norm.unnormalize(pred) if self._recon_tar_norm else pred
 
     def load_state_dict(self, state_dict):
         # MCWAMPAgent seeds a missing critic_obs normalizer from the obs
@@ -50,12 +68,15 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
         for key in own_state.keys():
             if (key.startswith("_critic_obs_norm.") and key not in state_dict):
                 state_dict[key] = own_state[key].clone()
+        self._fill_missing_kick_disc(state_dict)
         super(mcwamp_agent.MCWAMPAgent, self).load_state_dict(state_dict)
         return
 
     def _record_data_pre_step(self, obs, info, action, action_info):
         super()._record_data_pre_step(obs, info, action, action_info)
         self._exp_buffer.record("recon_tar", info["recon_tar"])
+        if (self._recon_tar_norm and self._need_normalizer_update()):
+            self._recon_norm.record(info["recon_tar"])
         return
 
     def _recon_gate_weights(self, obs):
@@ -84,10 +105,18 @@ class MCWAMPEncAgent(mcwamp_agent.MCWAMPAgent):
             # target, no rand-action mask needed
             norm_obs = self._obs_norm.normalize(batch["obs"])
             pred = self._model.eval_recon(norm_obs)
-            sq_err = torch.square(pred - batch["recon_tar"])  # [T, B, 4]
+            tar = batch["recon_tar"]
+            if (self._recon_tar_norm):
+                tar = self._recon_norm.normalize(tar)
+            sq_err = torch.square(pred - tar)  # [T, B, D]
             if (self._enc_recon_gate_halflife > 0):
-                w = self._recon_gate_weights(batch["obs"]).unsqueeze(-1)
-                recon_loss = (w * sq_err).sum() / torch.clamp(w.sum() * sq_err.shape[-1], min=1.0)
+                w = self._recon_gate_weights(batch["obs"]).unsqueeze(-1).expand_as(sq_err)
+                n_gated = int(getattr(self._env, "get_recon_gated_dims", lambda: sq_err.shape[-1])())
+                if (n_gated < sq_err.shape[-1]):
+                    # robot/static targets are observable at all times: no recency gate
+                    w = w.clone()
+                    w[..., n_gated:] = 1.0
+                recon_loss = (w * sq_err).sum() / torch.clamp(w.sum(), min=1.0)
             else:
                 recon_loss = torch.mean(sq_err)
             info["actor_loss"] = info["actor_loss"] + self._enc_recon_weight * recon_loss

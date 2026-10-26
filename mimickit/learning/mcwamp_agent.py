@@ -1,11 +1,16 @@
+import numpy as np
 import torch
 
 import envs.base_env as base_env
+import learning.base_agent as base_agent
+import learning.kick_disc as kick_disc
 import learning.mcwamp_model as mcwamp_model
+import learning.mp_optimizer as mp_optimizer
 import learning.multi_critic_util as multi_critic_util
 import learning.normalizer as normalizer
 import learning.rl_util as rl_util
 import learning.wamp_agent as wamp_agent
+import learning.wgan_util as wgan_util
 import util.mp_util as mp_util
 import util.torch_util as torch_util
 
@@ -35,6 +40,11 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         # keep the pure style stream.
         self._aux_style_weight = float(config.get("aux_style_weight", 1.0))
         self._has_aux_env_reward = False
+        self._has_style_gain = False
+        # doc 25 C(c): second critic trained only on kicks; its style reward is paid on the steps with a foot
+        # near the ball (env info "kick_near"), aux += aux_style_weight * kick_disc_weight * near * kick_disc_r.
+        # 0 = off (no critic built)
+        self._kick_disc_weight = float(config.get("kick_disc_weight", 0.0))
 
         # Per-stream reward scale applied before TD(lambda). Because the
         # advantages are standardized per stream, a uniform scale on a
@@ -50,6 +60,28 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
     def _build_model(self, config):
         model_config = config["model"]
         self._model = mcwamp_model.MCWAMPModel(model_config, self._env)
+        return
+
+    def _build_optimizer(self, config):
+        super()._build_optimizer(config)
+        if (self._kick_disc_weight != 0.0):
+            # built here, not in _build_model: the Enc/Recon agents override _build_model without super()
+            self._kick_disc = kick_disc.KickDisc(config["model"], self._env).to(self._device)
+            self._kick_disc_optimizer = mp_optimizer.MPOptimizer(config["disc_optimizer"],
+                                                                 list(self._kick_disc.parameters()))
+        return
+
+    def _sync_optimizer(self):
+        super()._sync_optimizer()
+        if (self._kick_disc_weight != 0.0):
+            self._kick_disc_optimizer.sync()
+        return
+
+    def _fill_missing_kick_disc(self, state_dict):
+        # warm start from a checkpoint without the kick critic: keep its fresh init
+        for key, val in self.state_dict().items():
+            if (key.startswith("_kick_disc.") and key not in state_dict):
+                state_dict[key] = val.clone()
         return
 
     def _build_normalizers(self):
@@ -80,6 +112,7 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
             # critic_obs: the normalizer does not exist here, drop its keys
             state_dict = {k: v for k, v in state_dict.items()
                           if not k.startswith("_critic_obs_norm.")}
+        self._fill_missing_kick_disc(state_dict)
         super().load_state_dict(state_dict)
         return
 
@@ -104,6 +137,12 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         if ("aux_reward" in next_info):
             self._exp_buffer.record("aux_env_reward", next_info["aux_reward"])
             self._has_aux_env_reward = True
+        if ("style_gain" in next_info):
+            # per-step multiplier of the disc reward (soccer env, doc 25 C(b)); 1 everywhere = off
+            self._exp_buffer.record("style_gain", next_info["style_gain"])
+            self._has_style_gain = True
+        if (self._kick_disc_weight != 0.0):
+            self._exp_buffer.record("kick_near", next_info["kick_near"])
         if (self._use_critic_obs):
             self._exp_buffer.record("next_critic_obs", next_info["critic_obs"])
         return
@@ -123,6 +162,64 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
             "disc_reward_mean": disc_reward_mean,
             "disc_reward_std": disc_reward_std
         }
+        if (self._kick_disc_weight != 0.0):
+            kick_r = self._calc_kick_disc_rewards(norm_disc_obs)
+            self._exp_buffer.set_data_flat("kick_disc_reward", kick_r)
+            near = self._exp_buffer.get_data_flat("kick_near")
+            info["kick_disc_near_frac"] = near.mean()
+            info["kick_disc_r_near"] = (kick_r * near).sum() / near.sum().clamp_min(1.0)
+            info["disc_r_near"] = (disc_r * near).sum() / near.sum().clamp_min(1.0)
+        return info
+
+    def _calc_kick_disc_rewards(self, norm_disc_obs):
+        with torch.no_grad():
+            scores = torch_util.eval_minibatch(self._kick_disc, {"disc_obs": norm_disc_obs},
+                                               self._disc_eval_batch_size).squeeze(-1)
+            if (self._disc_reward_norm):
+                if (self._mode == base_agent.AgentMode.TRAIN):
+                    new_mean, new_var = wgan_util.update_score_stats_ema(
+                        self._kick_disc.score_mean, self._kick_disc.score_var, scores,
+                        self._disc_reward_norm_alpha)
+                    self._kick_disc.score_mean[:] = new_mean
+                    self._kick_disc.score_var[:] = new_var
+                scores = wgan_util.normalize_scores(scores, self._kick_disc.score_mean, self._kick_disc.score_var)
+            return wgan_util.compute_wamp_disc_rewards(scores, self._disc_reward_score_scale, self._disc_reward_scale)
+
+    def _update_model(self):
+        info = super()._update_model()
+        if (self._kick_disc_weight != 0.0):
+            info = {**info, **self._update_kick_disc()}
+        return info
+
+    def _update_kick_disc(self):
+        """WGAN-GP steps of the kick critic: agent = near-ball steps of this iteration, demo = kick windows."""
+        disc_obs = self._exp_buffer.get_data_flat("disc_obs")
+        agent_obs = disc_obs[self._exp_buffer.get_data_flat("kick_near") > 0]
+        n = agent_obs.shape[0]
+        if (n < 64):
+            return {"kick_disc_agent_n": torch.tensor(float(n), device=self._device)}
+        norm_agent = self._disc_obs_norm.normalize(agent_obs)
+        norm_demo = self._disc_obs_norm.normalize(self._env.fetch_kick_disc_obs_demo(n))
+        batch = min(n, int(np.ceil(self._disc_batch_size * self.get_num_envs())))
+        steps = int(np.ceil(n / batch)) * self._disc_epochs
+        info = dict()
+        for _ in range(steps):
+            ia = torch.randint(0, n, [batch], device=self._device)
+            idm = torch.randint(0, n, [batch], device=self._device)
+            demo, agent = norm_demo[idm], norm_agent[ia]
+            demo_s = self._kick_disc(demo).squeeze(-1)
+            agent_s = self._kick_disc(agent).squeeze(-1)
+            loss, w_info = wgan_util.compute_wasserstein_disc_loss(demo_s, agent_s, self._disc_score_scale)
+            gp, _ = wgan_util.compute_interp_grad_penalty(self._kick_disc, demo, agent)
+            loss = loss + self._disc_grad_penalty * gp
+            if (self._disc_logit_reg != 0):
+                loss = loss + self._disc_logit_reg * torch.sum(torch.square(self._kick_disc.get_logit_weights()))
+            self._kick_disc_optimizer.step(loss)
+            step_info = {"kick_disc_loss": loss.detach(), "kick_disc_w_gap": w_info["disc_w_gap"],
+                         "kick_disc_grad_penalty": gp.detach()}
+            torch_util.add_torch_dict(step_info, info)
+        torch_util.scale_torch_dict(1.0 / steps, info)
+        info["kick_disc_agent_n"] = torch.tensor(float(n), device=self._device)
         return info
 
     def _build_train_data(self):
@@ -151,9 +248,14 @@ class MCWAMPAgent(wamp_agent.WAMPAgent):
         done = self._exp_buffer.get_data("done")
         rand_action_mask = self._exp_buffer.get_data("rand_action_mask")
 
+        if (self._has_style_gain):
+            disc_r = disc_r * self._exp_buffer.get_data("style_gain")
         aux_r = self._aux_style_weight * disc_r
         if (self._has_aux_env_reward):
             aux_r = aux_r + self._exp_buffer.get_data("aux_env_reward")
+        if (self._kick_disc_weight != 0.0):
+            aux_r = aux_r + self._aux_style_weight * self._kick_disc_weight \
+                * self._exp_buffer.get_data("kick_near") * self._exp_buffer.get_data("kick_disc_reward")
 
         # per-stream reward means (pre critic scaling) for diagnostics
         task_reward_mean = task_r.mean().detach()

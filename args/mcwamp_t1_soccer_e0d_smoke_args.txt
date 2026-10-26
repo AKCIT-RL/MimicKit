@@ -1,0 +1,12 @@
+--num_envs 256
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_uneven.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_e0d_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_e0_agent.yaml
+
+--logger txt
+--save_int_models false
+--max_samples 2000000
+--model_file output/t1_soccer_e0c_seed1/model.pt
+--out_dir output/smoke_e0d/

@@ -27,13 +27,13 @@ def build_agent(agent_file, env, device):
         import learning.wamp_agent as wamp_agent
         agent = wamp_agent.WAMPAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "MCWAMP"):
-        import learning.mcwamp_agent as mcwamp_agent
+        import learning.mcwamp.mcwamp_agent as mcwamp_agent
         agent = mcwamp_agent.MCWAMPAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "MCWAMPRecon"):
-        import learning.mcwamp_recon_agent as mcwamp_recon_agent
+        import learning.mcwamp.mcwamp_recon_agent as mcwamp_recon_agent
         agent = mcwamp_recon_agent.MCWAMPReconAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "MCWAMPEnc"):
-        import learning.mcwamp_enc_agent as mcwamp_enc_agent
+        import learning.mcwamp.mcwamp_enc_agent as mcwamp_enc_agent
         agent = mcwamp_enc_agent.MCWAMPEncAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "SMP"):
         import learning.smp_agent as smp_agent

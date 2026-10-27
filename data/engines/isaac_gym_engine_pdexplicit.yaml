@@ -1,0 +1,11 @@
+# Diagnostico (2026-10-25): identico a isaac_gym_engine.yaml, unica diferenca control_mode pd_explicit
+# (torque = kp*(q*-q) - kd*qdot a cada passo de fisica, clipado no effort do asset), o atuador do MuJoCo/firmware.
+# Para avaliar politicas treinadas em pos; nao e config de treino.
+engine_name: "isaac_gym"
+    
+control_mode: "pd_explicit"
+control_freq: 30
+sim_freq: 120
+env_spacing: 5
+    
+ground_contact_height: 0.3

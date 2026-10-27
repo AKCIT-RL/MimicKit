@@ -1,0 +1,10 @@
+# Diagnostico (2026-10-25): base isaac_gym_engine.yaml; control_mode pos, sim_freq 480, physx_velocity_iterations 0. Nao e config de treino.
+engine_name: "isaac_gym"
+    
+control_mode: "pos"
+control_freq: 30
+sim_freq: 480
+env_spacing: 5
+    
+ground_contact_height: 0.3
+physx_velocity_iterations: 0

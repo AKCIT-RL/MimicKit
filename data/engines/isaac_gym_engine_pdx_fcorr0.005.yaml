@@ -1,0 +1,11 @@
+# Diagnostico (2026-10-25): base isaac_gym_engine_pdexplicit.yaml; physx_friction_correlation_distance 0.005. Nao e config de treino.
+engine_name: "isaac_gym"
+    
+control_mode: "pd_explicit"
+control_freq: 30
+sim_freq: 120
+env_spacing: 5
+    
+ground_contact_height: 0.3
+
+physx_friction_correlation_distance: 0.005

@@ -256,6 +256,11 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._reg_diag_enabled = self._aux_reward_enabled or \
             bool(env_config.get("reward_reg_diagnostics", False))
 
+        # diagnostic (2026-10-25), None = off: PhysX torsion_friction on the
+        # feet, written at build time next to the foot friction DR
+        tor = env_config.get("foot_torsion_friction", None)
+        self._foot_torsion_friction = None if tor is None else float(tor)
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
@@ -357,6 +362,11 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                                              restitution=params["foot_restitution"],
                                              compliance=params["foot_compliance"],
                                              body_ids=foot_ids)
+        # diagnostic (2026-10-25), off by default: PhysX torsional friction on
+        # the feet, set at build time like the friction DR above
+        if (self._foot_torsion_friction is not None):
+            self._engine.set_obj_shape_props(env_id, char_id, torsion_friction=self._foot_torsion_friction,
+                                             body_ids=foot_ids)
         return
 
     def _apply_dr_runtime(self):
@@ -367,6 +377,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         for env_id, params in enumerate(self._dr_samples):
             self._engine.scale_obj_pd_gains(env_id, char_id, params["kp_scale"],
                                             params["kd_scale"])
+            if (np.any(params["joint_friction"] != 0.0)):
+                self._engine.set_obj_dof_friction(env_id, char_id, params["joint_friction"])
 
         self._motor_bias = torch.as_tensor(
             np.stack([p["motor_bias"] for p in self._dr_samples]),

@@ -7,6 +7,7 @@ import engines.engine as engine
 import envs.base_env as base_env
 import envs.diag_util as diag_util
 import envs.smp_env as smp_env
+import envs.soccer.dribble_util as dribble_util
 import envs.soccer.soccer_util as soccer_util
 import envs.steering.steering_disc as steering_disc
 import envs.steering.steering_dr as steering_dr
@@ -102,6 +103,29 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # every (re)draw; _nav_fixed_cmd [3] replaces the sampled command
         self._nav_force = None
         self._nav_fixed_cmd = None
+
+        # dribble mode (doc 34): third episode mode, command = desired ball
+        # velocity in the heading frame, ball stays visible. All off by default.
+        self._drib_cmd_prob = float(env_config.get("drib_cmd_prob", 0.0))
+        self._drib_speed_range = [float(v) for v in env_config.get("drib_speed_range", [0.2, 1.0])]
+        self._drib_dir_max_deg = float(env_config.get("drib_dir_max_deg", 45.0))
+        self._drib_still_prob = float(env_config.get("drib_still_prob", 0.1))
+        self._drib_resample_s = [float(v) for v in env_config.get("drib_resample_s", [3.0, 5.0])]
+        self._drib_far_prob = float(env_config.get("drib_far_prob", 0.0))
+        self._drib_style_gain = float(env_config.get("drib_style_gain", 1.0))
+        self._reward_drib_vel_w = float(env_config.get("reward_drib_vel_w", 0.0))
+        self._drib_vel_sigma = float(env_config.get("drib_vel_sigma", 0.1))
+        self._reward_drib_prog_w = float(env_config.get("reward_drib_prog_w", 0.0))
+        self._drib_prog_over_pen = float(env_config.get("drib_prog_over_pen", 0.0))
+        self._reward_drib_chase_w = float(env_config.get("reward_drib_chase_w", 0.0))
+        self._reward_drib_dist_w = float(env_config.get("reward_drib_dist_w", 0.0))
+        self._drib_near_dist = float(env_config.get("drib_near_dist", 0.8))
+        self._drib_far_dist = float(env_config.get("drib_far_dist", 2.0))
+        self._drib_free_dist = float(env_config.get("drib_free_dist", 1.5))
+        self._drib_max_dist = float(env_config.get("drib_max_dist", 3.0))
+        # evaluation hooks: None = sample; True/False = force dribble on/off; fixed [2] command
+        self._drib_force = None
+        self._drib_fixed_cmd = None
 
         # spawn the ball in front of the robot (T1: "closer ball so robot can
         # actually reach and kick it") instead of uniformly over the field
@@ -767,7 +791,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     _STAGE_PARAM_KEYS = {"episode_length", "stand_start_prob", "reward_ball_chase_w", "reward_ball_align_w",
                          "ball_curriculum_far_prob", "ball_goal_strip_prob", "ball_goal_core_prob",
                          "nav_cmd_prob", "nav_switch_prob", "nav_cmd_scale",
-                         "reward_nav_lin_w", "reward_nav_yaw_w"}
+                         "reward_nav_lin_w", "reward_nav_yaw_w",
+                         "drib_cmd_prob", "drib_dir_max_deg", "drib_far_prob", "drib_vel_sigma",
+                         "reward_drib_vel_w", "reward_drib_prog_w", "reward_drib_chase_w", "reward_drib_dist_w"}
 
     def _ground_z(self, env_ids, keepdim=False):
         """Spawn lift of the ground under env_ids (None = all envs): the scalar _ground_z_offset unless
@@ -962,6 +988,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._k2n_left = torch.full([num_envs], float("inf"), device=self._device)
         self._k2n_abandon_left = torch.full([num_envs], float("inf"), device=self._device)
         self._nav_vel_filt = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
+        self._drib_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._drib_cmd = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._drib_cmd_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -1362,6 +1391,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 task_obs = task_obs.clone()
                 task_obs[nav, 0:2] = 0.0
                 ball_mask = torch.where(nav.unsqueeze(-1), torch.zeros_like(ball_mask), ball_mask)
+        if (self._drib_active()):
+            drib = self._drib_mode if env_ids is None else self._drib_mode[env_ids]
+            if (drib.any()):
+                # dribble: the command replaces the steering block, the ball stays visible
+                cmd = self._drib_cmd if env_ids is None else self._drib_cmd[env_ids]
+                steer_obs = torch.where(drib.unsqueeze(-1), dribble_util.compute_dribble_cmd_obs(cmd), steer_obs)
         if (self._goal_odom_noise and not privileged):
             # the goal comes from the odometry pose estimate, not the true pose
             odom_scale = self._schedule_progress(self._goal_odom_start_samples, self._goal_odom_end_samples)
@@ -1459,8 +1494,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # a scored ball is also outside the field; count it only as a goal
         self._ball_oob_buf &= ~self._goal_scored_buf
         # navigation episodes ignore the (parked) ball
-        self._goal_scored_buf &= ~self._nav_mode
-        self._ball_oob_buf &= ~self._nav_mode
+        self._goal_scored_buf &= ~self._nonkick_mode()
+        self._ball_oob_buf &= ~self._nonkick_mode()
 
         # ball motion timers (before reward caching: the decay and gating of
         # this step must see the up-to-date times)
@@ -1478,6 +1513,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cache_aux_reward(ball_pos)
         if (self._nav_active()):
             self._cache_nav_reward()
+        if (self._drib_active()):
+            self._cache_drib_reward()
 
         # 3. goal / out of bounds terminate the episode (paper 4.1); the
         #    flags become dones in _update_done and the reset keeps the
@@ -1494,6 +1531,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._post_goal_steps_left = torch.clamp(self._post_goal_steps_left - 1, min=0)
         if (self._nav_active()):
             self._update_nav_cmd()
+        if (self._drib_active()):
+            self._update_drib_cmd()
         if (self._task_hist_steps > 0):
             # exactly one roll per physics step, after the perception tick so
             # the newest history entry matches what the actor sees this step
@@ -2085,7 +2124,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         stagnant = soccer_util.compute_stagnation_flags(root_pos, self._stagnation_anchor_pos,
                                                         self._stagnation_move_threshold)
         stagnant = torch.logical_and(stagnant, window_done)
-        kick_m = (~self._nav_mode).float()
+        kick_m = (~self._nonkick_mode()).float()
         aux_r += self._stagnation_w_now() * stagnant.float() * kick_m
         if (window_done.any()):
             self._stagnation_anchor_pos[window_done] = root_pos[window_done]
@@ -2113,7 +2152,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 kick_align_r += self._reward_kick_alignment_w * \
                     soccer_util.compute_kick_alignment_reward(foot_vel, ball_pos,
                                                               self._goal_pos, contact,
-                                                              self._kick_alignment_power)
+                                                              self._kick_alignment_power) * kick_m
         aux_r += kick_side_r + kick_fwd_r + kick_align_r
         foot_ball_d = torch.stack([torch.linalg.norm(body_pos[:, f, :] - ball_pos, dim=-1)
                                    for f in self._foot_body_ids], dim=-1).min(dim=-1).values
@@ -2121,6 +2160,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._style_gain_buf[:] = 1.0 + (self._style_near_ball_gain - 1.0) * style_near
         if (self._nav_style_gain != 1.0):
             self._style_gain_buf[:] = torch.where(self._nav_mode, self._style_gain_buf * self._nav_style_gain,
+                                                  self._style_gain_buf)
+        if (self._drib_style_gain != 1.0):
+            self._style_gain_buf[:] = torch.where(self._drib_mode, self._style_gain_buf * self._drib_style_gain,
                                                   self._style_gain_buf)
         self._kick_near_buf[:] = style_near
         self._diag.add_mean("style_near_ball_frac", style_near)
@@ -2279,12 +2321,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # diagnostics: termination term + per-episode event counters
         d = self._diag
         d.add_mean("reward_termination", self._reward_termination_w * fall_mask.float())
-        kick_ep = ~self._nav_mode
+        kick_ep = ~self._nonkick_mode()
         d.add_sum("ep_falls", torch.logical_and(fall_mask, kick_ep).float())
         if (self._nav_active()):
             nav_end = torch.logical_and(self._nav_mode, self._done_buf != base_env.DoneFlags.NULL.value)
             d.add_sum("nav_ep_done", nav_end.float())
             d.add_sum("nav_ep_falls", torch.logical_and(fall_mask, self._nav_mode).float())
+        if (self._drib_active()):
+            drib_end = torch.logical_and(self._drib_mode, self._done_buf != base_env.DoneFlags.NULL.value)
+            d.add_sum("drib_ep_done", drib_end.float())
+            d.add_sum("drib_ep_falls", torch.logical_and(fall_mask, self._drib_mode).float())
         d.add_sum("ep_goals", self._goal_scored_buf.float())
         d.add_sum("ep_oob", self._ball_oob_buf.float())
         d.add_sum("goal_time", self._time_buf * self._goal_scored_buf.float())
@@ -2365,6 +2411,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         diags["ep_goal_rate"] = goals / eps if eps > 0.0 else 0.0
         diags["ep_fall_rate"] = sums.get("ep_falls", 0.0) / eps if eps > 0.0 else 0.0
         diags["ep_oob_rate"] = sums.get("ep_oob", 0.0) / eps if eps > 0.0 else 0.0
+        if (self._drib_active()):
+            drib_eps = sums.get("drib_ep_done", 0.0)
+            drib_steps = sums.get("drib_steps", 0.0)
+            diags["drib_ep_fall_rate"] = sums.get("drib_ep_falls", 0.0) / drib_eps if drib_eps > 0.0 else 0.0
+            for k in ("drib_vel_err", "drib_dir_err_deg", "drib_ball_dist", "drib_ball_lost"):
+                diags[k] = sums.get(k, 0.0) / drib_steps if drib_steps > 0.0 else 0.0
         if (self._nav_active()):
             nav_eps = sums.get("nav_ep_done", 0.0)
             nav_steps = sums.get("nav_steps", 0.0)
@@ -2507,7 +2559,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _update_ball_perturb(self):
         if (not self._ball_perturb_enable or not self._switch_on(self._ball_perturb_start_samples)):
             return
-        trigger_mask = self._time_buf >= self._ball_perturb_times
+        trigger_mask = torch.logical_and(self._time_buf >= self._ball_perturb_times, ~self._drib_mode)
         env_ids = trigger_mask.nonzero(as_tuple=False).flatten()
         n = len(env_ids)
         if (n > 0):
@@ -2592,6 +2644,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
             self._reset_nav_mode(env_ids)
+            self._reset_drib_mode(env_ids)
             if (self._virtual_perception):
                 self._reset_perception(env_ids)
             if (self._task_hist_steps > 0):
@@ -2652,8 +2705,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # the spatial benchmark is a kick benchmark: no nav draws, also
             # on the soft resets after a goal
             self._nav_force = False
+        if (self._drib_cmd_prob > 0.0 and self._drib_force is None):
+            self._drib_force = False
         self._reset_envs(env_ids)
         self._nav_mode[env_ids] = False
+        self._drib_mode[env_ids] = False
 
         n = len(env_ids)
         char_id = self._get_char_id()
@@ -2725,6 +2781,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reset_ball(env_ids, near=not self._ball_soft_reset_far,
                          gauss=self._ball_event_gauss())
         self._reset_nav_mode(env_ids)
+        self._reset_drib_mode(env_ids)
         self._post_goal_steps_left[:] = 0
         self._post_goal_steps_left[env_ids] = 16  # ~0.5 s at 30 Hz
         self._goal_odom_next_redraw[env_ids] = self._time_buf[env_ids] + self._goal_odom_redraw
@@ -2865,7 +2922,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._kick_to_nav_rate > 0.0 and self._nav_force is None):
             # kick -> nav mid-episode (per second rate), robot state kept
             p_step = self._kick_to_nav_rate * self._engine.get_timestep()
-            k2n = torch.logical_and(~self._nav_mode, torch.rand([self.get_num_envs()], device=self._device) < p_step)
+            k2n = torch.logical_and(~self._nonkick_mode(), torch.rand([self.get_num_envs()], device=self._device) < p_step)
             if (self._kick_to_nav_dist > 0.0):
                 # only near the ball: the far-ball chase must not be cut short
                 root_xy = self._engine.get_root_pos(self._get_char_id())[:, 0:2]
@@ -2895,7 +2952,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         of the episode arms a delayed switch with prob k2n_post_prob; independently the chase
         may be abandoned at a random time. The robot state is kept."""
         dt = self._engine.get_timestep()
-        kick_mode = ~self._nav_mode
+        kick_mode = ~self._nonkick_mode()
         char_id = self._get_char_id()
         if (self._k2n_post_prob > 0.0):
             body = self._engine.get_body_pos(char_id)
@@ -2935,6 +2992,113 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._stagnation_anchor_pos[env_ids] = self._engine.get_root_pos(char_id)[env_ids]
         self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
         self._record_reset_prev_states(env_ids)
+        return
+
+    def _drib_active(self):
+        return self._drib_cmd_prob > 0.0 or self._drib_force is not None
+
+    def _nonkick_mode(self):
+        """Episodes whose task is not the kick task (navigation or dribble)."""
+        return torch.logical_or(self._nav_mode, self._drib_mode)
+
+    def _reset_drib_mode(self, env_ids):
+        """Draw dribble episodes among the non-nav ones; the ball is placed near
+        (or far with drib_far_prob, the chase stage) and a command is drawn."""
+        if (not self._drib_active() or len(env_ids) == 0):
+            self._drib_mode[env_ids] = False
+            return
+        if (self._drib_force is not None):
+            drib = torch.full([len(env_ids)], bool(self._drib_force), device=self._device, dtype=torch.bool)
+        else:
+            drib = torch.rand([len(env_ids)], device=self._device) < self._drib_cmd_prob
+        drib &= ~self._nav_mode[env_ids]
+        self._drib_mode[env_ids] = drib
+        drib_ids = env_ids[drib]
+        if (len(drib_ids) > 0):
+            far = torch.rand([len(drib_ids)], device=self._device) < self._drib_far_prob
+            if (far.any()):
+                self._reset_ball(drib_ids[far], near=False)
+            if ((~far).any()):
+                self._reset_ball(drib_ids[~far], near=True)
+            self._resample_drib_cmd(drib_ids)
+        return
+
+    def _resample_drib_cmd(self, env_ids):
+        n = len(env_ids)
+        if (self._drib_fixed_cmd is not None):
+            cmd = torch.as_tensor(self._drib_fixed_cmd, device=self._device, dtype=torch.float)
+            cmd = cmd.reshape(-1, 2).expand(n, 2).clone()
+        else:
+            cmd = dribble_util.sample_dribble_cmd(n, self._drib_speed_range,
+                                                  np.deg2rad(self._drib_dir_max_deg),
+                                                  self._drib_still_prob, self._device)
+        self._drib_cmd[env_ids] = cmd
+        lo_t, hi_t = self._drib_resample_s
+        self._drib_cmd_time[env_ids] = self._time_buf[env_ids] + lo_t \
+            + (hi_t - lo_t) * torch.rand([n], device=self._device)
+        return
+
+    def _update_drib_cmd(self):
+        due = torch.logical_and(self._drib_mode, self._time_buf >= self._drib_cmd_time)
+        ids = due.nonzero(as_tuple=False).flatten()
+        if (len(ids) > 0 and self._drib_fixed_cmd is None):
+            self._resample_drib_cmd(ids)
+        return
+
+    def set_drib_mode(self, env_ids, on):
+        """Mid-episode switch (evaluation / transitions): dribble keeps the ball where it is
+        and draws a command; leaving it hands the ball to the kick task. Robot state is kept."""
+        if (len(env_ids) == 0):
+            return
+        self._drib_mode[env_ids] = bool(on)
+        if (on):
+            self._nav_mode[env_ids] = False
+            self._resample_drib_cmd(env_ids)
+        if (self._virtual_perception):
+            self._reset_perception(env_ids)
+        self._record_reset_prev_states(env_ids)
+        return
+
+    def _cache_drib_reward(self):
+        """Dribble episodes: ball-velocity tracking (heading frame) when the ball is near,
+        chase when it is far, penalty for letting it go; replaces the kick task reward."""
+        char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)
+        root_rot = self._engine.get_root_rot(char_id)
+        ball_pos = self._get_ball_pos()
+        ball_vel = self._engine.get_root_vel(self._get_ball_id())
+        heading_inv = torch_util.calc_heading_quat_inv(root_rot)
+        v_ball_h = torch_util.quat_rotate(heading_inv, ball_vel)[:, 0:2]
+        vel_r = dribble_util.compute_dribble_vel_reward(v_ball_h, self._drib_cmd, self._drib_vel_sigma)
+        dist = torch.linalg.norm(ball_pos[:, 0:2] - root_pos[:, 0:2], dim=-1)
+        near = dribble_util.compute_dribble_near_weight(dist, self._drib_near_dist, self._drib_far_dist)
+        chase_r = soccer_util.compute_ball_chase_reward(
+            root_pos, self._prev_root_pos, ball_pos, self._steer_stop_dist,
+            self._steer_speed_max, self._engine.get_timestep(), self._ball_chase_vel_scale)
+        dist_pen = dribble_util.compute_dribble_dist_penalty(dist, self._drib_free_dist, self._drib_max_dist)
+        prog_r = dribble_util.compute_dribble_progress_reward(v_ball_h, self._drib_cmd, self._drib_prog_over_pen)
+        r_vel = self._reward_drib_vel_w * near * vel_r + self._reward_drib_prog_w * near * prog_r
+        r_chase = self._reward_drib_chase_w * (1.0 - near) * chase_r
+        r_dist = self._reward_drib_dist_w * dist_pen
+        drib = self._drib_mode
+        self._task_reward_buf[:] = torch.where(drib, r_vel + r_chase + r_dist, self._task_reward_buf)
+        dm = drib.float()
+        err = torch.linalg.norm(self._drib_cmd - v_ball_h, dim=-1)
+        cmd_dir = torch.atan2(self._drib_cmd[:, 1], self._drib_cmd[:, 0])
+        v_dir = torch.atan2(v_ball_h[:, 1], v_ball_h[:, 0])
+        d_dir = torch.abs(torch.atan2(torch.sin(v_dir - cmd_dir), torch.cos(v_dir - cmd_dir)))
+        moving = (torch.linalg.norm(self._drib_cmd, dim=-1) > 0.05).float()
+        d = self._diag
+        d.add_mean("drib_frac", dm)
+        d.add_mean("reward_drib_vel", dm * r_vel)
+        d.add_mean("drib_prog", dm * near * prog_r)
+        d.add_mean("reward_drib_chase", dm * r_chase)
+        d.add_mean("reward_drib_dist", dm * r_dist)
+        d.add_sum("drib_steps", dm)
+        d.add_sum("drib_vel_err", dm * err)
+        d.add_sum("drib_dir_err_deg", dm * moving * torch.rad2deg(d_dir))
+        d.add_sum("drib_ball_dist", dm * dist)
+        d.add_sum("drib_ball_lost", dm * (dist > self._drib_max_dist).float())
         return
 
     def _cache_nav_reward(self):

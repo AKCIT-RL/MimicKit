@@ -14,6 +14,7 @@ from util.logger import Logger
 import util.booster_terrain as booster_terrain
 import util.terrain_util as terrain_util
 import util.torch_util as torch_util
+import util.actuator_util as actuator_util
 
 def str_to_key_code(key_str):
     key_str = key_str.upper()
@@ -67,6 +68,14 @@ class IsaacGymEngine(engine.Engine):
         self._timestep = 1.0 / control_freq
         self._sim_steps = int(sim_freq / control_freq)
         sim_timestep = 1.0 / sim_freq
+        # PhysX TGS iterations; the defaults are the values hardcoded before
+        # 2026-10-25 (booster_gym, validated on the robot, uses 4/1 at 500 Hz)
+        self._physx_pos_iters = int(config.get("physx_position_iterations", 4))
+        self._physx_vel_iters = int(config.get("physx_velocity_iterations", 0))
+        # PhysX friction patching; None = Isaac Gym's defaults (0.025 / 0.04 m),
+        # i.e. unchanged for every config written before 2026-10-25
+        self._physx_friction_corr = config.get("physx_friction_correlation_distance", None)
+        self._physx_friction_offset = config.get("physx_friction_offset_threshold", None)
         self._sim = self._create_simulator(sim_timestep, visualize, record_video)
 
         self._ground_contact_height = config.get("ground_contact_height", 0.3)
@@ -700,7 +709,7 @@ class IsaacGymEngine(engine.Engine):
         return getattr(self, "_booster_ground", None)
 
     def set_obj_shape_props(self, env_id, obj_id, friction=None, restitution=None,
-                            compliance=None, body_ids=None):
+                            compliance=None, body_ids=None, torsion_friction=None, rolling_friction=None):
         env_ptr = self.get_env(env_id)
         props = self._gym.get_actor_rigid_shape_properties(env_ptr, obj_id)
 
@@ -717,6 +726,14 @@ class IsaacGymEngine(engine.Engine):
                 p.restitution = float(restitution)
             if (compliance is not None):
                 p.compliance = float(compliance)
+            # torsional resistance of a contact patch (PhysX). 2026-10-25: an
+            # open-loop replay of MuJoCo targets showed the stance-leg hip yaw
+            # turning ~2 deg more in Isaac than in MuJoCo within 5 steps, with
+            # the swing leg identical (scripts/isaac_replay_targets.py).
+            if (torsion_friction is not None):
+                p.torsion_friction = float(torsion_friction)
+            if (rolling_friction is not None):
+                p.rolling_friction = float(rolling_friction)
         self._gym.set_actor_rigid_shape_properties(env_ptr, obj_id, props)
         return
 
@@ -763,6 +780,23 @@ class IsaacGymEngine(engine.Engine):
                 props["stiffness"][:] = kp[env_id].cpu().numpy()
             props["damping"][:] = kd[env_id].cpu().numpy()
             self._gym.set_actor_dof_properties(env_ptr, obj_id, props)
+        return
+
+    def set_obj_dof_friction(self, env_id, obj_id, friction):
+        """Coulomb friction (Nm) per dof of one object in one env.
+
+        Only the pd_explicit loop applies it. In pos/vel mode the PD is PhysX's
+        drive and this tensor would never be read -- the same silent no-op the
+        delay/kp-kd DR had until 2026-10-13 -- so a nonzero value is refused.
+        """
+        friction = torch.as_tensor(friction, device=self._device, dtype=torch.float32)
+        if (torch.any(friction != 0.0)):
+            assert self._control_mode == engine.ControlMode.pd_explicit, \
+                "joint friction is applied only in control_mode pd_explicit, got {}".format(self._control_mode)
+            self._has_dof_friction = True
+        dof0 = int(sum(self.get_obj_num_dofs(i) for i in range(obj_id)))
+        dof1 = dof0 + self.get_obj_num_dofs(obj_id)
+        self._dof_friction_raw[env_id, dof0:dof1] = friction
         return
 
     def set_action_delay(self, delay_weights):
@@ -960,8 +994,12 @@ class IsaacGymEngine(engine.Engine):
         
         sim_params.physx.num_threads = 4
         sim_params.physx.solver_type = 1
-        sim_params.physx.num_position_iterations = 4
-        sim_params.physx.num_velocity_iterations = 0
+        sim_params.physx.num_position_iterations = self._physx_pos_iters
+        sim_params.physx.num_velocity_iterations = self._physx_vel_iters
+        if (self._physx_friction_corr is not None):
+            sim_params.physx.friction_correlation_distance = float(self._physx_friction_corr)
+        if (self._physx_friction_offset is not None):
+            sim_params.physx.friction_offset_threshold = float(self._physx_friction_offset)
         sim_params.physx.contact_offset = 0.02
         sim_params.physx.rest_offset = 0.0
         sim_params.physx.bounce_threshold_velocity = 0.2
@@ -1134,6 +1172,11 @@ class IsaacGymEngine(engine.Engine):
         self._torque_lim_raw = torch.stack(self._torque_lim_raw, dim=0)
 
         self._dof_cmd_raw = torch.zeros_like(self._kp_raw)
+        # Coulomb joint friction (Nm) for pd_explicit; zeros = the plain PD.
+        # Written per env by set_obj_dof_friction (Booster Gym randomizes it,
+        # U(0, 2) Nm; real motors have it, PhysX and the MuJoCo deploy do not).
+        self._dof_friction_raw = torch.zeros_like(self._kp_raw)
+        self._has_dof_friction = False
 
         self._obj_kp = []
         self._obj_kd = []
@@ -1191,8 +1234,9 @@ class IsaacGymEngine(engine.Engine):
         dof_vel = self._dof_state[..., :, 1]
         tar_dof = self._get_dof_cmd_buf()
 
-        torque = self._kp_raw * (tar_dof - dof_pos) - self._kd_raw * dof_vel
-        return torque
+        friction = self._dof_friction_raw if self._has_dof_friction else None
+        return actuator_util.pd_explicit_torque(self._kp_raw, self._kd_raw, tar_dof, dof_pos, dof_vel,
+                                                friction)
     
     def _build_viewer(self):
         # subscribe to keyboard shortcuts

@@ -42,6 +42,10 @@ DEFAULT_RANGES = {
     "foot_friction": (0.0, 1.0),
     "foot_compliance": (0.5, 1.5),
     "foot_restitution": (0.0, 1.0),
+    # Coulomb joint friction per dof, Nm (Booster Gym dof_friction U(0, 2)).
+    # (0, 0) = off; applied only in control_mode pd_explicit (the engine refuses
+    # a nonzero value otherwise). Not in Table 2.
+    "joint_friction_nm": (0.0, 0.0),
 }
 
 # what the critic observes (Table 3, "Mass randomization": mass and CoM of the
@@ -81,6 +85,9 @@ def sample_env_params(rng, ranges, num_bodies, num_dofs, torso_body_id=0):
       com_offsets      [num_bodies, 3]   idem
       foot_friction / foot_compliance / foot_restitution  float
       torso_params     [4]               what the critic observes
+      joint_friction   [num_dofs]        Nm; drawn LAST and only when the range
+                                         is not (0, 0), so every config written
+                                         before it keeps its random stream
     """
     def uniform(key, size=None):
         lo, hi = ranges[key]
@@ -94,7 +101,7 @@ def sample_env_params(rng, ranges, num_bodies, num_dofs, torso_body_id=0):
     mass_scales[torso_body_id] = torso_mass_scale
     com_offsets[torso_body_id] = torso_com
 
-    return {
+    out = {
         "action_delay_ms": float(uniform("action_delay_ms")),
         "motor_bias": uniform("motor_bias_rad", size=num_dofs),
         "kp_scale": uniform("motor_stiffness_scale", size=num_dofs),
@@ -106,6 +113,10 @@ def sample_env_params(rng, ranges, num_bodies, num_dofs, torso_body_id=0):
         "foot_restitution": float(uniform("foot_restitution")),
         "torso_params": np.concatenate([[torso_mass_scale], torso_com]),
     }
+    lo, hi = ranges["joint_friction_nm"]
+    out["joint_friction"] = (uniform("joint_friction_nm", size=num_dofs) if (lo != 0.0 or hi != 0.0)
+                             else np.zeros(num_dofs))
+    return out
 
 
 def substep_action_blend(delay_ms, num_substeps, control_dt):

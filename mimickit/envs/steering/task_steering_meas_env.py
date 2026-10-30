@@ -233,6 +233,17 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         self._reward_hip_roll_add_w = float(env_config.get("reward_hip_roll_add_w", 0.0))
         self._hip_roll_add_thresh = float(env_config.get("hip_roll_add_thresh", 0.1396))
 
+        # standing still on stop commands (tar_speed < steering_still_speed):
+        # base planar speed + still_foot_w * mean foot planar speed
+        # (steering_reward.compute_still_penalty). 0 = off.
+        self._reward_still_w = float(env_config.get("reward_still_w", 0.0))
+        self._still_foot_w = float(env_config.get("still_foot_w", 0.5))
+        # seconds after a command change before the term applies: the stop it
+        # targets is the standing that follows, not the deceleration into it
+        # (measured on pdx, 2026-10-29: right after a change to a stop the
+        # term averages 0.42, standing creep ~0.22). 0 = from the first step.
+        self._still_settle_s = float(env_config.get("still_settle_s", 0.0))
+
         # every weight has to flip the gate. An OR that forgot one would leave
         # _aux_reward_buf unallocated and info["aux_reward"] unpublished, and
         # that config would train as if the term were not there.
@@ -246,7 +257,8 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
                              self._reward_feet_yaw_diff_w,
                              self._reward_feet_lat_dist_w,
                              self._reward_feet_swing_w,
-                             self._reward_hip_roll_add_w)
+                             self._reward_hip_roll_add_w,
+                             self._reward_still_w)
         self._aux_reward_enabled = any(w != 0.0 for w in self._reg_weights)
 
         # measure-before-you-spend: logs every raw term with ALL weights at 0,
@@ -699,6 +711,11 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
 
     def _reset_task(self, env_ids):
         super()._reset_task(env_ids)
+        # when the current command was set (still_settle_s); lazily built because
+        # the first reset runs inside the base constructor
+        if (not hasattr(self, "_tar_set_time")):
+            self._tar_set_time = torch.zeros_like(self._tar_change_times)
+        self._tar_set_time[env_ids] = self._time_buf[env_ids]
         if (self._still_proportion > 0.0 and len(env_ids) > 0):
             # before the gait clock below, which must see the stop
             still = torch.rand(len(env_ids), device=self._device) < self._still_proportion
@@ -912,6 +929,13 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
         hip_roll_add = steering_reward.compute_hip_roll_adduction_penalty(
             self._prev_action.index_select(-1, self._hip_roll_dof_ids), self._hip_roll_add_thresh)
 
+        still_pen = steering_reward.compute_still_penalty(
+            self._engine.get_root_vel(char_id)[..., 0:2], f_vel[..., 0:2], self._tar_speed,
+            self._steering_still_speed, self._still_foot_w)
+        if (self._still_settle_s > 0.0):
+            settled = (self._time_buf - self._tar_set_time) >= self._still_settle_s
+            still_pen = torch.where(settled, still_pen, torch.zeros_like(still_pen))
+
         # one in-place write at the end. _update_info published this buffer's
         # REFERENCE before _update_reward ran, so rebinding it here would leave
         # stale zeros there and nothing would report it.
@@ -926,7 +950,10 @@ class TaskSteeringMeasEnv(task_steering_env.TaskSteeringEnv):
             + self._reward_feet_yaw_diff_w * feet_yaw_diff
             + self._reward_feet_lat_dist_w * feet_lat
             + self._reward_feet_swing_w * feet_swing
-            + self._reward_hip_roll_add_w * hip_roll_add)
+            + self._reward_hip_roll_add_w * hip_roll_add
+            + self._reward_still_w * still_pen)
+        self._diag.add_mean("rew_still", self._reward_still_w * still_pen)
+        self._diag.add_mean("still_pen_raw", still_pen)
         self._diag.add_mean("rew_feet_swing", self._reward_feet_swing_w * feet_swing)
         self._diag.add_mean("feet_swing", feet_swing)
 

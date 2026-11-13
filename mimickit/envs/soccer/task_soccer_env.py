@@ -7,7 +7,10 @@ import engines.engine as engine
 import envs.base_env as base_env
 import envs.diag_util as diag_util
 import envs.smp_env as smp_env
+import envs.soccer.cow2_util as cow2_util
+import envs.soccer.cow_util as cow_util
 import envs.soccer.dribble_util as dribble_util
+import envs.soccer.percep_emulator as percep_emulator
 import envs.soccer.soccer_util as soccer_util
 import envs.steering.steering_disc as steering_disc
 import envs.steering.steering_dr as steering_dr
@@ -90,6 +93,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # fraction of nav commands drawn as a single backward or lateral axis (others 0): pure back/lateral
         # commands are rare in the uniform draw and the policy stays standing for them (k94k/k94l probes).
         self._nav_axis_prob = float(env_config.get("nav_axis_prob", 0.0))
+        # axis commands also forward and pure yaw (4 axes instead of back/lateral): fast forward and in-place
+        # turns are as rare in the uniform draw (u2/u3 students: fast_2.0 0.31, turn_right 0.21 vs nave5 0.10).
+        self._nav_axis_all = bool(env_config.get("nav_axis_all", False))
         self._nav_style_gain = float(env_config.get("nav_style_gain", 1.0))
         self._reward_nav_lin_w = float(env_config.get("reward_nav_lin_w", 0.0))
         self._reward_nav_yaw_w = float(env_config.get("reward_nav_yaw_w", 0.0))
@@ -123,9 +129,157 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._drib_far_dist = float(env_config.get("drib_far_dist", 2.0))
         self._drib_free_dist = float(env_config.get("drib_free_dist", 1.5))
         self._drib_max_dist = float(env_config.get("drib_max_dist", 3.0))
+        # doc 36 (goals G): the command is a WORLD direction toward a field waypoint (what the BT sends), converted to the
+        # heading frame every step; the robot must turn to follow it. Defaults keep the old behavior exactly.
+        self._drib_world_dir = bool(env_config.get("drib_world_dir", False))
+        self._drib_world_clip_deg = float(env_config.get("drib_world_dir_max_deg", 180.0))
+        self._drib_wp_margin = float(env_config.get("drib_wp_margin", 1.5))
+        self._reward_drib_turn_w = float(env_config.get("reward_drib_turn_w", 0.0))
+        self._drib_turn_sigma = float(env_config.get("drib_turn_sigma", 0.0))
+        self._reward_drib_yaw_w = float(env_config.get("reward_drib_yaw_w", 0.0))
+        self._drib_oob_enable = bool(env_config.get("drib_oob_enable", False))
         # evaluation hooks: None = sample; True/False = force dribble on/off; fixed [2] command
         self._drib_force = None
         self._drib_fixed_cmd = None
+
+        # cow dribble (doc 40): subset of the dribble episodes with a virtual opponent. All off by default.
+        g = env_config.get
+        self._cow_prob = float(g("cow_prob", 0.0))
+        self._cow_radius = float(g("cow_radius", 0.40))
+        self._cow_margin = float(g("cow_margin", 0.25))
+        self._cow_robot_pad = float(g("cow_robot_pad", 0.25))
+        self._cow_d_range = [float(v) for v in g("cow_d_range", [1.6, 2.6])]
+        self._cow_ang_deg = float(g("cow_ang_deg", 0.0))
+        self._cow_goal_blend = float(g("cow_goal_blend", 0.0))
+        self._cow_opp_speed = float(g("cow_opp_speed", 0.0))
+        self._cow_ball_decel = float(g("cow_ball_decel", 0.0))  # m/s^2 rolling resistance on the ball, cow envs only (0 = off, doc 40 (46))
+        self._cow_phase_p = {
+            "ctrl_max": float(g("cow_ctrl_max", 0.7)), "v_stab": float(g("cow_v_stab", 0.4)),
+            "hold_s": float(g("cow_hold_s", 0.5)), "touch_speed": float(g("cow_touch_speed", 0.8)),
+            "past_margin": float(g("cow_past_margin", 0.5)), "rec_dist": float(g("cow_rec_dist", 1.0)),
+            "rec_speed": float(g("cow_rec_speed", 1.0)), "lost_dist": float(g("cow_lost_dist", 3.0)),
+            "ctrl_s": float(g("cow_ctrl_s", 8.0)), "wait_s": float(g("cow_wait_s", 3.0)),
+            "rec_s": float(g("cow_rec_s", 6.0)),
+            "radius": self._cow_radius, "margin": self._cow_margin, "robot_pad": self._cow_robot_pad}
+        self._reward_cow_ctrl_w = float(g("reward_cow_ctrl_w", 0.0))
+        self._reward_cow_chase_w = float(g("reward_cow_chase_w", 0.0))
+        self._cow_ctrl2_past = float(g("cow_ctrl2_past", 0.0))  # 1: ctrl2 only once the ball is beyond the opponent
+        self._reward_cow_ctrl2_w = float(g("reward_cow_ctrl2_w", 0.0))  # keep/regain control of a slow ball after the touch (phase 2)
+        self._reward_cow_chase2_w = float(g("reward_cow_chase2_w", 0.0))  # chase the ball after the touch (phase 2)
+        self._reward_cow_touch_w = float(g("reward_cow_touch_w", 0.0))
+        self._reward_cow_idle_w = float(g("reward_cow_idle_w", 0.0))
+        self._reward_cow_rec_w = float(g("reward_cow_rec_w", 0.0))
+        self._reward_cow_goal_w = float(g("reward_cow_goal_w", 0.0))
+        self._reward_cow_succ_w = float(g("reward_cow_succ_w", 0.0))
+        self._reward_cow_fail_w = float(g("reward_cow_fail_w", 0.0))
+        self._reward_cow_fall_w = float(g("reward_cow_fall_w", 0.0))  # penalty on the step the root drops below 0.45 m
+        self._cow_dstar = float(g("cow_dstar", 0.4))
+        self._cow_sigma_d = float(g("cow_sigma_d", 0.05))
+        self._cow_sigma_v = float(g("cow_sigma_v", 0.1))
+        self._cow_v_target = float(g("cow_v_target", 2.0))
+        # >0: the touch reward is paid only in the first cow_touch_window_s of the flight (event-like); 0 = whole flight
+        self._cow_touch_window_s = float(g("cow_touch_window_s", 0.0))
+        self._cow_rec_sigma = float(g("cow_rec_sigma", 1.0))
+        self._cow_obs_scale = float(g("cow_obs_scale", 4.0))
+        self._cow_obs_noise_pos = float(g("cow_obs_noise_pos", 0.0))
+        self._cow_obs_noise_vel = float(g("cow_obs_noise_vel", 0.0))
+        self._cow_vis_dropout_p = float(g("cow_vis_dropout_p", 0.0))
+        # evaluation hook: None = sample; True/False = force cow on/off on every (re)draw
+        self._cow_force = None
+        # cow teacher v2 (doc 40, staged curriculum): 0 = v1 behaviour; 1 = stage A (capture a still/rolling ball)
+        self._cow2_stage = int(g("cow2_stage", 0))
+        # stage 2+: fraction of respawns that run a stage-A scenario instead (keeps A while B trains; doc 40 v2-58)
+        self._cow2_mix_a = float(g("cow2_mix_a", 0.0))
+        self._cow2_ball_dist = [float(v) for v in g("cow2_ball_dist", [0.3, 1.5])]
+        self._cow2_ball_ang_deg = float(g("cow2_ball_ang_deg", 180.0))
+        self._cow2_ball_speed = [float(v) for v in g("cow2_ball_speed", [0.0, 0.0])]
+        self._cow2_ctrl_cmd = [float(v) for v in g("cow2_ctrl_cmd", [0.0, 0.0])]  # heading-frame dribble command shown in stage A
+        self._cow2_cap_dist = float(g("cow2_cap_dist", 0.7))
+        # stage C carry cap: a TOUCH phase longer than touch_max_s with the ball still at the foot is a carry;
+        # always counted in the diag (cow2c_carry), a failure (respawn, timeout penalty) only when touch_max_fail
+        self._cow2_touch_max_s = float(g("cow2_touch_max_s", 1.0))
+        self._cow2_touch_max_fail = bool(g("cow2_touch_max_fail", False))
+        self._cow2_cyc_T = float(g("cow2_cyc_T", 4.0))  # stage C cycle window (diag only for now)
+        self._cow2_cap_speed = float(g("cow2_cap_speed", 0.5))
+        self._cow2_cap_hold = float(g("cow2_cap_hold", 0.5))
+        self._cow2_seek_s = float(g("cow2_seek_s", 8.0))
+        self._cow2_hold_s = float(g("cow2_hold_s", 4.0))
+        self._cow2_lost_dist = float(g("cow2_lost_dist", 3.0))
+        self._cow2_still_speed = float(g("cow2_still_speed", 0.1))
+        self._reward_cow2_ctrl_w = float(g("reward_cow2_ctrl_w", 0.0))
+        self._reward_cow2_chase_w = float(g("reward_cow2_chase_w", 0.0))
+        self._reward_cow2_cap_w = float(g("reward_cow2_cap_w", 0.0))
+        self._reward_cow2_idle_w = float(g("reward_cow2_idle_w", 0.0))
+        self._reward_cow2_lost_w = float(g("reward_cow2_lost_w", 0.0))
+        self._reward_cow2_timeout_w = float(g("reward_cow2_timeout_w", 0.0))
+        self._reward_cow2_fall_w = float(g("reward_cow2_fall_w", 0.0))
+        # stage B pre-touch shaping (doc 40 v2-14): potential w * delta cos(robot->ball, ball->P) in CTRL within
+        # cow2_setup_dist of the ball ("get behind the ball on the line to P"); potential-based, cannot be farmed
+        self._reward_cow2_setup_w = float(g("reward_cow2_setup_w", 0.0))
+        self._cow2_setup_dist = float(g("cow2_setup_dist", 1.5))
+        # stage B time cost (doc 40 v2-17): -w on every CTRL step (idle only covers the robot far from the ball;
+        # standing next to it without touching cost nothing but the one-off timeout)
+        self._reward_cow2_wait_w = float(g("reward_cow2_wait_w", 0.0))
+        self._reward_cow2_cyc_w = float(g("reward_cow2_cyc_w", 0.0))  # stage C: bonus per cycle completed within cow2_cyc_T
+        # fall termination (FAIL) penalty in the TASK stream of cow envs (doc 40 v2-5): the aux stream nets ~-7/step
+        # alive, so its -200 alone makes an early fall pay off when the task stream has no per-step reward (B)
+        self._reward_cow2_term_w = float(g("reward_cow2_term_w", 0.0))
+        self._cow2_replace_reward = bool(g("cow2_replace_reward", True))
+        # stage B (cow2_stage 2): touch the ball to a target P (doc 40 v2); P shown as a dribble command
+        self._cow2_p_fwd = [float(v) for v in g("cow2_p_fwd", [1.0, 2.0])]
+        self._cow2_p_lat = float(g("cow2_p_lat", 0.5))
+        self._cow2_p_ang_deg = float(g("cow2_p_ang_deg", 0.0))  # > 0: P on a ring within +-ang (B3)
+        self._cow2_p_scale = float(g("cow2_p_scale", 2.0))
+        # doc 40 v2-28: command = launch speed sqrt(2 decel d) instead of d / p_scale (the dribble cmd is a ball velocity)
+        self._cow2_p_cmd_speed = bool(g("cow2_p_cmd_speed", False))
+        self._cow2_p_sigma = float(g("cow2_p_sigma", 1.0))
+        self._cow2_hit_dist = float(g("cow2_hit_dist", 0.5))
+        self._cow2_touch_speed = float(g("cow2_touch_speed", 0.6))
+        self._cow2_touch_dist = float(g("cow2_touch_dist", 0.35))  # foot-ball centre distance of a touch (m)
+        self._cow2_roll_zero_cmd = bool(g("cow2_roll_zero_cmd", False))  # command 0 (stand) while the ball rolls
+        self._cow2_p_approach = bool(g("cow2_p_approach", True))  # draw P in the robot->ball frame (else heading)
+        self._cow2_touch_end = float(g("cow2_touch_end", 0.4))
+        self._cow2_rest_speed = float(g("cow2_rest_speed", 0.1))
+        self._cow2_rest_hold = float(g("cow2_rest_hold", 0.3))
+        self._cow2_roll_s = float(g("cow2_roll_s", 8.0))
+        self._reward_cow2_touch_w = float(g("reward_cow2_touch_w", 0.0))
+        # stage C release shaping (doc 40 v2-57): at the 1st touch end, ball velocity vs the one that stops at P
+        # (v_req = sqrt(2 a d) toward P); exp(-|v - v_req|^2 / rel_sigma^2). Diag always, reward only if w > 0
+        self._reward_cow2_rel_w = float(g("reward_cow2_rel_w", 0.0))
+        self._reward_cow2_sep_w = float(g("reward_cow2_sep_w", 0.0))  # c2c47: pay foot-ball separation (m/s) during TOUCH
+        self._cow2_rel_sigma = float(g("cow2_rel_sigma", 0.5))
+        self._reward_cow2_hit_w = float(g("reward_cow2_hit_w", 0.0))
+        self._reward_cow2_prog_w = float(g("reward_cow2_prog_w", 0.0))
+        self._cow2_prog_roll_only = bool(g("cow2_prog_roll_only", False))  # c2c44: prog only while the ball rolls (no pay for carry)
+        # stage D (cow2_stage 3, doc 40 sec 4b): ball at the robot's feet, still virtual opponent ahead, region beside/behind it;
+        # success = robot and ball inside the region with the ball controlled; bonus decays with time and extra touches.
+        # The opponent goes in the goal slots of the task obs (same dims, B3 warm-start), the region centre in the dribble slot.
+        self._cow2_d_opp_fwd = [float(v) for v in g("cow2_d_opp_fwd", [1.5, 2.5])]
+        self._cow2_d_opp_lat = float(g("cow2_d_opp_lat", 0.3))
+        self._cow2_d_reg_dist = [float(v) for v in g("cow2_d_reg_dist", [1.0, 2.0])]  # region centre distance from the opponent
+        self._cow2_d_reg_ang_deg = float(g("cow2_d_reg_ang_deg", 75.0))  # +- around "straight past the opponent"
+        self._cow2_d_reg_r = float(g("cow2_d_reg_r", 1.0))
+        self._cow2_d_tmax = float(g("cow2_d_tmax", 10.0))
+        self._cow2_d_fast_s = float(g("cow2_d_fast_s", 6.0))  # gate: median time to the region (diag)
+        self._cow2_d_opp_r = float(g("cow2_d_opp_r", 0.45))  # robot-opponent centre distance = contact
+        self._cow2_d_bypass_clear = float(g("cow2_d_bypass_clear", 0.0))  # >0: teacher cmd aims beside the opponent while it blocks ball->R
+        self._cow2_d_ball_opp_r = float(g("cow2_d_ball_opp_r", 0.4))  # ball-opponent centre distance = contact (terminal)
+        self._cow2_d_v_arr = float(g("cow2_d_v_arr", 0.0))  # stage D teacher: ball passes P at v_arr m/s (0 = rests at P)
+        self._cow2_d_ball_vmax = float(g("cow2_d_ball_vmax", 0.0))  # stage D success also needs ball speed <= vmax (0 = off)
+        self._cow2_d_prog_clip = float(g("cow2_d_prog_clip", 1.0))  # stage D: |ball/robot progress speed| clip in m/s (1.0 = original; the reward saturates at 1 m/s)
+        self._cow2_d_free_run = bool(g("cow2_d_free_run", False))  # stage D toque-longo: success drops the robot-ball distance (fd<=cap) and the bonus is paid on the ROBOT arrival time; use with cow2_d_recover_s as the window X
+        self._cow2_d_recover_s = float(g("cow2_d_recover_s", 0.0))  # stage D option C: ball reaches the region first, robot must recover within this many s (0 = off = original rule); bonus paid on the ball-arrival time
+        self._cow2_d_cmd_gain = float(g("cow2_d_cmd_gain", 1.0))  # stage D: teacher ball-speed command x gain (1 = calibrated launch speed)
+        self._cow2_d_opp_speed = float(g("cow2_d_opp_speed", 0.0))  # D3: >0 the opponent walks toward the ball (m/s); 0 = still
+        self._reward_cow2_d_succ_w = float(g("reward_cow2_d_succ_w", 0.0))
+        self._cow2_d_touch_k = float(g("cow2_d_touch_k", 0.0))  # bonus fraction lost per touch beyond the first
+        self._reward_cow2_d_prog_w = float(g("reward_cow2_d_prog_w", 0.0))  # ball toward the region (m/s, clamped 1)
+        self._reward_cow2_d_rprog_w = float(g("reward_cow2_d_rprog_w", 0.0))  # robot toward the region
+        self._reward_cow2_d_ocont_w = float(g("reward_cow2_d_ocont_w", 0.0))  # per step of robot-opponent contact
+        self._reward_cow2_d_verr_w = float(g("reward_cow2_d_verr_w", 0.0))  # stage D: cost on |teacher cmd - ball vel| (heading frame, clamped 2 m/s); always <= 0
+        self._reward_cow2_d_xtouch_w = float(g("reward_cow2_d_xtouch_w", 0.0))  # per touch beyond the first, paid at the touch
+        self._reward_cow2_d_bcont_w = float(g("reward_cow2_d_bcont_w", 0.0))  # ball hits the opponent (ends the scenario)
+        self._reward_cow2_d_oob_w = float(g("reward_cow2_d_oob_w", 0.0))  # ball out of the field (ends the scenario)
 
         # spawn the ball in front of the robot (T1: "closer ball so robot can
         # actually reach and kick it") instead of uniformly over the field
@@ -312,6 +466,31 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_noise_dist_coef = float(env_config.get("percep_noise_dist_coef", 0.124))
         self._percep_noise_base = float(env_config.get("percep_noise_base", 0.149))     # m
         self._percep_detect_prob = float(env_config.get("percep_detect_prob", 0.9))
+        self._env_config_percep_ab = env_config.get("percep_ab_filter", None)  # [alpha, beta]
+        # RT-01 deploy-perception emulator (docs/t1/37): estimated pose + 10 Hz ball with holes/outliers.
+        # Off by default. scale multiplies the curriculum progress (1 = measured deploy, 1.5 = stress).
+        # percep_rt01_filter [alpha, beta]: alpha-beta filter on the held field-frame ball (variant p3a).
+        self._percep_rt01 = bool(env_config.get("percep_rt01", False))
+        self._percep_rt01_scale = float(env_config.get("percep_rt01_scale", 1.0))
+        # per-episode scale multipliers drawn at reset (e.g. [0, 0.5, 1, 1.5]); None = one global scale
+        self._percep_rt01_scale_mix = env_config.get("percep_rt01_scale_mix", None)
+        self._percep_rt01_filter = env_config.get("percep_rt01_filter", None)
+        self._percep_rt01_params = env_config.get("percep_rt01_params", None)
+        self._percep_rt01_pose_mult = float(env_config.get("percep_rt01_pose_mult", 1.0))
+        self._percep_rt01_ball_mult = float(env_config.get("percep_rt01_ball_mult", 1.0))
+        # subtract the known mean detection bias at the measured distance (deploy calibration, goes to policy_io)
+        self._percep_rt01_bias_correct = bool(env_config.get("percep_rt01_bias_correct", False))
+        # expanding mean: gain max(alpha, 1/(n+1)) over the n measurements fused this episode, so the first delivered
+        # measurement replaces the clean reset value and a static ball converges to the running mean
+        self._percep_ab_expand = bool(env_config.get("percep_ab_expand", False))
+        # Kalman position filter (doc 35, B1): constant-position model, process noise q m^2/s, measurement variance
+        # from the noise model at the measured distance; a measurement whose normalized innovation exceeds the gate is
+        # dropped, and a second one in a row resets the filter to it (the ball was kicked). q <= 0 disables.
+        self._percep_kf_q = float(env_config.get("percep_kf_q", 0.0))
+        self._percep_kf_gate = float(env_config.get("percep_kf_gate", 0.0))
+        # constant-velocity state (pos + vel, q = white-noise accel) with the
+        # same latency look-ahead as the alpha-beta path; false = position-only KF
+        self._percep_kf_cv = bool(env_config.get("percep_kf_cv", False))
         self._percep_detect_full_range = float(env_config.get("percep_detect_full_range", 7.0))  # m
         self._percep_detect_decay_range = float(env_config.get("percep_detect_decay_range", 3.0))  # m
         # full FOV angle in deg; <= 0 disables the FOV check. G1 has no
@@ -546,6 +725,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # strike pays more than the same speed added over several pushing steps; 0 = off
         self._reward_kick_impulse_w = float(env_config.get("reward_kick_impulse_w", 0.0))
         self._kick_impulse_cap = float(env_config.get("kick_impulse_cap", 8.0))  # m/s
+        # >0: the contact/impulse caps and the overspeed limit grow with the ball-goal distance d,
+        # cap(d) = clamp(kick_gain_cap_per_m * d, cap, kick_gain_cap_max) and limit(d) = limit + cap(d) - cap,
+        # so a short shot is paid only for a soft strike and a long one still for the speed it needs
+        # (ks4: fixed 4 m/s caps cut the 6-99 m bucket to 20-30%); 0 = fixed caps
+        self._kick_gain_cap_per_m = float(env_config.get("kick_gain_cap_per_m", 0.0))  # (m/s)/m
+        self._kick_gain_cap_max = float(env_config.get("kick_gain_cap_max", 8.0))  # m/s
+        # EMA on the PD target: 1.0 is off; the first step after a reset takes the raw action
+        self._action_filter_alpha = float(env_config.get("action_filter_alpha", 1.0))
+        # filter only in kick mode (nav/drib take the raw action; the EMA state tracks it, so a switch is smooth)
+        self._action_filter_kick_only = bool(env_config.get("action_filter_kick_only", False))
+        # with kick_only: alpha ramps linearly from 1 (raw) to action_filter_alpha over this many
+        # seconds after the episode enters kick mode (nav->kick switch); 0 = off (full filter at once)
+        self._action_filter_kick_ramp_s = float(env_config.get("action_filter_kick_ramp_s", 0.0))
         # inside-foot (side-foot) kick: the contact bonus is scaled by (1 - mix) + mix * side, with
         # side = |sin| of the angle between the nearest foot's horizontal long axis and the ball launch
         # direction (0 = toe poke, 1 = inside of the foot); 0 = off, the bonus is unchanged
@@ -625,6 +817,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # arm-speed penalty (aux stream, doc 25, goal M12): mean over the arm joints of max(|qd| - tol, 0)^2;
         # tol 1.0 rad/s leaves the dataset's own arm motion (RMS 0.78 walking) free. 0 = off
         self._reward_arm_vel_w = float(env_config.get("reward_arm_vel_w", 0.0))
+        # joint-acceleration penalty (aux stream, doc 35 goal C3, soft kick). 0 = off; diag always logged
+        self._reward_joint_acc_w = float(env_config.get("reward_joint_acc_w", 0.0))
+        self._joint_acc_scale = float(env_config.get("joint_acc_scale", 1.0e-4))
         # torque-saturation penalty (aux stream, doc 25 goal M7): mean over the joints of max(|tau|/limit - frac, 0)^2,
         # tau = the applied (clipped) drive torque. k73b on the firmware limits sits >= 95% of the hip-pitch/knee
         # limit ~30% of the steps. 0 = off; the raw value and the >=95% fraction are logged anyway.
@@ -793,7 +988,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                          "nav_cmd_prob", "nav_switch_prob", "nav_cmd_scale",
                          "reward_nav_lin_w", "reward_nav_yaw_w",
                          "drib_cmd_prob", "drib_dir_max_deg", "drib_far_prob", "drib_vel_sigma",
-                         "reward_drib_vel_w", "reward_drib_prog_w", "reward_drib_chase_w", "reward_drib_dist_w"}
+                         "reward_drib_vel_w", "reward_drib_prog_w", "reward_drib_chase_w", "reward_drib_dist_w",
+                         "reward_drib_turn_w", "reward_drib_yaw_w",
+                         "cow_ctrl2_past", "cow_prob", "cow_ang_deg", "cow_goal_blend", "cow_opp_speed", "cow_ball_decel",
+                         "reward_cow_ctrl_w", "reward_cow_chase_w", "reward_cow_chase2_w", "reward_cow_ctrl2_w", "reward_cow_touch_w", "reward_cow_idle_w",
+                         "reward_cow_rec_w", "reward_cow_goal_w", "reward_cow_succ_w", "reward_cow_fail_w", "reward_cow_fall_w",
+                         "cow_obs_noise_pos", "cow_obs_noise_vel", "cow_vis_dropout_p"}
 
     def _ground_z(self, env_ids, keepdim=False):
         """Spawn lift of the ground under env_ids (None = all envs): the scalar _ground_z_offset unless
@@ -853,6 +1053,28 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         return
 
     def _apply_action(self, actions):
+        if (self._action_filter_alpha < 1.0):
+            a = self._action_filter_alpha
+            filt = torch.where(self._filt_fresh.unsqueeze(-1), actions,
+                               a * actions + (1.0 - a) * self._filt_action)
+            if (self._action_filter_kick_only):
+                nonkick = self._nonkick_mode()
+                if (self._action_filter_kick_ramp_s > 0.0):
+                    ramp_steps = max(1.0, self._action_filter_kick_ramp_s / self._engine.get_timestep())
+                    self._filt_kick_steps[:] = torch.where(
+                        torch.logical_or(nonkick, self._filt_fresh), 0, self._filt_kick_steps + 1)
+                    r = torch.clamp(1.0 - self._filt_kick_steps.float() / ramp_steps, 0.0, 1.0)
+                    # an episode born in kick mode keeps the plain filter (no ramp)
+                    r = torch.where(self._filt_kick_born, 0.0, r)
+                    ae = (a + (1.0 - a) * r).unsqueeze(-1)
+                    filt = torch.where(self._filt_fresh.unsqueeze(-1), actions,
+                                       ae * actions + (1.0 - ae) * self._filt_action)
+                    self._filt_kick_born[:] = torch.logical_and(
+                        self._filt_kick_born | self._filt_fresh, torch.logical_not(nonkick))
+                filt = torch.where(nonkick.unsqueeze(-1), actions, filt)
+            self._filt_action[:] = filt
+            self._filt_fresh[:] = False
+            actions = filt
         if (not self._dr_enabled):
             super()._apply_action(actions)
             return
@@ -990,7 +1212,45 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._nav_vel_filt = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._drib_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._drib_cmd = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._drib_wp = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._drib_spd = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._drib_cmd_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._cow_opp = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow_opp_vel = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow_est = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow_est_vel = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow_vis = torch.ones([num_envs], device=self._device, dtype=torch.float)
+        self._cow_phase = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._cow_hold = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow_since = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow_min_bo = torch.full([num_envs], 10.0, device=self._device, dtype=torch.float)
+        self._cow_min_ro = torch.full([num_envs], 10.0, device=self._device, dtype=torch.float)
+        self._cow_axis = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow_goal0 = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow_passed = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._cow2_phase = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._cow2_hold = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_since = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_htime = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_P = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow2_ball0 = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)  # ball when P was drawn
+        self._cow2_pside = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_pang = torch.zeros([num_envs], device=self._device, dtype=torch.float)  # P angle (rad) in the draw frame, eval B3 sectors
+        # stage C cycle (doc 40): capture -> touch -> hit rest -> recapture (= next cycle's capture), clock from the capture;
+        # -1 = no cycle started (ball not yet captured in this scenario); pend = a hit rest waits for the recapture
+        self._cow2_cyc_clock = -torch.ones([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_cyc_pend = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
+        self._cow2_isA = torch.zeros([num_envs], device=self._device, dtype=torch.bool)  # stage-A episode (cow2_mix_a)
+        self._cow2_tdur = torch.zeros([num_envs], device=self._device, dtype=torch.float)  # time in the TOUCH phase
+        self._cow2_pred = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow2_touches = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_prev_fd = torch.full([num_envs], 10.0, device=self._device, dtype=torch.float)
+        self._cow2_prev_speed = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_prev_pd = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2d_prev_rd = torch.zeros([num_envs], device=self._device, dtype=torch.float)  # stage D robot-region dist
+        self._cow2d_tball = torch.full([num_envs], -1.0, device=self._device)  # option C: time the ball first entered the region (-1 = not yet)
+        self._cow2d_ocont = torch.zeros([num_envs], device=self._device, dtype=torch.bool)  # robot touched the opponent this scenario
 
         # ball motion timers (T1): drive the kick-direction decay, the
         # approach gating and the waiting penalty
@@ -1002,6 +1262,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._style_gain_buf = torch.ones([num_envs], device=self._device, dtype=torch.float)
         self._kick_near_buf = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._prev_root_vel = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
+        self._prev_dof_vel = None  # [num_envs, dof], set on the first _record_prev_states
         self._stagnation_anchor_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._stagnation_anchor_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
 
@@ -1018,7 +1279,37 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_buf_valid = torch.zeros([num_envs, K], device=self._device, dtype=torch.bool)
         self._percep_buf_deliver = torch.full([num_envs, K], float("inf"),
                                               device=self._device, dtype=torch.float)
+        self._percep_buf_capture = torch.zeros([num_envs, K], device=self._device, dtype=torch.float)
         self._percep_buf_head = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        # optional alpha-beta filter (goal B1): fuses the delayed noisy
+        # measurements at their capture time into a ball position/velocity
+        # estimate and extrapolates it to the current time. None = raw
+        # measurements (training default).
+        ab = self._env_config_percep_ab
+        self._percep_ab = None if ab is None else (float(ab[0]), float(ab[1]))
+        self._percep_ab_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._percep_ab_vel = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._percep_ab_t = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_ab_n = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_kf_P = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_kf_out = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._percep_kf_P01 = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._percep_kf_P11 = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._rt01 = None
+        if (self._percep_rt01):
+            assert self._virtual_perception, "percep_rt01 needs virtual_perception"
+            prm = None if self._percep_rt01_params is None \
+                else percep_emulator.load_params(self._percep_rt01_params)
+            self._rt01 = percep_emulator.PercepEmulator(num_envs, self._device, params=prm)
+            # diagnostic only (docs/t1/39): split the pose error from the ball error, default 1 = unchanged
+            self._rt01.pose_mult = self._percep_rt01_pose_mult
+            self._rt01.ball_mult = self._percep_rt01_ball_mult
+            self._rt01.bias_correct = self._percep_rt01_bias_correct
+            self._rt01_t = 0.0
+            self._rt01_dpos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+            self._rt01_dyaw = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+            self._rt01_scale_now = 0.0
+            self._rt01_mult = torch.ones([num_envs], device=self._device, dtype=torch.float)
         self._percep_ball_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._percep_ball_valid = torch.ones([num_envs], device=self._device, dtype=torch.bool)
         # evaluation hook (occlusion experiment): captures are all misses until
@@ -1058,6 +1349,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
         action_dim = self._action_space.shape[0]
         self._prev_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
+        self._filt_action = torch.zeros([num_envs, action_dim], device=self._device, dtype=torch.float)
+        self._filt_fresh = torch.ones([num_envs], device=self._device, dtype=torch.bool)
+        self._filt_kick_steps = torch.zeros([num_envs], device=self._device, dtype=torch.long)
+        self._filt_kick_born = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._world_step = 0
         self._push_active = False
         self._push_force_b = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
@@ -1074,6 +1369,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._meas_hist_buf = torch.zeros(
                 [num_envs, self._meas_hist_steps, self._meas_frame_dim],
                 device=self._device, dtype=torch.float)
+            # privileged twin of the task-block columns of the history (true ball, mask 1): the
+            # distillation teacher reads the same history with these columns swapped in (get_teacher_obs)
+            self._meas_priv_blk_hist = torch.zeros(
+                [num_envs, self._meas_hist_steps, 12], device=self._device, dtype=torch.float)
 
         char_id = self._get_char_id()
         dof_low, dof_high = self._engine.get_obj_dof_limits(0, char_id)
@@ -1329,6 +1628,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         char_id = self._get_char_id()
         self._prev_root_pos[:] = self._engine.get_root_pos(char_id)
         self._prev_root_vel[:] = self._engine.get_root_vel(char_id)
+        self._prev_dof_vel = self._engine.get_dof_vel(char_id).clone()
         self._prev_ball_pos[:] = self._get_ball_pos()
         return
 
@@ -1343,6 +1643,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball_pos = self._get_ball_pos()
         goal_pos = self._goal_pos
         goal_dir = self._goal_dir
+        if (self._cow2_stage == 3 and self._cow_active()):
+            # stage D: the opponent replaces the goal centre in the task obs (same dims)
+            d_on = (self._cow_mode & ~self._cow2_isA).unsqueeze(-1)
+            goal_pos = torch.where(d_on, self._cow_opp, goal_pos)
 
         if (self._virtual_perception and not privileged):
             # the actor only ever sees the virtual camera's ball estimate
@@ -1397,11 +1701,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 # dribble: the command replaces the steering block, the ball stays visible
                 cmd = self._drib_cmd if env_ids is None else self._drib_cmd[env_ids]
                 steer_obs = torch.where(drib.unsqueeze(-1), dribble_util.compute_dribble_cmd_obs(cmd), steer_obs)
-        if (self._goal_odom_noise and not privileged):
+        if (self._cow_active()):
+            cow = self._cow_mode if env_ids is None else self._cow_mode[env_ids]
+            if (cow.any() and self._cow2_stage == 0):
+                steer_obs = torch.where(cow.unsqueeze(-1), self._compute_cow_obs_block(root_pos, root_rot, env_ids, privileged),
+                                        steer_obs)
+        if ((self._goal_odom_noise or self._rt01 is not None) and not privileged):
             # the goal comes from the odometry pose estimate, not the true pose
-            odom_scale = self._schedule_progress(self._goal_odom_start_samples, self._goal_odom_end_samples)
-            odom_pos = self._goal_odom_pos * odom_scale
-            odom_yaw = self._goal_odom_yaw * odom_scale
+            if (self._rt01 is not None):
+                odom_pos = self._rt01_dpos
+                odom_yaw = self._rt01_dyaw
+            else:
+                odom_scale = self._schedule_progress(self._goal_odom_start_samples, self._goal_odom_end_samples)
+                odom_pos = self._goal_odom_pos * odom_scale
+                odom_yaw = self._goal_odom_yaw * odom_scale
             if (env_ids is not None):
                 odom_pos = odom_pos[env_ids]
                 odom_yaw = odom_yaw[env_ids]
@@ -1445,6 +1758,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         once per reset (refill). The critic never goes through here."""
         return steering_util.apply_obs_noise(self._compute_measurable_frame(env_ids),
                                              self._obs_noise_std)
+
+    def get_teacher_obs(self):
+        """Actor-layout obs whose task-block columns carry the TRUE ball (mask 1) in every history frame:
+        what a policy trained without virtual perception would see. Proprio columns keep the actor's noise."""
+        assert self._measurable_obs
+        hist = self._meas_hist_buf.clone()
+        hist[..., -12:] = self._meas_priv_blk_hist
+        return torch.cat([hist[:, -1], hist.flatten(start_dim=1)], dim=-1)
 
     def get_measurable_frame_dim(self):
         assert self._measurable_obs
@@ -1495,7 +1816,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._ball_oob_buf &= ~self._goal_scored_buf
         # navigation episodes ignore the (parked) ball
         self._goal_scored_buf &= ~self._nonkick_mode()
-        self._ball_oob_buf &= ~self._nonkick_mode()
+        self._ball_oob_buf &= ~(self._nav_mode | (self._drib_mode & (not self._drib_oob_enable)))
 
         # ball motion timers (before reward caching: the decay and gating of
         # this step must see the up-to-date times)
@@ -1515,6 +1836,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._cache_nav_reward()
         if (self._drib_active()):
             self._cache_drib_reward()
+        if (self._cow_active()):
+            if (self._cow2_stage > 0):
+                self._update_cow2()
+            else:
+                self._update_cow()
 
         # 3. goal / out of bounds terminate the episode (paper 4.1); the
         #    flags become dones in _update_done and the reset keeps the
@@ -1544,6 +1870,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._measurable_obs):
             self._meas_hist_buf[:, :-1] = self._meas_hist_buf[:, 1:].clone()
             self._meas_hist_buf[:, -1] = self._compute_actor_frame()
+            self._meas_priv_blk_hist[:, :-1] = self._meas_priv_blk_hist[:, 1:].clone()
+            self._meas_priv_blk_hist[:, -1] = self._compute_task_block(privileged=True)
         return
 
     def _reset_goal_odom(self, env_ids):
@@ -1621,6 +1949,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         Deliver first (measurements captured ~latency ago become what the
         actor sees; if several are due, the most recent wins), then capture
         (a new noisy measurement enters the ring at the sampled frame rate)."""
+        if (self._rt01 is not None):
+            self._update_rt01()
+            return
         # deliver: pick, per env, the due slot with the latest deliver time
         due = self._percep_buf_deliver <= self._time_buf.unsqueeze(-1)  # [N, K]
         any_due = due.any(dim=-1)
@@ -1632,9 +1963,32 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             slots = latest[env_ids]
             valid = self._percep_buf_valid[env_ids, slots]
             upd = env_ids[valid]
-            self._percep_ball_pos[upd] = self._percep_buf_pos[env_ids, slots][valid]
+            meas = self._percep_buf_pos[env_ids, slots][valid]
+            if (self._percep_kf_q > 0.0):
+                self._kf_update(upd, meas, self._percep_buf_capture[env_ids, slots][valid])
+            elif (self._percep_ab is None):
+                self._percep_ball_pos[upd] = meas
+            else:
+                alpha, beta = self._percep_ab
+                t_meas = self._percep_buf_capture[env_ids, slots][valid]
+                dt = torch.clamp(t_meas - self._percep_ab_t[upd], min=1e-3).unsqueeze(-1)
+                pred = self._percep_ab_pos[upd] + self._percep_ab_vel[upd] * dt
+                r = meas - pred
+                if (self._percep_ab_expand):
+                    alpha = torch.clamp(1.0 / (self._percep_ab_n[upd] + 1.0), min=alpha).unsqueeze(-1)
+                    self._percep_ab_n[upd] += 1.0
+                self._percep_ab_pos[upd] = pred + alpha * r
+                vel = self._percep_ab_vel[upd] + (beta / dt) * r
+                speed = torch.linalg.norm(vel, dim=-1, keepdim=True)
+                self._percep_ab_vel[upd] = vel * torch.clamp(15.0 / (speed + 1e-6), max=1.0)
+                self._percep_ab_t[upd] = t_meas
             self._percep_ball_valid[env_ids] = valid
             self._percep_buf_deliver[due] = float("inf")
+        if (self._percep_kf_q > 0.0 and not self._percep_kf_cv):
+            self._percep_ball_pos[:] = self._percep_ab_pos
+        elif (self._percep_ab is not None or self._percep_kf_cv):
+            ahead = torch.clamp(self._time_buf - self._percep_ab_t, min=0.0, max=0.5).unsqueeze(-1)
+            self._percep_ball_pos[:] = self._percep_ab_pos + self._percep_ab_vel * ahead
 
         # capture
         capture = self._time_buf >= self._percep_next_capture
@@ -1685,6 +2039,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._percep_buf_pos[env_ids, head] = noisy_pos
             self._percep_buf_valid[env_ids, head] = detected
             self._percep_buf_deliver[env_ids, head] = self._time_buf[env_ids] + latency
+            self._percep_buf_capture[env_ids, head] = self._time_buf[env_ids]
             self._percep_buf_head[env_ids] = (head + 1) % self._percep_buf_slots
             self._percep_next_capture[env_ids] = self._percep_next_capture[env_ids] \
                 + self._percep_period[env_ids]
@@ -1700,6 +2055,98 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._prev_percep_valid[:] = self._percep_ball_valid
         return
 
+    def _update_rt01(self):
+        """RT-01 emulator tick: estimated pose + deploy-style ball (held, 10 Hz, holes) + mask. The actor's ball
+        slot is rebuilt as a fake world point whose heading-frame coordinates equal the emulator's robot-frame
+        ball; goal slots use the estimated pose via _rt01_dpos/_rt01_dyaw."""
+        char_id = self._get_char_id()
+        root_pos = self._engine.get_root_pos(char_id)
+        root_rot = self._engine.get_root_rot(char_id)
+        ball_pos = self._get_ball_pos()
+        yaw = torch_util.calc_heading(root_rot)
+        vel = self._engine.get_root_vel(char_id)[:, 0:2]
+        p = soccer_util.compute_curriculum_progress(
+            self._get_schedule_samples(),
+            self._percep_curriculum_start_samples, self._percep_curriculum_end_samples)
+        scale = p * self._percep_rt01_scale
+        self._rt01_scale_now = scale
+        if (self._percep_rt01_scale_mix is not None):
+            scale = scale * self._rt01_mult
+        fov_deg = 360.0 + p * (self._percep_fov_deg - 360.0)
+        if (self._fov_body_id is not None):
+            head_pos = self._engine.get_body_pos(char_id)[:, self._fov_body_id]
+            head_rot = self._engine.get_body_rot(char_id)[:, self._fov_body_id]
+            in_fov = soccer_util.compute_ball_in_fov_body(head_pos, head_rot, ball_pos,
+                                                         0.5 * fov_deg * np.pi / 180.0)
+        else:
+            in_fov = soccer_util.compute_ball_in_fov(root_pos, root_rot, ball_pos,
+                                                    0.5 * fov_deg * np.pi / 180.0)
+        self._rt01_t += self._rt01.dt
+        o = self._rt01.step(self._rt01_t, root_pos[:, 0:2], yaw, vel, ball_pos[:, 0:2], in_fov, scale)
+        mask = o["mask"] > 0.5
+        ball_rel = o["ball_rel"]
+        if (self._percep_rt01_filter is not None and float(self._rt01_scale_now) > 0.0):
+            alpha, beta = float(self._percep_rt01_filter[0]), float(self._percep_rt01_filter[1])
+            det = o["detected"]
+            t = self._rt01_t
+            held = self._rt01.held_field
+            if (det.any()):
+                ids = det.nonzero(as_tuple=False).flatten()
+                first = self._percep_ab_n[ids] == 0
+                dt = torch.clamp(t - self._percep_ab_t[ids], min=1e-3).unsqueeze(-1)
+                pred = self._percep_ab_pos[ids] + self._percep_ab_vel[ids] * dt
+                r = held[ids] - pred
+                pos = pred + alpha * r
+                vel_e = self._percep_ab_vel[ids] + (beta / dt) * r
+                sp = torch.linalg.norm(vel_e, dim=-1, keepdim=True)
+                vel_e = vel_e * torch.clamp(15.0 / (sp + 1e-6), max=1.0)
+                f = first.unsqueeze(-1)
+                self._percep_ab_pos[ids] = torch.where(f, held[ids], pos)
+                self._percep_ab_vel[ids] = torch.where(f, torch.zeros_like(vel_e), vel_e)
+                self._percep_ab_t[ids] = t
+                self._percep_ab_n[ids] += 1.0
+            ahead = torch.clamp(t - self._percep_ab_t, min=0.0, max=0.5).unsqueeze(-1)
+            ball_rel = self._rt01.to_robot_frame(self._percep_ab_pos + self._percep_ab_vel * ahead)
+        elif (self._percep_kf_q > 0.0 and float(self._rt01_scale_now) > 0.0):
+            # Kalman filter on the held field-frame detections (gate + reset on kick); R from the emulator's
+            # noise table at the measured distance (from the ESTIMATED pose, as the deploy can compute it)
+            det = o["detected"]
+            t = self._rt01_t
+            if (det.any()):
+                ids = det.nonzero(as_tuple=False).flatten()
+                meas = self._rt01.held_field[ids]
+                dist = torch.linalg.norm(meas - o["est_pos"][ids], dim=-1)
+                sc_ids = scale[ids] if torch.is_tensor(scale) and scale.dim() > 0 else scale
+                R = self._rt01.meas_var(dist, sc_ids)
+                self._kf_update(ids, meas, torch.full_like(dist, t), R=R)
+            ahead = torch.clamp(t - self._percep_ab_t, min=0.0, max=0.5).unsqueeze(-1)
+            est = self._percep_ab_pos + (self._percep_ab_vel * ahead if self._percep_kf_cv else 0.0)
+            ball_rel = self._rt01.to_robot_frame(est)
+        # before the first detection held_field is 0 (world origin, ~100 m away in Lab): show the actor zeros
+        never = (self._rt01.last_det_t < -1e8).unsqueeze(-1)
+        ball_rel = torch.where(never, torch.zeros_like(ball_rel), ball_rel)
+        mask = mask & (self._time_buf >= self._percep_blackout_until)
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        self._percep_ball_pos[:] = root_pos[:, 0:2] + torch.stack(
+            [c * ball_rel[:, 0] - s * ball_rel[:, 1], s * ball_rel[:, 0] + c * ball_rel[:, 1]], dim=-1)
+        self._percep_ball_valid[:] = mask
+        self._rt01_dpos[:] = o["est_pos"] - root_pos[:, 0:2]
+        self._rt01_dyaw[:] = torch.atan2(torch.sin(o["est_yaw"] - yaw), torch.cos(o["est_yaw"] - yaw))
+        d = self._diag
+        d.add_mean("ball_visible_frac", self._percep_ball_valid.float())
+        d.add_mean("rt01_pose_err_m", torch.linalg.norm(self._rt01_dpos, dim=-1))
+        d.add_mean("rt01_yaw_err_deg", torch.abs(self._rt01_dyaw) * 180.0 / np.pi)
+        d.add_mean("rt01_ball_err_m", torch.linalg.norm(
+            self._percep_ball_pos - ball_pos[:, 0:2], dim=-1))
+        d.add_mean("rt01_scale", torch.full_like(yaw, 1.0) * scale)
+        self._percep_lost_since, reacq_sum, reacq_count = diag_util.update_reacquisition(
+            self._prev_percep_valid, self._percep_ball_valid,
+            self._percep_lost_since, self._time_buf)
+        d.add_sum("reacq_time", reacq_sum)
+        d.add_sum("reacq_count", reacq_count)
+        self._prev_percep_valid[:] = self._percep_ball_valid
+        return
+
     def set_percep_blackout(self, env_ids, duration_s):
         """Hide the ball from the actor for `duration_s` from now (evaluation
         only). Drops what is already in flight too, so the actor sees the
@@ -1707,6 +2154,76 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_blackout_until[env_ids] = self._time_buf[env_ids] + float(duration_s)
         self._percep_buf_valid[env_ids] = False
         self._percep_ball_valid[env_ids] = False
+        return
+
+    def _kf_update(self, ids, meas, t_meas, R=None):
+        if (R is None):
+            p = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(),
+                self._percep_curriculum_start_samples, self._percep_curriculum_end_samples)
+            root_pos = self._engine.get_root_pos(self._get_char_id())[ids]
+            dist = torch.linalg.norm(meas - root_pos[:, 0:2], dim=-1)
+            R = soccer_util.compute_perception_noise_std(
+                dist, p * self._percep_noise_dist_coef, p * self._percep_noise_base) ** 2 + 1e-6
+        dt = torch.clamp(t_meas - self._percep_ab_t[ids], min=0.0)
+        if (self._percep_kf_cv):
+            self._kf_cv_update(ids, meas, t_meas, R, dt)
+            return
+        P = self._percep_kf_P[ids] + self._percep_kf_q * dt
+        r = meas - self._percep_ab_pos[ids]
+        S = P + R
+        first = self._percep_ab_n[ids] == 0
+        if (self._percep_kf_gate > 0.0):
+            out = (r.square().sum(-1) / S) > self._percep_kf_gate ** 2
+            n_out = torch.where(out, self._percep_kf_out[ids] + 1, torch.zeros_like(self._percep_kf_out[ids]))
+            reset = torch.logical_or(first, n_out >= 2)
+            skip = torch.logical_and(out, ~reset)
+            self._percep_kf_out[ids] = torch.where(reset, torch.zeros_like(n_out), n_out)
+        else:
+            reset = first
+            skip = torch.zeros_like(first)
+        K = torch.where(reset, torch.ones_like(P), torch.where(skip, torch.zeros_like(P), P / S))
+        self._percep_ab_pos[ids] = self._percep_ab_pos[ids] + K.unsqueeze(-1) * r
+        self._percep_kf_P[ids] = torch.where(reset, R, (1.0 - K) * P)
+        self._percep_ab_t[ids] = t_meas
+        self._percep_ab_n[ids] += 1.0
+        return
+
+    def _kf_cv_update(self, ids, meas, t_meas, R, dt):
+        # isotropic R -> one 2x2 covariance [[P, P01], [P01, P11]] per env, shared by x and y
+        q = self._percep_kf_q
+        P00, P01, P11 = self._percep_kf_P[ids], self._percep_kf_P01[ids], self._percep_kf_P11[ids]
+        P00 = P00 + 2.0 * dt * P01 + dt * dt * P11 + q * dt ** 3 / 3.0
+        P01 = P01 + dt * P11 + q * dt * dt / 2.0
+        P11 = P11 + q * dt
+        pred = self._percep_ab_pos[ids] + self._percep_ab_vel[ids] * dt.unsqueeze(-1)
+        r = meas - pred
+        S = P00 + R
+        first = self._percep_ab_n[ids] == 0
+        if (self._percep_kf_gate > 0.0):
+            out = (r.square().sum(-1) / S) > self._percep_kf_gate ** 2
+            n_out = torch.where(out, self._percep_kf_out[ids] + 1, torch.zeros_like(self._percep_kf_out[ids]))
+            reset = torch.logical_or(first, n_out >= 2)
+            skip = torch.logical_and(out, ~reset)
+            self._percep_kf_out[ids] = torch.where(reset, torch.zeros_like(n_out), n_out)
+        else:
+            reset = first
+            skip = torch.zeros_like(first)
+        K0 = torch.where(skip, torch.zeros_like(S), P00 / S)
+        K1 = torch.where(skip, torch.zeros_like(S), P01 / S)
+        pos = pred + K0.unsqueeze(-1) * r
+        vel = self._percep_ab_vel[ids] + K1.unsqueeze(-1) * r
+        speed = torch.linalg.norm(vel, dim=-1, keepdim=True)
+        vel = vel * torch.clamp(15.0 / (speed + 1e-6), max=1.0)
+        n00, n01, n11 = (1.0 - K0) * P00, (1.0 - K0) * P01, P11 - K1 * P01
+        rs = reset.unsqueeze(-1)
+        self._percep_ab_pos[ids] = torch.where(rs, meas, pos)
+        self._percep_ab_vel[ids] = torch.where(rs, torch.zeros_like(vel), vel)
+        self._percep_kf_P[ids] = torch.where(reset, R, n00)
+        self._percep_kf_P01[ids] = torch.where(reset, torch.zeros_like(n01), n01)
+        self._percep_kf_P11[ids] = torch.where(reset, torch.full_like(n11, 4.0), n11)
+        self._percep_ab_t[ids] = t_meas
+        self._percep_ab_n[ids] += 1.0
         return
 
     def _reset_perception(self, env_ids):
@@ -1726,7 +2243,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._percep_blackout_until[env_ids] = -float("inf")
         self._percep_buf_head[env_ids] = 0
         self._percep_ball_pos[env_ids] = self._get_ball_pos()[env_ids][:, 0:2]
+        self._percep_ab_pos[env_ids] = self._percep_ball_pos[env_ids]
+        self._percep_ab_vel[env_ids] = 0.0
+        self._percep_ab_t[env_ids] = self._time_buf[env_ids]
+        self._percep_ab_n[env_ids] = 0.0
+        self._percep_kf_P[env_ids] = 0.0
+        self._percep_kf_out[env_ids] = 0
+        self._percep_kf_P01[env_ids] = 0.0
+        self._percep_kf_P11[env_ids] = 0.0
         self._percep_ball_valid[env_ids] = True
+        if (self._rt01 is not None):
+            self._rt01.reset(env_ids, self._rt01_t)
+            if (self._percep_rt01_scale_mix is not None):
+                mix = torch.tensor(self._percep_rt01_scale_mix, device=self._device, dtype=torch.float)
+                self._rt01_mult[env_ids] = mix[torch.randint(0, len(mix), (len(env_ids),), device=self._device)]
+            self._rt01_dpos[env_ids] = 0.0
+            self._rt01_dyaw[env_ids] = 0.0
         self._prev_percep_valid[env_ids] = True
         self._percep_lost_since[env_ids] = -1.0
         return
@@ -1791,7 +2323,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         kick_event = torch.logical_and(near, gain >= self._kick_contact_min_gain)
         # a robot that fell onto the ball does not count as a kick
         kick_event = torch.logical_and(kick_event, root_pos[:, 2] > self._kick_contact_min_height)
-        kick_contact_r = kick_event.float() * torch.clamp(gain, max=self._kick_contact_gain_cap)
+        contact_cap = self._kick_contact_gain_cap
+        impulse_cap = self._kick_impulse_cap
+        over_limit = self._kick_overspeed_limit
+        if (self._kick_gain_cap_per_m > 0.0):
+            d_ball_goal = torch.linalg.norm(self._goal_pos - ball_pos[:, 0:2], dim=-1)
+            extra = torch.clamp(self._kick_gain_cap_per_m * d_ball_goal - contact_cap, min=0.0,
+                                max=max(self._kick_gain_cap_max - contact_cap, 0.0))
+            contact_cap = contact_cap + extra
+            impulse_cap = impulse_cap + extra
+            over_limit = over_limit + extra
+        kick_contact_r = kick_event.float() * torch.minimum(gain, torch.as_tensor(contact_cap, device=gain.device))
         side = self._kick_side_factor(ball_pos, ball_vel, ball_speed)
         if (self._kick_side_foot_mix != 0.0):
             kick_contact_r = kick_contact_r * ((1.0 - self._kick_side_foot_mix)
@@ -1818,7 +2360,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             kick_contact_r = kick_contact_r * ((1.0 - self._kick_aim_mix) + self._kick_aim_mix * aim_gate)
         impulse_r = torch.zeros_like(kick_contact_r)
         if (self._reward_kick_impulse_w != 0.0):
-            impulse_r = kick_event.float() * aim_gate * torch.clamp(gain, min=0.0, max=self._kick_impulse_cap) ** 2
+            impulse_r = kick_event.float() * aim_gate * torch.minimum(torch.clamp_min(gain, 0.0), torch.as_tensor(impulse_cap, device=gain.device)) ** 2
         pitch_near = torch.logical_and(foot_d < self._kick_pitch_dense_dist, kick_still).float()
         pitch_dense_r = pitch_near * excess / 45.0
         chapa_r = kick_event.float() * chapa_score
@@ -1853,7 +2395,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         overspeed_r = torch.zeros_like(kick_contact_r)
         if (self._reward_kick_overspeed_w != 0.0):
             over = ball_speed if self._kick_overspeed_use_speed else gain
-            overspeed_r = near.float() * torch.clamp(over - self._kick_overspeed_limit, min=0.0, max=10.0)
+            overspeed_r = near.float() * torch.clamp(torch.clamp_min(over - over_limit, 0.0), max=10.0)
             if (self._kick_overspeed_goal_exempt > 0.0):
                 d_goal = torch.linalg.norm(self._goal_pos - ball_pos[:, 0:2], dim=-1)
                 overspeed_r = overspeed_r * (d_goal >= self._kick_overspeed_goal_exempt).float()
@@ -2264,6 +2806,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         dt = self._engine.get_timestep()
         base_accel = soccer_util.compute_base_accel_penalty(root_vel, self._prev_root_vel, dt)
         aux_r += self._reward_base_accel_w * base_accel
+        # joint acceleration (aux stream, doc 35 goal C3): mean over the joints of ((qd - qd_prev) / dt)^2,
+        # scaled by joint_acc_scale; raw value and per-step peak logged always, penalty only with the weight on
+        if (self._prev_dof_vel is not None):
+            ddq = (self._engine.get_dof_vel(char_id) - self._prev_dof_vel) / dt
+            joint_acc = torch.mean(torch.square(ddq), dim=-1) * self._joint_acc_scale
+            self._diag.add_mean("joint_acc_pen_raw", joint_acc)
+            self._diag.add_mean("joint_acc_peak", torch.amax(torch.abs(ddq), dim=-1))
+            if (self._reward_joint_acc_w != 0.0):
+                aux_r += self._reward_joint_acc_w * joint_acc
+                self._diag.add_mean("reward_joint_acc", self._reward_joint_acc_w * joint_acc)
 
         # waiting penalty (T1): grows quadratically with ball-still time,
         # saturating at waiting_time_max; zero while the ball rolls
@@ -2300,6 +2852,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (collision is not None):
             d.add_mean("reward_collision", self._reward_collision_w * collision)
         d.add_mean("reward_joint_limit", self._reward_joint_limit_w * joint_limit)
+        d.add_mean("head_dof_speed", torch.linalg.norm(
+            self._engine.get_dof_vel(char_id).index_select(-1, self._head_dof_ids), dim=-1))  # rad/s, diag only (user: head moves too much)
         d.add_mean("reward_base_accel", self._reward_base_accel_w * base_accel)
         d.add_mean("reward_waiting", waiting_r)
 
@@ -2321,6 +2875,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # diagnostics: termination term + per-episode event counters
         d = self._diag
         d.add_mean("reward_termination", self._reward_termination_w * fall_mask.float())
+        if (self._cow2_stage > 0):
+            cow_fall = torch.logical_and(fall_mask, self._cow_mode).float()
+            self._task_reward_buf -= self._reward_cow2_term_w * cow_fall
+            self._reward_buf -= self._reward_cow2_term_w * cow_fall  # copied from the task buf in _update_reward
+            d.add_mean("cow2_term_fall", cow_fall)
+            d.add_mean("reward_cow2_term", -self._reward_cow2_term_w * cow_fall)
         kick_ep = ~self._nonkick_mode()
         d.add_sum("ep_falls", torch.logical_and(fall_mask, kick_ep).float())
         if (self._nav_active()):
@@ -2395,6 +2955,39 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._info["recon_tar"] = self._compute_recon_tar()
         return
 
+    @staticmethod
+    def _cow_event_diags(sums):
+        """Cow episode rates from the window's event sums (doc 40 metrics V1-V6). Scenario = one gate/respawn
+        cycle ended by success or failure; rates are per ended scenario."""
+        g = lambda k: sums.get(k, 0.0)
+        succ = g("cow_succ")
+        fails = g("cow_fail_ball") + g("cow_fail_contact") + g("cow_fail_lost") + g("cow_fail_time")
+        ended = succ + fails
+        touches = g("cow_touch")
+        gates = g("cow_gate")
+        ratio = lambda a, b: a / b if b > 0.0 else 0.0
+        side_pos = g("cow_side_pos_succ") + g("cow_side_pos_fail")
+        side_neg = g("cow_side_neg_succ") + g("cow_side_neg_fail")
+        return {
+            "cow_ended": ended,
+            "cow_succ_rate": ratio(succ, ended),
+            "cow_gate_count": gates,
+            "cow_gate_time_mean": ratio(g("cow_gate_time"), gates),
+            "cow_touch_count": touches,
+            "cow_pass_rate": ratio(g("cow_pass"), touches),
+            "cow_fail_ball_rate": ratio(g("cow_fail_ball"), ended),
+            "cow_fail_contact_rate": ratio(g("cow_fail_contact"), ended),
+            "cow_fail_lost_rate": ratio(g("cow_fail_lost"), ended),
+            "cow_fail_time_rate": ratio(g("cow_fail_time"), ended),
+            "cow_fail_time_ctrl_rate": ratio(g("cow_fail_time_ctrl"), ended),
+            "cow_side_pos_frac": ratio(side_pos, side_pos + side_neg),
+            "cow_side_pos_succ_rate": ratio(g("cow_side_pos_succ"), side_pos),
+            "cow_side_neg_succ_rate": ratio(g("cow_side_neg_succ"), side_neg),
+            "cow_goal_gain_pos_frac": ratio(g("cow_goal_gain_pos"), succ),
+            "cow_goal_gain_mean": ratio(g("cow_goal_gain"), succ),
+            "cow_opp_dist_mean": ratio(g("cow_opp_dist"), g("cow_steps")),
+        }
+
     def record_diagnostics(self):
         """Per-iteration diagnostics: windowed means of every weighted reward
         term plus episode event rates. The window covers every env step since
@@ -2417,6 +3010,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             diags["drib_ep_fall_rate"] = sums.get("drib_ep_falls", 0.0) / drib_eps if drib_eps > 0.0 else 0.0
             for k in ("drib_vel_err", "drib_dir_err_deg", "drib_ball_dist", "drib_ball_lost"):
                 diags[k] = sums.get(k, 0.0) / drib_steps if drib_steps > 0.0 else 0.0
+        if (self._cow_active()):
+            diags.update(self._cow_event_diags(sums))
+            if (self._cow2_stage > 0):
+                diags.update(self._cow2_event_diags(sums))
         if (self._nav_active()):
             nav_eps = sums.get("nav_ep_done", 0.0)
             nav_steps = sums.get("nav_steps", 0.0)
@@ -2665,6 +3262,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._dr_enabled or self._fixed_action_delay_ms is not None):
                 self._engine.reset_action_delay(env_ids)
             self._prev_action[env_ids] = 0.0
+            self._filt_fresh[env_ids] = True
             self._prev_ball_touch[env_ids] = False
             if (self._search_sweep_w != 0.0):
                 # first post-reset step must not read a stale yaw from the
@@ -2678,6 +3276,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 # the frame the actor sees on its first post-reset step
                 self._meas_hist_buf[env_ids] = \
                     self._compute_actor_frame(env_ids).unsqueeze(1)
+                self._meas_priv_blk_hist[env_ids] = \
+                    self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
             self._ball_moving_time[env_ids] = 0.0
             self._ball_still_time[env_ids] = 0.0
             char_id = self._get_char_id()
@@ -2707,9 +3307,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._nav_force = False
         if (self._drib_cmd_prob > 0.0 and self._drib_force is None):
             self._drib_force = False
+        if (self._cow_prob > 0.0 and self._cow_force is None):
+            self._cow_force = False
         self._reset_envs(env_ids)
         self._nav_mode[env_ids] = False
         self._drib_mode[env_ids] = False
+        self._cow_mode[env_ids] = False
 
         n = len(env_ids)
         char_id = self._get_char_id()
@@ -2757,8 +3360,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._measurable_obs):
             self._meas_hist_buf[env_ids] = \
                 self._compute_actor_frame(env_ids).unsqueeze(1)
+            self._meas_priv_blk_hist[env_ids] = \
+                self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._prev_root_vel[env_ids] = self._engine.get_root_vel(char_id)[env_ids]
+        if (self._prev_dof_vel is not None):
+            self._prev_dof_vel[env_ids] = self._engine.get_dof_vel(char_id)[env_ids]
         self._stagnation_anchor_pos[env_ids] = root_pos
         self._stagnation_anchor_time[env_ids] = self._time_buf[env_ids]
         self._ball_perturb_times[env_ids] = 1.0e9
@@ -2795,6 +3402,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._measurable_obs):
             self._meas_hist_buf[env_ids] = \
                 self._compute_actor_frame(env_ids).unsqueeze(1)
+            self._meas_priv_blk_hist[env_ids] = \
+                self._compute_task_block(env_ids, privileged=True).unsqueeze(1)
         self._record_reset_prev_states(env_ids)
         self._task_reward_buf[env_ids] = 0.0
         self._goal_scored_buf[env_ids] = False
@@ -2899,15 +3508,23 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             cmd = (lo + u * (hi - lo)) * self._nav_cmd_scale
             if (self._nav_axis_prob > 0.0):
                 axis = torch.rand([n], device=self._device) < self._nav_axis_prob
-                back = torch.rand([n], device=self._device) < 0.5
+                kind = torch.randint(0, 4 if self._nav_axis_all else 2, [n], device=self._device)
+                back = kind == 0
                 mag = 0.1 + 0.9 * torch.rand([n], device=self._device)
                 sgn = torch.where(torch.rand([n], device=self._device) < 0.5, -1.0, 1.0)
                 cmd[axis, 2] = 0.0
                 cmd[axis & back, 0] = -mag[axis & back] * abs(self._nav_vx_range[0]) * self._nav_cmd_scale
                 cmd[axis & back, 1] = 0.0
-                lat = axis & ~back
+                lat = axis & (kind == 1)
                 cmd[lat, 0] = 0.0
                 cmd[lat, 1] = sgn[lat] * mag[lat] * self._nav_vy_range[1] * self._nav_cmd_scale
+                fwd = axis & (kind == 2)
+                cmd[fwd, 0] = mag[fwd] * self._nav_vx_range[1] * self._nav_cmd_scale
+                cmd[fwd, 1] = 0.0
+                yaw = axis & (kind == 3)
+                cmd[yaw, 0] = 0.0
+                cmd[yaw, 1] = 0.0
+                cmd[yaw, 2] = sgn[yaw] * mag[yaw] * self._nav_yaw_range[1] * self._nav_cmd_scale
             still = torch.rand([n], device=self._device) < self._nav_still_prob
             cmd[still] = 0.0
         self._nav_cmd[env_ids] = cmd
@@ -3006,6 +3623,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         (or far with drib_far_prob, the chase stage) and a command is drawn."""
         if (not self._drib_active() or len(env_ids) == 0):
             self._drib_mode[env_ids] = False
+            self._cow_mode[env_ids] = False
             return
         if (self._drib_force is not None):
             drib = torch.full([len(env_ids)], bool(self._drib_force), device=self._device, dtype=torch.bool)
@@ -3021,6 +3639,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if ((~far).any()):
                 self._reset_ball(drib_ids[~far], near=True)
             self._resample_drib_cmd(drib_ids)
+        self._cow_mode[env_ids] = False
+        if (self._cow_active() and len(drib_ids) > 0):
+            if (self._cow_force is not None):
+                cow = torch.full([len(drib_ids)], bool(self._cow_force), device=self._device, dtype=torch.bool)
+            else:
+                cow = torch.rand([len(drib_ids)], device=self._device) < self._cow_prob
+            cow_ids = drib_ids[cow]
+            if (len(cow_ids) > 0):
+                # cow episodes start with a still ball near the robot (phase 0)
+                self._reset_ball(cow_ids, near=True)
+                self._cow_mode[cow_ids] = True
+                self._cow_spawn_any(cow_ids)
         return
 
     def _resample_drib_cmd(self, env_ids):
@@ -3033,13 +3663,48 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                                   np.deg2rad(self._drib_dir_max_deg),
                                                   self._drib_still_prob, self._device)
         self._drib_cmd[env_ids] = cmd
+        if (self._drib_world_dir and self._drib_fixed_cmd is None):
+            self._drib_spd[env_ids] = torch.linalg.norm(cmd, dim=-1)
+            self._sample_drib_wp(env_ids)
+            self._set_world_drib_cmd(env_ids)
         lo_t, hi_t = self._drib_resample_s
         self._drib_cmd_time[env_ids] = self._time_buf[env_ids] + lo_t \
             + (hi_t - lo_t) * torch.rand([n], device=self._device)
         return
 
+    def _sample_drib_wp(self, ids):
+        """Random waypoint inside the field (world frame), the BT stand-in of doc 36."""
+        n = len(ids)
+        hx = 0.5 * self._field_length - self._drib_wp_margin
+        hy = 0.5 * self._field_width - self._drib_wp_margin
+        u = 2.0 * torch.rand([n, 2], device=self._device) - 1.0
+        self._drib_wp[ids] = self._field_offset[ids] + u * torch.tensor([hx, hy], device=self._device)
+
+    def _set_world_drib_cmd(self, ids):
+        """Heading-frame ball-velocity command toward the waypoint: speed * R(-heading) * unit(wp - ball)."""
+        ball = self._get_ball_pos()[ids, 0:2]
+        rel = self._drib_wp[ids] - ball
+        reached = torch.linalg.norm(rel, dim=-1) < 0.7
+        if (reached.any()):
+            self._sample_drib_wp(ids[reached])
+            rel = self._drib_wp[ids] - ball
+        des = rel / torch.clamp(torch.linalg.norm(rel, dim=-1, keepdim=True), min=1.0e-6)
+        rot = self._engine.get_root_rot(self._get_char_id())[ids]
+        d3 = torch.cat([des, torch.zeros_like(des[:, 0:1])], dim=-1)
+        v = torch_util.quat_rotate(torch_util.calc_heading_quat_inv(rot), d3)[:, 0:2]
+        clip = float(np.deg2rad(self._drib_world_clip_deg))
+        ang = torch.atan2(v[:, 1], v[:, 0]).clamp(-clip, clip)
+        self._drib_cmd[ids] = self._drib_spd[ids].unsqueeze(-1) * torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+
     def _update_drib_cmd(self):
+        if (self._drib_world_dir and self._drib_fixed_cmd is None):
+            wm = self._drib_mode & ~self._cow_mode if self._cow2_stage > 0 else self._drib_mode
+            ids = wm.nonzero(as_tuple=False).flatten()
+            if (len(ids) > 0):
+                self._set_world_drib_cmd(ids)
         due = torch.logical_and(self._drib_mode, self._time_buf >= self._drib_cmd_time)
+        if (self._cow2_stage > 0):  # cow v2 envs keep the command set by the stage
+            due &= ~self._cow_mode
         ids = due.nonzero(as_tuple=False).flatten()
         if (len(ids) > 0 and self._drib_fixed_cmd is None):
             self._resample_drib_cmd(ids)
@@ -3078,6 +3743,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         dist_pen = dribble_util.compute_dribble_dist_penalty(dist, self._drib_free_dist, self._drib_max_dist)
         prog_r = dribble_util.compute_dribble_progress_reward(v_ball_h, self._drib_cmd, self._drib_prog_over_pen)
         r_vel = self._reward_drib_vel_w * near * vel_r + self._reward_drib_prog_w * near * prog_r
+        moving_f = (torch.linalg.norm(self._drib_cmd, dim=-1) > 0.05).float()
+        turn_ang = torch.atan2(self._drib_cmd[:, 1], self._drib_cmd[:, 0])
+        if (self._drib_turn_sigma > 0.0):
+            turn_r = torch.exp(-torch.square(turn_ang / self._drib_turn_sigma)) * moving_f
+        else:
+            turn_r = torch.cos(turn_ang) * moving_f
+        r_vel = r_vel + self._reward_drib_turn_w * turn_r
+        # yaw-rate toward the command: rewards turning the heading toward the ball-velocity command
+        # (sign of the command angle), saturating at 1 rad/s; scaled by min(|angle|/0.3, 1).
+        wz = self._engine.get_root_ang_vel(char_id)[:, 2]
+        yaw_r = torch.tanh(wz * torch.sign(turn_ang)) * torch.clamp(torch.abs(turn_ang) / 0.3, max=1.0) * moving_f
+        r_vel = r_vel + self._reward_drib_yaw_w * yaw_r
         r_chase = self._reward_drib_chase_w * (1.0 - near) * chase_r
         r_dist = self._reward_drib_dist_w * dist_pen
         drib = self._drib_mode
@@ -3092,6 +3769,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("drib_frac", dm)
         d.add_mean("reward_drib_vel", dm * r_vel)
         d.add_mean("drib_prog", dm * near * prog_r)
+        d.add_mean("drib_turn_cos", dm * turn_r)
+        d.add_mean("reward_drib_turn", dm * self._reward_drib_turn_w * turn_r)
+        d.add_mean("reward_drib_yaw", dm * self._reward_drib_yaw_w * yaw_r)
         d.add_mean("reward_drib_chase", dm * r_chase)
         d.add_mean("reward_drib_dist", dm * r_dist)
         d.add_sum("drib_steps", dm)
@@ -3099,6 +3779,842 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_sum("drib_dir_err_deg", dm * moving * torch.rad2deg(d_dir))
         d.add_sum("drib_ball_dist", dm * dist)
         d.add_sum("drib_ball_lost", dm * (dist > self._drib_max_dist).float())
+        return
+
+    def _cow_active(self):
+        return self._cow_prob > 0.0 or self._cow_force is not None
+
+    def _cow_heading_dir(self, env_ids):
+        root_rot = self._engine.get_root_rot(self._get_char_id())[env_ids]
+        fwd = torch_util.quat_rotate(torch_util.calc_heading_quat(root_rot),
+                                     torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(len(env_ids), 3))
+        return fwd[:, 0:2]
+
+    def _cow_spawn(self, env_ids):
+        """(Re)start the cow scenario of env_ids around the current ball: new virtual opponent, phase 0."""
+        n = len(env_ids)
+        ball = self._get_ball_pos()[env_ids, 0:2]
+        root = self._engine.get_root_pos(self._get_char_id())[env_ids, 0:2]
+        goal = self._goal_pos[env_ids]
+        half_x = 0.5 * self._field_length - 0.3
+        half_y = 0.5 * self._field_width - 0.3
+        lo = torch.stack([-half_x + self._field_offset[env_ids, 0], -half_y + self._field_offset[env_ids, 1]], dim=-1)
+        hi = torch.stack([half_x + self._field_offset[env_ids, 0], half_y + self._field_offset[env_ids, 1]], dim=-1)
+        heading = self._cow_heading_dir(env_ids)
+        opp = cow_util.sample_cow_opponent(ball, heading, goal, self._cow_d_range, np.deg2rad(self._cow_ang_deg),
+                                           self._cow_goal_blend, lo, hi)
+        self._cow_opp[env_ids] = opp
+        self._cow_opp_vel[env_ids] = 0.0
+        self._cow_est[env_ids] = opp
+        self._cow_est_vel[env_ids] = 0.0
+        self._cow_vis[env_ids] = 1.0
+        self._cow_phase[env_ids] = cow_util.PH_CTRL
+        self._cow_hold[env_ids] = 0.0
+        self._cow_since[env_ids] = 0.0
+        self._cow_min_bo[env_ids] = 10.0
+        self._cow_min_ro[env_ids] = 10.0
+        self._cow_axis[env_ids] = heading
+        self._cow_goal0[env_ids] = torch.linalg.norm(goal - ball, dim=-1)
+        self._cow_passed[env_ids] = False
+        return
+
+    def set_cow_mode(self, env_ids, on, reset_ball=False):
+        """Mid-episode switch (evaluation / transitions). on: dribble+cow with a fresh opponent around the
+        current ball (reset_ball=True also puts a still ball in front of the robot). off: hands the ball to kick."""
+        if (len(env_ids) == 0):
+            return
+        self._cow_mode[env_ids] = bool(on)
+        self._drib_mode[env_ids] = bool(on)
+        if (on):
+            self._nav_mode[env_ids] = False
+            if (reset_ball):
+                self._reset_ball(env_ids, near=True)
+            self._resample_drib_cmd(env_ids)
+            self._cow_spawn_any(env_ids)
+        if (self._virtual_perception):
+            self._reset_perception(env_ids)
+        self._record_reset_prev_states(env_ids)
+        return
+
+    def _compute_cow_obs_block(self, root_pos, root_rot, env_ids, privileged):
+        """[N, 5] cow block for the steering slots: opponent estimate in the heading frame (true + vis=1 when privileged)."""
+        sel = (lambda t: t) if env_ids is None else (lambda t: t[env_ids])
+        if (privileged):
+            opp, vel, vis = sel(self._cow_opp), sel(self._cow_opp_vel), torch.ones_like(sel(self._cow_vis))
+        else:
+            opp, vel, vis = sel(self._cow_est), sel(self._cow_est_vel), sel(self._cow_vis)
+        heading_inv = torch_util.calc_heading_quat_inv(root_rot)
+        z = torch.zeros_like(opp[:, 0:1])
+        rel = torch_util.quat_rotate(heading_inv, torch.cat([opp - root_pos[:, 0:2], z], dim=-1))[:, 0:2]
+        vel_h = torch_util.quat_rotate(heading_inv, torch.cat([vel, z], dim=-1))[:, 0:2]
+        return cow_util.compute_cow_obs(rel, vel_h, vis, self._cow_obs_scale)
+
+    def _cow_spawn_any(self, env_ids):
+        if (self._cow2_stage > 0):
+            self._cow2_spawn(env_ids)
+        else:
+            self._cow_spawn(env_ids)
+
+    def _cow2_spawn(self, env_ids, is_a=None):
+        """Stage A scenario (doc 40 v2): ball at U[dist] m within +-ang of the heading, rolling at U[speed] in a
+        random direction (0 = still); the dribble slot shows cow2_ctrl_cmd."""
+        n = len(env_ids)
+        if (n == 0):
+            return
+        ball_id = self._get_ball_id()
+        root = self._engine.get_root_pos(self._get_char_id())[env_ids, 0:2]
+        heading = self._cow_heading_dir(env_ids)
+        rel = cow2_util.sample_ring(n, self._cow2_ball_dist[0], self._cow2_ball_dist[1],
+                                    float(np.deg2rad(self._cow2_ball_ang_deg)), self._device)
+        pos = root + cow2_util.heading_to_world(rel, heading)
+        half_x = 0.5 * self._field_length - 0.3
+        half_y = 0.5 * self._field_width - 0.3
+        off = self._field_offset[env_ids]
+        pos = torch.stack([torch.clamp(pos[:, 0], off[:, 0] - half_x, off[:, 0] + half_x),
+                           torch.clamp(pos[:, 1], off[:, 1] - half_y, off[:, 1] + half_y)], dim=-1)
+        ball3 = self._get_ball_pos()[env_ids].clone()
+        ball3[:, 0:2] = pos
+        vel3 = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        vel3[:, 0:2] = cow2_util.sample_ball_vel(n, self._cow2_ball_speed[0], self._cow2_ball_speed[1], self._device)
+        self._engine.set_root_pos(env_ids, ball_id, ball3)
+        self._engine.set_root_vel(env_ids, ball_id, vel3)
+        self._engine.set_root_ang_vel(env_ids, ball_id, torch.zeros_like(vel3))
+        self._prev_ball_pos[env_ids] = ball3
+        self._reset_kick_prev(env_ids, ball3)
+        self._drib_cmd[env_ids] = torch.tensor(self._cow2_ctrl_cmd, device=self._device, dtype=torch.float)
+        self._cow2_prev_fd[env_ids] = 10.0
+        self._cow2_prev_speed[env_ids] = torch.linalg.norm(vel3[:, 0:2], dim=-1)
+        if (self._cow2_stage >= 2):
+            if (is_a is not None):
+                self._cow2_isA[env_ids] = is_a
+            elif (self._cow2_mix_a > 0.0):
+                self._cow2_isA[env_ids] = torch.rand(n, device=self._device) < self._cow2_mix_a
+            b_ids = env_ids[~self._cow2_isA[env_ids]]
+            if (len(b_ids) > 0):
+                if (self._cow2_stage == 3):
+                    self._cow2d_new(b_ids)
+                else:
+                    self._cow2_new_target(b_ids)
+        self._cow2_phase[env_ids] = cow2_util.PH_SEEK
+        self._cow2_hold[env_ids] = 0.0
+        self._cow2_since[env_ids] = 0.0
+        self._cow2_htime[env_ids] = 0.0
+        self._cow2_cyc_clock[env_ids] = -1.0
+        self._cow2_cyc_pend[env_ids] = False
+        self._cow2_tdur[env_ids] = 0.0
+        return
+
+    def _cow_ball_friction(self, cow):
+        """Rolling resistance: constant deceleration of the cow balls' planar speed. Returns the [N, 2] velocity."""
+        _bid = self._get_ball_id()
+        _v3 = self._engine.get_root_vel(_bid).clone()
+        if (self._cow_ball_decel > 0.0):
+            dt = self._engine.get_timestep()
+            _sp = torch.linalg.norm(_v3[:, 0:2], dim=-1)
+            _k = torch.clamp(1.0 - self._cow_ball_decel * dt / torch.clamp(_sp, min=1.0e-6), min=0.0)
+            _ids = (cow & (_sp > 0.02)).nonzero(as_tuple=False).flatten()
+            if (_ids.numel() > 0):
+                _v3[_ids, 0:2] = _v3[_ids, 0:2] * _k[_ids].unsqueeze(-1)
+                self._engine.set_root_vel(_ids, _bid, _v3[_ids])
+        return _v3[:, 0:2]
+
+    def _cow2_cmd_decel(self):
+        """Ball deceleration for the speed-calibrated P command (0 -> legacy |P - ball| / p_scale)."""
+        return float(self._cow_ball_decel) if self._cow2_p_cmd_speed else 0.0
+
+    def _cow2_new_target(self, env_ids):
+        """Stage B+: new P around the current ball (the ball is not moved), phase CTRL."""
+        ball = self._get_ball_pos()[env_ids, 0:2]
+        heading = self._cow_heading_dir(env_ids)
+        frame = heading
+        if (self._cow2_p_approach):
+            frame = cow2_util.approach_dir(self._engine.get_root_pos(self._get_char_id())[env_ids, 0:2], ball, heading)
+        P, side = cow2_util.sample_target(ball, frame, self._cow2_p_fwd, self._cow2_p_lat,
+                                          float(np.deg2rad(self._cow2_p_ang_deg)))
+        rel = cow2_util.world_to_heading(P - ball, frame)
+        self._cow2_pang[env_ids] = torch.atan2(rel[:, 1], rel[:, 0])
+        off = self._field_offset[env_ids]
+        hx = 0.5 * self._field_length - 0.5
+        hy = 0.5 * self._field_width - 0.5
+        P = torch.stack([torch.clamp(P[:, 0], off[:, 0] - hx, off[:, 0] + hx),
+                         torch.clamp(P[:, 1], off[:, 1] - hy, off[:, 1] + hy)], dim=-1)
+        self._cow2_P[env_ids] = P
+        self._cow2_ball0[env_ids] = ball
+        self._cow2_pside[env_ids] = side
+        self._cow2_pred[env_ids] = ball
+        self._cow2_touches[env_ids] = 0.0
+        self._cow2_prev_pd[env_ids] = torch.linalg.norm(P - ball, dim=-1)
+        self._cow2_phase[env_ids] = cow2_util.PH_CTRL
+        self._cow2_since[env_ids] = 0.0
+        self._cow2_htime[env_ids] = 0.0
+        self._cow2_hold[env_ids] = 0.0
+        self._drib_cmd[env_ids] = cow2_util.target_cmd(ball, P, heading, self._cow2_p_scale, self._cow2_cmd_decel())
+        return
+
+    def _cow2d_new(self, env_ids):
+        """Stage D scenario: still opponent ahead of the robot, region beside/behind it (ball already placed)."""
+        n = len(env_ids)
+        root = self._engine.get_root_pos(self._get_char_id())[env_ids, 0:2]
+        heading = self._cow_heading_dir(env_ids)
+        opp_rel, reg_rel = cow2_util.sample_region(n, self._cow2_d_opp_fwd, self._cow2_d_opp_lat, self._cow2_d_reg_dist,
+                                                   float(np.deg2rad(self._cow2_d_reg_ang_deg)), self._device)
+        off = self._field_offset[env_ids]
+        hx = 0.5 * self._field_length - 0.6
+        hy = 0.5 * self._field_width - 0.6
+        def clamp(p):
+            return torch.stack([torch.clamp(p[:, 0], off[:, 0] - hx, off[:, 0] + hx),
+                                torch.clamp(p[:, 1], off[:, 1] - hy, off[:, 1] + hy)], dim=-1)
+        # a scenario that does not fit in the field along the heading (robot near a wall) is laid toward the field
+        # centre instead: clamping it would squash opponent and region onto the robot (instant "success", smoke c2d01s)
+        frame = heading
+        R_raw = root + cow2_util.heading_to_world(reg_rel, heading)
+        fits = ((R_raw[:, 0] - off[:, 0]).abs() <= hx) & ((R_raw[:, 1] - off[:, 1]).abs() <= hy)
+        to_c = off - root
+        to_c = to_c / torch.clamp(torch.linalg.norm(to_c, dim=-1, keepdim=True), min=1.0e-6)
+        frame = torch.where(fits.unsqueeze(-1), heading, to_c)
+        opp = clamp(root + cow2_util.heading_to_world(opp_rel, frame))
+        R = clamp(root + cow2_util.heading_to_world(reg_rel, frame))
+        self._diag.add_sum("cow2d_spawn_n", torch.ones_like(fits, dtype=torch.float))
+        self._diag.add_sum("cow2d_spawn_center", (~fits).float())
+        ball = self._get_ball_pos()[env_ids, 0:2]
+        self._cow_opp[env_ids] = opp
+        self._cow_opp_vel[env_ids] = 0.0
+        self._cow_est[env_ids] = opp
+        self._cow_est_vel[env_ids] = 0.0
+        self._cow_vis[env_ids] = 1.0
+        self._cow2_P[env_ids] = R
+        self._cow2_ball0[env_ids] = ball
+        rel = cow2_util.world_to_heading(R - opp, frame)
+        self._cow2_pang[env_ids] = torch.atan2(rel[:, 1], rel[:, 0])
+        self._cow2_pside[env_ids] = torch.sign(rel[:, 1])
+        self._cow2_touches[env_ids] = 0.0
+        self._cow2_prev_pd[env_ids] = torch.linalg.norm(R - ball, dim=-1)
+        self._cow2d_prev_rd[env_ids] = torch.linalg.norm(R - root, dim=-1)
+        self._cow2d_ocont[env_ids] = False
+        self._cow2d_tball[env_ids] = -1.0
+        self._cow2_phase[env_ids] = cow2_util.PH_CTRL
+        self._cow2_since[env_ids] = 0.0
+        self._drib_cmd[env_ids] = cow2_util.target_cmd(ball, R, heading, self._cow2_p_scale, self._cow2_cmd_decel())
+        return
+
+    def _update_cow2_region(self, cow):
+        """Stage D tick (doc 40 sec 4b): reach the region P (radius cow2_d_reg_r) with robot + controlled ball,
+        past a still opponent. Ends: success | timeout (d_tmax) | ball lost | ball hits the opponent | ball OOB."""
+        char_id = self._get_char_id()
+        dt = self._engine.get_timestep()
+        cf = cow.float()
+        root3 = self._engine.get_root_pos(char_id)
+        root = root3[:, 0:2]
+        ball3 = self._get_ball_pos()
+        ball = ball3[:, 0:2]
+        if (self._cow2_d_opp_speed > 0.0):  # D3: opponent closes on the ball (pos + vel are in the task obs)
+            u = ball - self._cow_opp
+            u = u / torch.clamp(torch.linalg.norm(u, dim=-1, keepdim=True), min=1.0e-6)
+            ov = torch.where(cow.unsqueeze(-1), u * self._cow2_d_opp_speed, torch.zeros_like(u))
+            self._cow_opp_vel[:] = ov
+            self._cow_opp[:] = self._cow_opp + ov * dt
+        self._diag.add_mean("cow2d_opp_speed", cow.float() * torch.linalg.norm(self._cow_opp_vel, dim=-1))
+        vel = self._cow_ball_friction(cow)
+        speed = torch.linalg.norm(vel, dim=-1)
+        dist = torch.linalg.norm(ball - root, dim=-1)
+        fd = self._min_foot_ball_dist(ball3)
+        R = self._cow2_P
+        pd = torch.linalg.norm(R - ball, dim=-1)
+        rd = torch.linalg.norm(R - root, dim=-1)
+        self._cow2_since[:] = torch.where(cow, self._cow2_since + dt, self._cow2_since)
+        t = self._cow2_since
+        hit_ev = cow2_util.touch_start(self._cow2_prev_fd, fd, self._cow2_prev_speed, speed, self._cow2_touch_dist,
+                                       self._kick_contact_min_gain, self._cow2_touch_speed) & cow
+        self._cow2_touches[:] = self._cow2_touches + hit_ev.float()
+        ocont = cow & (torch.linalg.norm(root - self._cow_opp, dim=-1) < self._cow2_d_opp_r)
+        self._cow2d_ocont[:] = self._cow2d_ocont | ocont
+        bcont = cow & (torch.linalg.norm(ball - self._cow_opp, dim=-1) < self._cow2_d_ball_opp_r)
+        off = self._field_offset
+        oob = cow & (((ball[:, 0] - off[:, 0]).abs() > 0.5 * self._field_length)
+                     | ((ball[:, 1] - off[:, 1]).abs() > 0.5 * self._field_width))
+        lost = cow & (dist > self._cow2_lost_dist) & ~bcont & ~oob
+        succ = cow & (pd <= self._cow2_d_reg_r) & (rd <= self._cow2_d_reg_r) & ~bcont & ~oob
+        if (not self._cow2_d_free_run):
+            succ = succ & (fd <= self._cow2_cap_dist)
+        if (self._cow2_d_ball_vmax > 0.0):
+            succ = succ & (speed <= self._cow2_d_ball_vmax)
+        t_bonus = t
+        fail_rec = torch.zeros_like(succ)
+        if (self._cow2_d_recover_s > 0.0):  # option C: success only if the robot recovers within recover_s of the ball arrival
+            ball_in = cow & (pd <= self._cow2_d_reg_r) & ~bcont & ~oob
+            self._cow2d_tball[:] = torch.where(ball_in & (self._cow2d_tball < 0.0), t, self._cow2d_tball)
+            armed = cow & (self._cow2d_tball >= 0.0)
+            in_win = armed & ((t - self._cow2d_tball) <= self._cow2_d_recover_s + 1.0e-6)
+            succ = succ & in_win
+            fail_rec = armed & ~succ & ~in_win & ~bcont & ~oob & ~lost
+            if (not self._cow2_d_free_run):
+                t_bonus = torch.where(self._cow2d_tball >= 0.0, self._cow2d_tball, t)
+        fail_time = (cow & ~succ & ~bcont & ~oob & ~lost & (t >= self._cow2_d_tmax - 1.0e-6)) | fail_rec
+
+        # rewards
+        near = dribble_util.compute_dribble_near_weight(dist, self._drib_near_dist, self._drib_far_dist)
+        chase_r = soccer_util.compute_ball_chase_reward(root3, self._prev_root_pos, ball3, self._steer_stop_dist,
+                                                        self._steer_speed_max, dt, self._ball_chase_vel_scale)
+        pc = self._cow2_d_prog_clip
+        prog = torch.clamp((self._cow2_prev_pd - pd) / dt, -pc, pc)
+        rprog = torch.clamp((self._cow2d_prev_rd - rd) / dt, -pc, pc)
+        bonus = torch.clamp(1.0 - t_bonus / self._cow2_d_tmax, min=0.0) \
+            * torch.clamp(1.0 - self._cow2_d_touch_k * torch.clamp(self._cow2_touches - 1.0, min=0.0), min=0.0)
+        fallen = root3[:, 2] < 0.45
+        r_chase = self._reward_cow2_chase_w * cf * (1.0 - near) * chase_r
+        r_prog = self._reward_cow2_d_prog_w * cf * prog
+        r_rprog = self._reward_cow2_d_rprog_w * cf * rprog
+        r_succ = self._reward_cow2_d_succ_w * succ.float() * bonus
+        r_ocont = -self._reward_cow2_d_ocont_w * ocont.float()
+        r_xtouch = -self._reward_cow2_d_xtouch_w * (hit_ev & (self._cow2_touches > 1.0)).float()
+        hinv = torch_util.calc_heading_quat_inv(self._engine.get_root_rot(char_id))
+        v_ball_h = torch_util.quat_rotate(hinv, torch.cat([vel, torch.zeros_like(vel[:, 0:1])], dim=-1))[:, 0:2]
+        verr = torch.clamp(torch.linalg.norm(self._drib_cmd - v_ball_h, dim=-1), max=2.0)
+        r_verr = -self._reward_cow2_d_verr_w * cf * verr
+        self._diag.add_mean("cow2d_verr", cf * verr)
+        r_bcont = -self._reward_cow2_d_bcont_w * bcont.float()
+        r_oob = -self._reward_cow2_d_oob_w * oob.float()
+        r_lost = -self._reward_cow2_lost_w * lost.float()
+        r_timeout = -self._reward_cow2_timeout_w * fail_time.float()
+        r_fall = -self._reward_cow2_fall_w * fallen.float()
+        r_wait = -self._reward_cow2_wait_w * cf
+        r = r_chase + r_prog + r_rprog + r_succ + r_ocont + r_xtouch + r_bcont + r_oob + r_lost + r_timeout + r_fall + r_wait + r_verr
+        if (self._cow2_replace_reward):
+            self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
+        else:
+            self._task_reward_buf[:] = self._task_reward_buf + cf * r
+
+        d = self._diag
+        d.add_mean("cow2_frac", cf)
+        for name, val in (("chase", r_chase), ("d_prog", r_prog), ("d_rprog", r_rprog), ("d_succ", r_succ),
+                          ("d_ocont", r_ocont), ("d_xtouch", r_xtouch), ("d_verr", r_verr), ("d_bcont", r_bcont), ("d_oob", r_oob), ("lost", r_lost),
+                          ("timeout", r_timeout), ("fall", r_fall), ("wait", r_wait)):
+            d.add_mean("reward_cow2_" + name, cf * val)
+        d.add_sum("cow2d_succ", succ.float())
+        d.add_sum("cow2d_succ_fast", (succ & (t <= self._cow2_d_fast_s + 1.0e-6)).float())
+        d.add_sum("cow2d_succ_time", succ.float() * t)
+        d.add_sum("cow2d_succ_touches", succ.float() * self._cow2_touches)
+        d.add_sum("cow2d_succ_le3", (succ & (self._cow2_touches <= 3.0)).float())
+        d.add_sum("cow2d_timeout", fail_time.float())
+        d.add_sum("cow2d_lost", lost.float())
+        d.add_sum("cow2d_bcont", bcont.float())
+        d.add_sum("cow2d_oob", oob.float())
+        end = succ | fail_time | lost | bcont | oob
+        d.add_sum("cow2d_ocont_ep", (end & self._cow2d_ocont).float())
+        d.add_sum("cow2d_ocont_steps", ocont.float())
+        d.add_sum("cow2d_steps", cf)
+        if (getattr(self, "_cow2d_log", None) is not None and bool(end.any())):  # eval only: per-scenario rows
+            code = succ.float() * 1 + fail_time.float() * 2 + lost.float() * 3 + bcont.float() * 4 + oob.float() * 5
+            self._cow2d_log.append(torch.stack([code, t.clone(), self._cow2_touches.clone(), self._cow2d_ocont.float(),
+                                                self._cow2_pang.clone(), pd, self._cow2d_tball.clone()], dim=-1)[end].cpu())
+
+        self._cow2_prev_fd[:] = fd
+        self._cow2_prev_speed[:] = speed
+        self._cow2_prev_pd[:] = pd
+        self._cow2d_prev_rd[:] = rd
+        ids = end.nonzero(as_tuple=False).flatten()
+        if (len(ids) > 0):
+            self._cow2_spawn(ids)
+            if (self._virtual_perception):
+                self._reset_perception(ids)
+            self._record_reset_prev_states(ids)
+        ball = self._get_ball_pos()[:, 0:2]
+        cids = cow.nonzero(as_tuple=False).flatten()
+        if (len(cids) > 0):
+            tgt = self._cow2_P[cids]
+            if (self._cow2_d_bypass_clear > 0.0):
+                tgt = cow2_util.bypass_target(ball[cids], self._cow_opp[cids], tgt, self._cow2_d_bypass_clear)
+                self._diag.add_mean("cow2d_cmd_bypass", (tgt != self._cow2_P[cids]).any(-1).float())
+            self._drib_cmd[cids] = cow2_util.target_cmd(ball[cids], tgt, self._cow_heading_dir(cids),
+                                                        self._cow2_p_scale, self._cow2_cmd_decel(), self._cow2_d_v_arr) * self._cow2_d_cmd_gain
+            self._diag.add_mean("cow2d_cmd_speed", torch.linalg.norm(self._drib_cmd[cids], dim=-1))
+        return
+
+    def _update_cow2(self, cow=None):
+        if (cow is None and self._cow2_stage >= 2):
+            mA = self._cow_mode & self._cow2_isA
+            if (self._cow2_stage == 3):
+                self._update_cow2_region(self._cow_mode & ~self._cow2_isA)
+            else:
+                self._update_cow2_target(self._cow_mode & ~self._cow2_isA)
+            if (self._cow2_mix_a > 0.0):
+                self._diag.add_mean("cow2_mixa_frac", mA.float())
+                self._update_cow2(mA)
+            return
+        """Stage A tick: seek (reach + settle the ball) -> hold (keep it close) -> respawn; rewards replace the
+        task reward of cow envs (cow2_replace_reward), diagnostics cow2_*."""
+        char_id = self._get_char_id()
+        dt = self._engine.get_timestep()
+        if (cow is None):
+            cow = self._cow_mode
+        cf = cow.float()
+        root3 = self._engine.get_root_pos(char_id)
+        root = root3[:, 0:2]
+        ball = self._get_ball_pos()[:, 0:2]
+        vel = self._cow_ball_friction(cow)
+        rspeed = torch.linalg.norm(self._engine.get_root_vel(char_id)[:, 0:2], dim=-1)
+        dist = torch.linalg.norm(ball - root, dim=-1)
+        speed = torch.linalg.norm(vel, dim=-1)
+
+        seek = cow & (self._cow2_phase == cow2_util.PH_SEEK)
+        hold_ph = cow & (self._cow2_phase == cow2_util.PH_HOLD)
+        self._cow2_since[:] = torch.where(cow, self._cow2_since + dt, self._cow2_since)
+        self._cow2_hold[:] = torch.where(seek, cow2_util.capture_step(self._cow2_hold, dist, speed, dt, self._cow2_cap_dist,
+                                                                      self._cow2_cap_speed), self._cow2_hold)
+        self._cow2_htime[:] = torch.where(hold_ph, self._cow2_htime + dt, self._cow2_htime)
+        cap = seek & (self._cow2_hold >= self._cow2_cap_hold - 1.0e-6)
+        cap_time = self._cow2_since - self._cow2_cap_hold
+        lost = cow & (dist > self._cow2_lost_dist)
+        fail_time = seek & ~cap & ~lost & (self._cow2_since >= self._cow2_seek_s)
+        succ = hold_ph & ~lost & (self._cow2_htime >= self._cow2_hold_s)
+        self._cow2_phase[:] = torch.where(cap & ~lost, torch.full_like(self._cow2_phase, cow2_util.PH_HOLD), self._cow2_phase)
+        self._cow2_htime[:] = torch.where(cap, torch.zeros_like(self._cow2_htime), self._cow2_htime)
+
+        # rewards
+        near = dribble_util.compute_dribble_near_weight(dist, self._drib_near_dist, self._drib_far_dist)
+        ctrl = near * torch.exp(-torch.square(dist - self._cow_dstar) / self._cow_sigma_d) \
+            * torch.exp(-torch.square(speed) / self._cow_sigma_v)
+        chase_r = soccer_util.compute_ball_chase_reward(root3, self._prev_root_pos, self._get_ball_pos(), self._steer_stop_dist,
+                                                        self._steer_speed_max, dt, self._ball_chase_vel_scale)
+        idle = seek & (rspeed < self._cow2_still_speed) & (dist > self._cow2_cap_dist)
+        fallen = root3[:, 2] < 0.45
+        r_ctrl = self._reward_cow2_ctrl_w * ctrl
+        r_chase = self._reward_cow2_chase_w * (1.0 - near) * chase_r
+        r_cap = self._reward_cow2_cap_w * cap.float()
+        r_idle = -self._reward_cow2_idle_w * idle.float()
+        r_lost = -self._reward_cow2_lost_w * lost.float()
+        r_timeout = -self._reward_cow2_timeout_w * fail_time.float()
+        r_fall = -self._reward_cow2_fall_w * fallen.float()
+        r = r_ctrl + r_chase + r_cap + r_idle + r_lost + r_timeout + r_fall
+        if (self._cow2_replace_reward):
+            self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
+        else:
+            self._task_reward_buf[:] = self._task_reward_buf + cf * r
+
+        d = self._diag
+        d.add_mean("cow2_frac", cf)
+        for name, val in (("ctrl", r_ctrl), ("chase", r_chase), ("cap", r_cap), ("idle", r_idle), ("lost", r_lost),
+                          ("timeout", r_timeout), ("fall", r_fall)):
+            d.add_mean("reward_cow2_" + name, cf * val)
+        d.add_sum("cow2_cap", cap.float())
+        d.add_sum("cow2_cap5", (cap & (cap_time <= 5.0 + 1.0e-6)).float())
+        d.add_sum("cow2_cap_time", cap.float() * cap_time)
+        d.add_sum("cow2_fail_time", fail_time.float())
+        d.add_sum("cow2_lost_seek", (lost & seek).float())
+        d.add_sum("cow2_lost_hold", (lost & hold_ph).float())
+        d.add_sum("cow2_succ", succ.float())
+        d.add_sum("cow2_seek_steps", (seek & (dist > self._cow2_cap_dist)).float())  # still fraction: ball not yet reached
+        d.add_sum("cow2_seek_still", idle.float())
+        d.add_sum("cow2_hold_steps", hold_ph.float())
+        d.add_sum("cow2_hold_near", (hold_ph & (dist < 1.0)).float())
+        d.add_sum("cow2_hold_dist", hold_ph.float() * dist)
+
+        ids = (succ | fail_time | lost).nonzero(as_tuple=False).flatten()
+        if (len(ids) > 0):
+            self._cow2_spawn(ids)
+            if (self._virtual_perception):
+                self._reset_perception(ids)
+            self._record_reset_prev_states(ids)
+        return
+
+    def _update_cow2_target(self, cow=None):
+        """Stage B tick (doc 40 v2): CTRL (reach the ball, touch it to >= touch_speed) -> TOUCH (until the ball
+        is > touch_end from the foot: rest prediction, touch reward) -> ROLL (until the ball rests: hit if
+        <= hit_dist from P, hit reward) -> new P around the ball. Extra touches while rolling are counted."""
+        char_id = self._get_char_id()
+        dt = self._engine.get_timestep()
+        if (cow is None):
+            cow = self._cow_mode
+        cf = cow.float()
+        root3 = self._engine.get_root_pos(char_id)
+        root = root3[:, 0:2]
+        ball3 = self._get_ball_pos()
+        ball = ball3[:, 0:2]
+        vel = self._cow_ball_friction(cow)
+        rspeed = torch.linalg.norm(self._engine.get_root_vel(char_id)[:, 0:2], dim=-1)
+        dist = torch.linalg.norm(ball - root, dim=-1)
+        speed = torch.linalg.norm(vel, dim=-1)
+        fd = self._min_foot_ball_dist(ball3)
+        P = self._cow2_P
+        pd = torch.linalg.norm(P - ball, dim=-1)
+        ph = self._cow2_phase
+        ctrl_ph = cow & (ph == cow2_util.PH_CTRL)
+        touch_ph = cow & (ph == cow2_util.PH_TOUCH)
+        roll_ph = cow & (ph == cow2_util.PH_ROLL)
+        self._cow2_since[:] = torch.where(cow, self._cow2_since + dt, self._cow2_since)
+
+        hit_ev = cow2_util.touch_start(self._cow2_prev_fd, fd, self._cow2_prev_speed, speed, self._cow2_touch_dist,
+                                       self._kick_contact_min_gain, self._cow2_touch_speed) & cow
+        first = hit_ev & ctrl_ph
+        extra = hit_ev & roll_ph
+        touch_time = self._cow2_since.clone()
+        self._cow2_touches[:] = self._cow2_touches + hit_ev.float() * (ctrl_ph | roll_ph).float()
+        # touch end: the ball left the foot -> predicted rest point, touch reward (paid once per touch)
+        # (a ball kept at the foot past seek_s, i.e. carried instead of touched, also ends the touch)
+        end_t = ((touch_ph & ((fd > self._cow2_touch_end) | (self._cow2_since >= self._cow2_seek_s)))
+                 | (first & (fd > self._cow2_touch_end)))
+        pred = cow2_util.predict_rest(ball, vel, self._cow_ball_decel)
+        self._cow2_pred[:] = torch.where(end_t.unsqueeze(-1), pred, self._cow2_pred)
+        touch_r = cow2_util.touch_target_reward(pred, P, self._cow2_p_sigma)
+        # rest: slow for rest_hold s while rolling (or roll timeout)
+        slow = speed < self._cow2_rest_speed
+        self._cow2_hold[:] = torch.where(roll_ph & slow, self._cow2_hold + dt, torch.where(roll_ph, torch.zeros_like(self._cow2_hold), self._cow2_hold))
+        self._cow2_htime[:] = torch.where(roll_ph, self._cow2_htime + dt, self._cow2_htime)
+        rest = roll_ph & ((self._cow2_hold >= self._cow2_rest_hold - 1.0e-6) | (self._cow2_htime >= self._cow2_roll_s))
+        err = pd
+        hit = rest & (err <= self._cow2_hit_dist)
+        hit_r = cow2_util.touch_target_reward(ball, P, self._cow2_p_sigma)
+        lost = cow & (dist > self._cow2_lost_dist) & ~rest
+        fail_time = ctrl_ph & ~first & (self._cow2_since >= self._cow2_seek_s)
+        self._cow2_tdur[:] = torch.where(touch_ph, self._cow2_tdur + dt, torch.zeros_like(self._cow2_tdur))
+        carry = touch_ph & ~end_t & (self._cow2_tdur >= self._cow2_touch_max_s - 1.0e-6)
+        if (self._cow2_touch_max_fail):
+            fail_time = fail_time | carry
+
+        # phase transitions
+        new_ph = ph.clone()
+        new_ph = torch.where(first, torch.full_like(ph, cow2_util.PH_TOUCH), new_ph)
+        new_ph = torch.where(end_t, torch.full_like(ph, cow2_util.PH_ROLL), new_ph)
+        new_ph = torch.where(extra & (fd <= self._cow2_touch_end), torch.full_like(ph, cow2_util.PH_TOUCH), new_ph)
+        self._cow2_phase[:] = torch.where(cow, new_ph, ph)
+        self._cow2_htime[:] = torch.where(end_t & ~roll_ph, torch.zeros_like(self._cow2_htime), self._cow2_htime)
+
+        # rewards
+        near = dribble_util.compute_dribble_near_weight(dist, self._drib_near_dist, self._drib_far_dist)
+        chase_r = soccer_util.compute_ball_chase_reward(root3, self._prev_root_pos, ball3, self._steer_stop_dist,
+                                                        self._steer_speed_max, dt, self._ball_chase_vel_scale)
+        idle = ctrl_ph & (rspeed < self._cow2_still_speed) & (dist > self._cow2_cap_dist)
+        fallen = root3[:, 2] < 0.45
+        prog = torch.clamp((self._cow2_prev_pd - pd) / dt, -1.0, 1.0)  # m/s of the ball toward P, in [-1, 1] like drib_prog
+        r_chase = self._reward_cow2_chase_w * ctrl_ph.float() * (1.0 - near) * chase_r
+        r_prog = self._reward_cow2_prog_w * (roll_ph.float() if self._cow2_prog_roll_only else cf) * prog
+        r_touch = self._reward_cow2_touch_w * (end_t & (self._cow2_touches <= 1.0)).float() * touch_r  # 1st touch only
+        rel_ev = end_t & (self._cow2_touches <= 1.0)
+        to_p = P - ball
+        d_p = torch.linalg.norm(to_p, dim=-1)
+        v_req = torch.sqrt(2.0 * self._cow_ball_decel * d_p).unsqueeze(-1) * to_p / torch.clamp_min(d_p, 1.0e-6).unsqueeze(-1)
+        rel_err = torch.linalg.norm(vel - v_req, dim=-1)
+        rel_r = torch.exp(-torch.square(rel_err / self._cow2_rel_sigma))
+        r_rel = self._reward_cow2_rel_w * rel_ev.float() * rel_r
+        r_sep = self._reward_cow2_sep_w * touch_ph.float() * torch.clamp((fd - self._cow2_prev_fd) / dt, -1.0, 1.0)
+        rf = rel_ev.float()
+        cosang = torch.sum(vel * to_p, dim=-1) / torch.clamp_min(speed * d_p, 1.0e-6)
+        r_hit = self._reward_cow2_hit_w * rest.float() * hit_r
+        r_idle = -self._reward_cow2_idle_w * idle.float()
+        r_lost = -self._reward_cow2_lost_w * lost.float()
+        r_timeout = -self._reward_cow2_timeout_w * fail_time.float()
+        r_fall = -self._reward_cow2_fall_w * fallen.float()
+        # pre-touch setup potential: ball still in CTRL, so only the robot moves between steps
+        to_p = P - ball
+        to_p = to_p / torch.clamp(torch.linalg.norm(to_p, dim=-1, keepdim=True), min=1.0e-6)
+        def _setup_pot(rxy):
+            v = ball - rxy
+            v = v / torch.clamp(torch.linalg.norm(v, dim=-1, keepdim=True), min=1.0e-6)
+            return (v * to_p).sum(-1)
+        setup_pot = _setup_pot(root)
+        setup_gate = (ctrl_ph & (dist < self._cow2_setup_dist)).float()
+        r_setup = self._reward_cow2_setup_w * setup_gate * (setup_pot - _setup_pot(self._prev_root_pos[:, 0:2]))
+        r_wait = -self._reward_cow2_wait_w * ctrl_ph.float()
+        r = r_chase + r_prog + r_touch + r_hit + r_idle + r_lost + r_timeout + r_fall + r_setup + r_wait + r_rel + r_sep
+        if (self._cow2_replace_reward):
+            self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
+        else:
+            self._task_reward_buf[:] = self._task_reward_buf + cf * r
+
+        d = self._diag
+        d.add_mean("cow2_frac", cf)
+        for name, val in (("chase", r_chase), ("prog", r_prog), ("touch", r_touch), ("hit", r_hit), ("idle", r_idle),
+                          ("lost", r_lost), ("timeout", r_timeout), ("fall", r_fall), ("setup", r_setup), ("wait", r_wait),
+                          ("rel", r_rel), ("sep", r_sep)):
+            d.add_mean("reward_cow2_" + name, cf * val)
+        d.add_sum("cow2c_sep_n", touch_ph.float())
+        d.add_sum("cow2c_sep_v", touch_ph.float() * torch.clamp((fd - self._cow2_prev_fd) / dt, -1.0, 1.0))
+        d.add_sum("cow2c_rel_n", rf)
+        d.add_sum("cow2c_rel_err", rf * rel_err)
+        d.add_sum("cow2c_rel_r", rf * rel_r)
+        d.add_sum("cow2c_rel_spd_err", rf * torch.abs(speed - torch.linalg.norm(v_req, dim=-1)))
+        d.add_sum("cow2c_rel_ang45", rf * (cosang < 0.7071).float())
+        d.add_mean("cow2b_setup_pot", setup_gate * setup_pot)
+        d.add_sum("cow2b_setup_steps", setup_gate)
+        d.add_sum("cow2b_touch_pot", first.float() * setup_pot)  # alignment at the 1st touch
+        d.add_sum("cow2b_touch1", first.float())
+        d.add_sum("cow2b_touch_le3", (first & (touch_time <= 3.0 + 1.0e-6)).float())
+        d.add_sum("cow2b_rest", rest.float())
+        d.add_sum("cow2b_hit", hit.float())
+        d.add_sum("cow2b_err", rest.float() * err)
+        d.add_sum("cow2b_err_le1", (rest & (err <= 1.0)).float())
+        d.add_sum("cow2b_pred_err", rest.float() * torch.linalg.norm(self._cow2_pred - ball, dim=-1))
+        d.add_sum("cow2b_pred_le02", (rest & (torch.linalg.norm(self._cow2_pred - ball, dim=-1) <= 0.2)).float())
+        d.add_sum("cow2b_touches", rest.float() * self._cow2_touches)
+        d.add_sum("cow2b_one_touch", (rest & (self._cow2_touches <= 1.0)).float())
+        d.add_sum("cow2b_fail_time", fail_time.float())
+        d.add_sum("cow2b_lost", lost.float())
+        for nm, sd in (("pos", self._cow2_pside > 0), ("neg", self._cow2_pside < 0)):
+            d.add_sum("cow2b_rest_" + nm, (rest & sd).float())
+            d.add_sum("cow2b_hit_" + nm, (hit & sd).float())
+        d.add_sum("cow2b_ctrl_steps", (ctrl_ph & (dist > self._cow2_cap_dist)).float())
+        d.add_sum("cow2b_ctrl_still", idle.float())
+        # stage C cycle: capture -> touch -> hit rest -> recapture (robot within cap_dist), timed from the capture
+        near_b = cow & (dist < self._cow2_cap_dist)
+        run = self._cow2_cyc_clock >= 0.0
+        self._cow2_cyc_clock[:] = torch.where(cow & run, self._cow2_cyc_clock + dt, self._cow2_cyc_clock)
+        recap = self._cow2_cyc_pend & near_b
+        d.add_sum("cow2c_cyc", recap.float())
+        d.add_sum("cow2c_cyc_T", (recap & (self._cow2_cyc_clock <= self._cow2_cyc_T + 1.0e-6)).float())
+        d.add_sum("cow2c_cyc_time", recap.float() * self._cow2_cyc_clock)
+        r_cyc = self._reward_cow2_cyc_w * (recap & (self._cow2_cyc_clock <= self._cow2_cyc_T + 1.0e-6)).float()
+        self._task_reward_buf[:] = self._task_reward_buf + cf * r_cyc
+        d.add_mean("reward_cow2_cyc", cf * r_cyc)
+        start = (ctrl_ph & near_b & ~run) | recap  # the recapture starts the next cycle
+        self._cow2_cyc_clock[:] = torch.where(start, torch.zeros_like(self._cow2_cyc_clock), self._cow2_cyc_clock)
+        self._cow2_cyc_pend[:] = torch.where(recap, torch.zeros_like(self._cow2_cyc_pend), self._cow2_cyc_pend)
+        self._cow2_cyc_pend[:] = self._cow2_cyc_pend | (hit & (self._cow2_cyc_clock >= 0.0))
+        self._cow2_cyc_clock[:] = torch.where(rest & ~hit, -torch.ones_like(self._cow2_cyc_clock), self._cow2_cyc_clock)
+        # where the time goes (per cow step): ctrl (before the 1st touch), touch (ball at the foot), roll
+        d.add_sum("cow2c_ph_ctrl", ctrl_ph.float())
+        d.add_sum("cow2c_carry", (carry & (self._cow2_tdur < self._cow2_touch_max_s + dt - 1.0e-6)).float())  # once per carry
+        d.add_sum("cow2c_ph_touch", touch_ph.float())
+        d.add_sum("cow2c_ph_roll", roll_ph.float())
+        d.add_sum("cow2c_ph_pend", (cow & self._cow2_cyc_pend).float())
+        if (getattr(self, "_cow2_fail_log", None) is not None and bool((fail_time | lost).any())):  # eval only: P angle of failed scenarios
+            self._cow2_fail_log.append(self._cow2_pang[fail_time | lost].cpu())
+        if (getattr(self, "_cow2_err_log", None) is not None and bool(rest.any())):  # eval only: per-scenario rows
+            # signed error of the rest point in the ball0->P frame: along > 0 = overshoot, lat = sideways miss
+            ax = self._cow2_P - self._cow2_ball0
+            ax = ax / torch.clamp(torch.linalg.norm(ax, dim=-1, keepdim=True), min=1.0e-6)
+            e = ball - self._cow2_P
+            e_along = (e * ax).sum(-1)
+            e_lat = e[:, 1] * ax[:, 0] - e[:, 0] * ax[:, 1]
+            self._cow2_err_log.append(torch.stack([err, torch.linalg.norm(self._cow2_pred - ball, dim=-1),
+                                                   self._cow2_touches, self._cow2_pside, e_along, e_lat,
+                                                   self._cow2_pang],
+                                                  dim=-1)[rest].cpu())
+
+        self._cow2_prev_fd[:] = fd
+        self._cow2_prev_speed[:] = speed
+        self._cow2_prev_pd[:] = pd
+        ids = rest.nonzero(as_tuple=False).flatten()  # ball at rest: next P around it, the ball stays
+        if (len(ids) > 0 and self._cow2_mix_a > 0.0):  # or, with prob cow2_mix_a, a stage-A scenario
+            to_a = torch.rand(len(ids), device=self._device) < self._cow2_mix_a
+            a_ids = ids[to_a]
+            ids = ids[~to_a]
+            if (len(a_ids) > 0):
+                self._cow2_spawn(a_ids, is_a=True)
+                if (self._virtual_perception):
+                    self._reset_perception(a_ids)
+                self._record_reset_prev_states(a_ids)
+        if (len(ids) > 0):
+            self._cow2_new_target(ids)
+        ids = (lost | fail_time).nonzero(as_tuple=False).flatten()  # respawn the ball near the robot (+ new P)
+        if (len(ids) > 0):
+            self._cow2_spawn(ids)
+            if (self._virtual_perception):
+                self._reset_perception(ids)
+            self._record_reset_prev_states(ids)
+        ball = self._get_ball_pos()[:, 0:2]
+        # P as the dribble command, re-expressed in the current heading every tick
+        cids = cow.nonzero(as_tuple=False).flatten()
+        if (len(cids) > 0):
+            self._drib_cmd[cids] = cow2_util.target_cmd(ball[cids], self._cow2_P[cids], self._cow_heading_dir(cids),
+                                                        self._cow2_p_scale, self._cow2_cmd_decel())
+            if (self._cow2_roll_zero_cmd):
+                rz = cids[self._cow2_phase[cids] == cow2_util.PH_ROLL]
+                self._drib_cmd[rz] = 0.0
+        return
+
+    @staticmethod
+    def _cow2_event_diags(sums):
+        """Stage A rates (doc 40 v2 gate A1/A2). Seek ends = capture, timeout or ball lost while seeking;
+        scenarios ended = success (hold completed), timeout, lost."""
+        g = lambda k: sums.get(k, 0.0)
+        ratio = lambda a, b: a / b if b > 0.0 else 0.0
+        cap = g("cow2_cap")
+        seek_end = cap + g("cow2_fail_time") + g("cow2_lost_seek")
+        ended = g("cow2_succ") + g("cow2_fail_time") + g("cow2_lost_seek") + g("cow2_lost_hold")
+        d_end = g("cow2d_succ") + g("cow2d_timeout") + g("cow2d_lost") + g("cow2d_bcont") + g("cow2d_oob")
+        dd = {"cow2d_ended": d_end, "cow2d_succ_rate": ratio(g("cow2d_succ"), d_end),
+              "cow2d_succ_fast_rate": ratio(g("cow2d_succ_fast"), d_end),
+              "cow2d_time_mean": ratio(g("cow2d_succ_time"), g("cow2d_succ")),
+              "cow2d_touches_mean": ratio(g("cow2d_succ_touches"), g("cow2d_succ")),
+              "cow2d_le3_rate": ratio(g("cow2d_succ_le3"), g("cow2d_succ")),
+              "cow2d_timeout_rate": ratio(g("cow2d_timeout"), d_end), "cow2d_lost_rate": ratio(g("cow2d_lost"), d_end),
+              "cow2d_bcont_rate": ratio(g("cow2d_bcont"), d_end), "cow2d_oob_rate": ratio(g("cow2d_oob"), d_end),
+              "cow2d_ocont_rate": ratio(g("cow2d_ocont_ep"), d_end),
+              "cow2d_ocont_step_frac": ratio(g("cow2d_ocont_steps"), g("cow2d_steps"))}
+        return {**dd, "cow2_seek_end": seek_end, "cow2_cap_rate": ratio(cap, seek_end), "cow2_cap5_rate": ratio(g("cow2_cap5"), seek_end),
+                "cow2_cap_time_mean": ratio(g("cow2_cap_time"), cap), "cow2_ended": ended,
+                "cow2_succ_rate": ratio(g("cow2_succ"), ended),
+                "cow2_lost_rate": ratio(g("cow2_lost_seek") + g("cow2_lost_hold"), ended),
+                "cow2_timeout_rate": ratio(g("cow2_fail_time"), seek_end),
+                "cow2_still_frac": ratio(g("cow2_seek_still"), g("cow2_seek_steps")),
+                "cow2_hold_near_frac": ratio(g("cow2_hold_near"), g("cow2_hold_steps")),
+                "cow2_hold_dist_mean": ratio(g("cow2_hold_dist"), g("cow2_hold_steps")),
+                "cow2_cap_n": cap, "cow2_cap5_n": g("cow2_cap5"), "cow2_lost_n": g("cow2_lost_seek") + g("cow2_lost_hold"),
+                "cow2_succ_n": g("cow2_succ"),
+                # stage B (cow2b_*): scenarios ended = rest + no touch in time + lost
+                "cow2b_ended": g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost"),
+                "cow2b_hit_rate": ratio(g("cow2b_hit"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2b_touch_le3_rate": ratio(g("cow2b_touch_le3"), g("cow2b_touch1") + g("cow2b_fail_time")),
+                "cow2b_err_mean": ratio(g("cow2b_err"), g("cow2b_rest")),
+                "cow2b_err_le1_rate": ratio(g("cow2b_err_le1"), g("cow2b_rest")),
+                "cow2b_pred_err_mean": ratio(g("cow2b_pred_err"), g("cow2b_rest")),
+                "cow2b_pred_le02_rate": ratio(g("cow2b_pred_le02"), g("cow2b_rest")),
+                "cow2b_touches_mean": ratio(g("cow2b_touches"), g("cow2b_rest")),
+                "cow2b_one_touch_rate": ratio(g("cow2b_one_touch"), g("cow2b_rest")),
+                "cow2b_timeout_rate": ratio(g("cow2b_fail_time"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2b_lost_rate": ratio(g("cow2b_lost"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2b_hit_pos_rate": ratio(g("cow2b_hit_pos"), g("cow2b_rest_pos")),
+                "cow2b_hit_neg_rate": ratio(g("cow2b_hit_neg"), g("cow2b_rest_neg")),
+                "cow2b_still_frac": ratio(g("cow2b_ctrl_still"), g("cow2b_ctrl_steps")),
+                "cow2c_cyc_T_rate": ratio(g("cow2c_cyc_T"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2c_cyc_rate": ratio(g("cow2c_cyc"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2c_cyc_time_mean": ratio(g("cow2c_cyc_time"), g("cow2c_cyc")),
+                "cow2c_ph_touch_s": ratio(g("cow2c_ph_touch"), g("cow2b_rest")) / 30.0,  # s per ended-at-rest scenario
+                "cow2c_ph_roll_s": ratio(g("cow2c_ph_roll"), g("cow2b_rest")) / 30.0,
+                "cow2c_rel_err_mean": ratio(g("cow2c_rel_err"), g("cow2c_rel_n")),
+                "cow2c_rel_r_mean": ratio(g("cow2c_rel_r"), g("cow2c_rel_n")),
+                "cow2c_rel_spd_err_mean": ratio(g("cow2c_rel_spd_err"), g("cow2c_rel_n")),
+                "cow2c_rel_ang45_rate": ratio(g("cow2c_rel_ang45"), g("cow2c_rel_n")),
+                "cow2c_carry_rate": ratio(g("cow2c_carry"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2c_ph_ctrl_s": ratio(g("cow2c_ph_ctrl"), g("cow2b_rest")) / 30.0,
+                "cow2c_ph_pend_s": ratio(g("cow2c_ph_pend"), g("cow2c_cyc")) / 30.0,
+                "cow2b_hit_n": g("cow2b_hit"), "cow2b_rest_n": g("cow2b_rest")}
+
+    def _update_cow(self):
+        """One tick of the cow episodes: phase machine, rewards (replace the task reward), respawn on
+        success/failure (the episode goes on), opponent estimate (noise/dropout)."""
+        char_id = self._get_char_id()
+        dt = self._engine.get_timestep()
+        root = self._engine.get_root_pos(char_id)[:, 0:2]
+        ball = self._get_ball_pos()[:, 0:2]
+        vel = self._engine.get_root_vel(self._get_ball_id())[:, 0:2]
+        cow = self._cow_mode
+        cf = cow.float()
+        if (self._cow_ball_decel > 0.0):  # rolling resistance: constant deceleration of the ball's horizontal speed
+            _bid = self._get_ball_id()
+            _v3 = self._engine.get_root_vel(_bid).clone()
+            _sp = torch.linalg.norm(_v3[:, 0:2], dim=-1)
+            _k = torch.clamp(1.0 - self._cow_ball_decel * dt / torch.clamp(_sp, min=1.0e-6), min=0.0)
+            _ids = (cow & (_sp > 0.02)).nonzero(as_tuple=False).flatten()
+            if (_ids.numel() > 0):
+                _v3[_ids, 0:2] = _v3[_ids, 0:2] * _k[_ids].unsqueeze(-1)
+                self._engine.set_root_vel(_ids, _bid, _v3[_ids])
+                vel = _v3[:, 0:2]
+        p = self._cow_phase_p
+
+        # reactive opponent (stage 4): after the touch it closes on the ball
+        if (self._cow_opp_speed > 0.0):
+            chase = torch.logical_and(cow, self._cow_phase == cow_util.PH_FLIGHT)
+            u = ball - self._cow_opp
+            u = u / torch.clamp(torch.linalg.norm(u, dim=-1, keepdim=True), min=1.0e-6)
+            ov = torch.where(chase.unsqueeze(-1), u * self._cow_opp_speed, torch.zeros_like(u))
+            self._cow_opp_vel[:] = ov
+            self._cow_opp[:] = self._cow_opp + ov * dt
+
+        old_phase = self._cow_phase.clone()
+        old_since = self._cow_since.clone()
+        (phase, hold, since, min_bo, min_ro, axis, ev) = cow_util.cow_phase_step(
+            self._cow_phase, self._cow_hold, self._cow_since, self._cow_min_bo, self._cow_min_ro, self._cow_axis,
+            ball, vel, root, self._cow_opp, dt, p)
+        self._cow_phase[:] = torch.where(cow, phase, self._cow_phase)
+        self._cow_hold[:] = torch.where(cow, hold, self._cow_hold)
+        self._cow_since[:] = torch.where(cow, since, self._cow_since)
+        self._cow_min_bo[:] = torch.where(cow, min_bo, self._cow_min_bo)
+        self._cow_min_ro[:] = torch.where(cow, min_ro, self._cow_min_ro)
+        self._cow_axis[:] = torch.where(cow.unsqueeze(-1), axis, self._cow_axis)
+        ph = self._cow_phase
+        gate, touch = ev["gate"] & cow, ev["touch"] & cow
+        succ = ev["succ"] & cow
+        fail_ball, fail_contact = ev["fail_ball"] & cow, ev["fail_contact"] & cow
+        fail_lost, fail_time = ev["fail_lost"] & cow, ev["fail_time"] & cow
+        fail = fail_ball | fail_contact | fail_lost | fail_time
+
+        # rewards
+        dist = torch.linalg.norm(ball - root, dim=-1)
+        speed = torch.linalg.norm(vel, dim=-1)
+        near = dribble_util.compute_dribble_near_weight(dist, self._drib_near_dist, self._drib_far_dist)
+        ctrl = near * torch.exp(-torch.square(dist - self._cow_dstar) / self._cow_sigma_d) \
+            * torch.exp(-torch.square(speed) / self._cow_sigma_v)
+        ball3 = self._get_ball_pos()
+        chase_r = soccer_util.compute_ball_chase_reward(
+            self._engine.get_root_pos(char_id), self._prev_root_pos, ball3, self._steer_stop_dist,
+            self._steer_speed_max, dt, self._ball_chase_vel_scale)
+        touch_r = cow_util.compute_cow_touch_reward(ball, vel, self._cow_opp, self._cow_radius, self._cow_margin,
+                                                    self._cow_v_target)
+        clear = torch.clamp((cow_util.ball_pass_clearance(ball, vel, self._cow_opp) - self._cow_radius)
+                            / max(self._cow_margin, 1.0e-6), 0.0, 1.0)
+        goal_t = cow_util.compute_cow_goal_term(ball, vel, self._goal_pos, clear, self._cow_v_target)
+        rec_r = torch.exp(-dist / self._cow_rec_sigma)
+        in0 = (old_phase == cow_util.PH_CTRL) & ~gate
+        in1 = (old_phase == cow_util.PH_TOUCH) | gate
+        in2 = (old_phase == cow_util.PH_FLIGHT) | touch
+        in1 = in1 & ~touch
+        r_ctrl = self._reward_cow_ctrl_w * in0.float() * ctrl
+        r_chase = self._reward_cow_chase_w * in0.float() * (1.0 - near) * chase_r
+        t_win = (self._cow_since <= self._cow_touch_window_s + 1.0e-6) if self._cow_touch_window_s > 0.0 \
+            else torch.ones_like(cow)
+        _past_ok = ((ball - self._cow_opp) * self._cow_axis).sum(-1) > 0.0
+        _g2 = _past_ok.float() if self._cow_ctrl2_past > 0.5 else torch.ones_like(ctrl)
+        r_ctrl2 = self._reward_cow_ctrl2_w * in2.float() * _g2 * ctrl
+        r_chase2 = self._reward_cow_chase2_w * in2.float() * (1.0 - near) * chase_r
+        r_touch = self._reward_cow_touch_w * (in2 & t_win).float() * touch_r
+        r_idle = -self._reward_cow_idle_w * in1.float()
+        r_rec = self._reward_cow_rec_w * in2.float() * rec_r
+        r_goal = self._reward_cow_goal_w * in2.float() * goal_t
+        r_succ = self._reward_cow_succ_w * succ.float()
+        r_fail = -self._reward_cow_fail_w * fail.float()
+        fallen = self._engine.get_root_pos(char_id)[:, 2] < 0.45
+        r_fall = -self._reward_cow_fall_w * fallen.float()
+        r = r_ctrl + r_chase + r_chase2 + r_ctrl2 + r_touch + r_idle + r_rec + r_goal + r_succ + r_fail + r_fall
+        self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
+
+        # diagnostics
+        d = self._diag
+        d.add_mean("cow_frac", cf)
+        for name, val in (("ctrl", r_ctrl), ("chase", r_chase), ("chase2", r_chase2), ("ctrl2", r_ctrl2), ("touch", r_touch), ("idle", r_idle),
+                          ("rec", r_rec), ("goal", r_goal), ("succ", r_succ), ("fail", r_fail), ("fall", r_fall)):
+            d.add_mean("reward_cow_" + name, cf * val)
+        d.add_sum("cow_steps", cf)
+        d.add_sum("cow_gate", gate.float())
+        d.add_sum("cow_gate_time", gate.float() * old_since)
+        d.add_sum("cow_touch", touch.float())
+        new_pass = ev["pass_ok"] & cow & ~self._cow_passed  # first pass_ok step of the scenario
+        self._cow_passed |= new_pass
+        d.add_sum("cow_pass", new_pass.float())
+        d.add_sum("cow_succ", succ.float())
+        d.add_sum("cow_fail_ball", fail_ball.float())
+        d.add_sum("cow_fail_contact", fail_contact.float())
+        d.add_sum("cow_fail_lost", fail_lost.float())
+        d.add_sum("cow_fail_time", fail_time.float())
+        d.add_sum("cow_fail_time_ctrl", (fail_time & (old_phase == cow_util.PH_CTRL)).float())
+        side = cow_util.cow_side(self._cow_axis, ball, self._cow_opp)
+        end2 = (succ | fail_ball | fail_contact) & (old_phase == cow_util.PH_FLIGHT)
+        d.add_sum("cow_side_pos_succ", (end2 & succ & (side > 0)).float())
+        d.add_sum("cow_side_pos_fail", (end2 & ~succ & (side > 0)).float())
+        d.add_sum("cow_side_neg_succ", (end2 & succ & (side < 0)).float())
+        d.add_sum("cow_side_neg_fail", (end2 & ~succ & (side < 0)).float())
+        gain = self._cow_goal0 - torch.linalg.norm(self._goal_pos - ball, dim=-1)
+        d.add_sum("cow_goal_gain_pos", (succ & (gain > 0)).float())
+        d.add_sum("cow_goal_gain", succ.float() * gain)
+        d.add_sum("cow_opp_dist", cf * torch.linalg.norm(self._cow_opp - ball, dim=-1))
+
+        # respawn finished scenarios in place (episode continues)
+        ids = (succ | fail).nonzero(as_tuple=False).flatten()
+        if (len(ids) > 0):
+            self._reset_ball(ids, near=True)
+            self._cow_spawn(ids)
+            if (self._virtual_perception):
+                self._reset_perception(ids)
+            self._record_reset_prev_states(ids)
+
+        # opponent estimate for the actor: noise + dropout (hold last estimate, vis=0)
+        n = len(cow)
+        keep = torch.rand([n], device=self._device) >= self._cow_vis_dropout_p
+        new_est = self._cow_opp + self._cow_obs_noise_pos * torch.randn_like(self._cow_opp)
+        new_vel = self._cow_opp_vel + self._cow_obs_noise_vel * torch.randn_like(self._cow_opp_vel)
+        self._cow_est[:] = torch.where(keep.unsqueeze(-1), new_est, self._cow_est)
+        self._cow_est_vel[:] = torch.where(keep.unsqueeze(-1), new_vel, self._cow_est_vel)
+        self._cow_vis[:] = keep.float()
         return
 
     def _cache_nav_reward(self):

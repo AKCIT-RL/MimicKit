@@ -13,9 +13,12 @@ import torch
 def compute_dribble_cmd_obs(cmd):
     # type: (Tensor) -> Tensor
     """Ball-velocity command [N, 2] (heading frame) in the steering-slot layout
-    [dir_x, dir_y, |v|, 1, 0]; zero direction when the command is zero."""
+    [dir_x, dir_y, |v|, 1, 0]; heading direction (1, 0) when the command is zero:
+    the all-zero block drops the policy (doc 34, A8), a tiny command does not."""
     speed = torch.linalg.norm(cmd, dim=-1, keepdim=True)
-    direction = cmd / torch.clamp(speed, min=1.0e-6)
+    heading = torch.zeros_like(cmd)
+    heading[:, 0] = 1.0
+    direction = torch.where(speed > 1.0e-4, cmd / torch.clamp(speed, min=1.0e-6), heading)
     ones = torch.ones_like(speed)
     return torch.cat([direction, speed, ones, torch.zeros_like(speed)], dim=-1)
 

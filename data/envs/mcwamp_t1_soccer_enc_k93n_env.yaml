@@ -1,4 +1,5 @@
-# k93n = k93m (style events cut, seeded from k93h 200) with the conservative agent of k93j (desired_kl 0.003); +100M (doc 25 M13).
+# k93n (docs/t1/39, fase A0): k93r env + RT-01 perception emulator from step 0 (FOV 360, scale mix [0,1,1,1.5]) for a PPO fine-tune of the kick teacher k93r700 under noise.
+# k93r = k93q + impulse reward 10 (aim_gate * min(gain, 8)^2 at a kick event: a 6 m/s one-step strike pays 360, three 2 m/s pushes 120), seeded from k93m 700; +100M (doc 25 M13).
 # k93d = k93c (reward_ball_oob_w -15) seeded from k93a 600 instead of k92a 750: the aim gate is already learned there (k93a 400 goal 45 / 70%); +100M (doc 25 M13).
 # k93c = k93a with the ball out-of-bounds penalty (reward_ball_oob_w -15, mirrors reward_goal_scored_w 15): k93a 400 has the side-foot kick (toe 0 / 9%) but oob 55% in front; fine-tune of k92a 750 +100M (doc 25 M13).
 # k93a = k92a with the positive kick-style terms (pitch target, toe out, contact side) gated by the launch aim (kick_style_aim_mix 1.0): k92a 750 has the side-foot kick (toe 9%) but oob 98% in front; fine-tune of k92a 750 +100M (doc 25 M13).
@@ -81,8 +82,8 @@ ball_spawn_near: true
 ball_spawn_front_min: 0.5
 ball_spawn_front_max: 2.0
 ball_spawn_lateral: 0.25
-percep_curriculum_start_samples: 1000000000000
-percep_curriculum_end_samples: 1000000000001
+percep_curriculum_start_samples: 0.0
+percep_curriculum_end_samples: 1.0
 ball_curriculum_start_samples: 10000001
 ball_curriculum_end_samples: 15000000
 ball_curriculum_far_prob: 0.0
@@ -103,7 +104,7 @@ measurable_obs: true
 measurable_hist_steps: 30
 virtual_perception: true
 percep_fov_body: aahead_pitch_link
-percep_fov_deg: 90.0
+percep_fov_deg: 360.0
 reward_head_gaze_w: 0.0
 reward_goal_scored_w: 15.0
 reward_ball_approach_w: 50.0
@@ -163,11 +164,11 @@ reward_foot_ball_w: 50.0
 reward_kick_contact_w: 100.0
 kick_contact_dist: 0.2
 kick_contact_min_gain: 0.3
-kick_contact_gain_cap: 2.0
+kick_contact_gain_cap: 8.0
 kick_contact_min_height: 0.58
 kick_contact_hold_steps: 30
 reward_kick_overspeed_w: -50.0
-kick_overspeed_limit: 3.5
+kick_overspeed_limit: 6.0
 kick_overspeed_goal_exempt: 2.5
 ball_perturb_enable: true
 stand_start_prob: 0.0
@@ -248,9 +249,15 @@ reward_kick_toe_face_w: -1000.0
 reward_kick_toe_out_w: 300.0
 kick_toe_out_target_deg: 20.0
 kick_toe_out_sigma_deg: 12.0
-reward_kick_pitch_target_w: 60.0
+reward_kick_pitch_target_w: 200.0
 kick_pitch_target_deg: -15.0
 kick_pitch_target_sigma_deg: 20.0
 kick_style_aim_mix: 1.0
 reward_ball_oob_w: -50.0
 reward_kick_direction_w: 100.0
+reward_kick_impulse_w: 10.0
+kick_impulse_cap: 8.0
+percep_rt01: true
+percep_rt01_scale: 1.0
+percep_rt01_scale_mix: [0.0, 1.0, 1.0, 1.5]
+percep_ab_expand: false

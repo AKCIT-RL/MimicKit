@@ -1,0 +1,12 @@
+# c2d22: c2d12 (prog_w 30) + style critic weight 0 (doc 40), warm-start c2d07 it.250.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_c2d22_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_cw000_kl003_std005_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_c2d22/

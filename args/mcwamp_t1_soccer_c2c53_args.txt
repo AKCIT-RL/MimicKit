@@ -1,0 +1,12 @@
+# c2c53: c2c50 + agent kl0.001 lr_max 3e-5 (doc 40 v2-58); warm-start c2c50 it.400. B3 fine-tune small step.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_c2c50_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_cw025_kl001_std005_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_c2c53/

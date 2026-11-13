@@ -1,0 +1,12 @@
+# c2b13: cow v2 stage B1 (doc 40 v2-21, p_sigma 0.5), seed dbl9k it.200.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_c2b13_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_c2b13/

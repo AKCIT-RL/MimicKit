@@ -1,0 +1,12 @@
+# kfs: warm-start from kf_seed1 it100, desired_kl 0.002, checkpoints every 10 it (doc 35, goal C3).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_kf_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kfs_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 20000000
+--out_dir output/t1_soccer_kfs/

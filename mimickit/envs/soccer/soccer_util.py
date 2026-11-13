@@ -669,7 +669,8 @@ class GateClock:
     def __init__(self, gates, start=0.0):
         self.gates = gates
         self.clock = float(start)
-        self.idx = 0
+        # a resumed clock already passed the gates behind it (else advance() would pull it back)
+        self.idx = sum(1 for g in gates if g["at"] < self.clock)
         self.hold = 0
         self.stalled_iters = 0
 

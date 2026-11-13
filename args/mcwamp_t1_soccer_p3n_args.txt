@@ -1,0 +1,12 @@
+# p3n (normalizers frozen): PPO fine-tune of the RT-01 DAgger student dgr0 it600 (docs/t1/39), seeded with seed_finetune_dirs.sh (total 1229000000).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_p3j_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_p3n_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1329000000
+--out_dir output/t1_soccer_p3n/

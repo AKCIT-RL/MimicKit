@@ -1,0 +1,12 @@
+# dbl11: RL fine-tune from the distilled student dst3 (doc 34 B1).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_dbl11_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 60000000
+--out_dir output/t1_soccer_dbl11/

@@ -46,6 +46,10 @@ class PPOAgent(base_agent.BaseAgent):
         self._lr_min = float(config.get("lr_min", 1e-5))
         self._lr_max = float(config.get("lr_max", 1e-2))
         self._lr_adapt_factor = float(config.get("lr_adapt_factor", 1.5))
+        # warm-start with a fresh critic/discriminator: hold the actor for the first
+        # N updates of this process so the advantages are not noise (doc 35, D1 option c)
+        self._actor_freeze_iters = int(config.get("actor_freeze_iters", 0))
+        self._actor_updates_seen = 0
         self._adapt_critic_lr = bool(config.get("adapt_critic_lr", True))
 
         # Mirror symmetry loss (arXiv:2511.03996 Table 1). Weight 0 keeps every
@@ -54,7 +58,48 @@ class PPOAgent(base_agent.BaseAgent):
         self._mirror_sym_weight = float(config.get("mirror_sym_weight", 0.0))
         self._log_sym_residual = bool(config.get("log_sym_residual", False))
         self._mirror_ops = None
+
+        # Anchor to a frozen policy (squared distance between action means). Without
+        # anchor_model_file nothing changes; with the file and weight 0 the distance is
+        # only logged, which is how a baseline number is obtained.
+        self._anchor_weight = float(config.get("anchor_weight", 0.0))
+        self._anchor_model_file = config.get("anchor_model_file", None)
+        self._anchor_model = None
+
+        # The FIXED logstd is a saved parameter, so action_std in the config is ignored when a
+        # checkpoint is loaded. action_std_override (optional) rewrites it after every load.
+        self._action_std_override = config.get("action_std_override", None)
         return
+
+    def load(self, in_file):
+        super().load(in_file)
+        if (self._action_std_override is not None):
+            logstd = float(np.log(self._action_std_override))
+            n = 0
+            with torch.no_grad():
+                for name, p in self._model.named_parameters():
+                    if (name.endswith("_logstd_net") and not p.requires_grad):
+                        p.fill_(logstd)
+                        n += 1
+            assert(n > 0), "action_std_override: no FIXED logstd parameter found"
+            Logger.print("action_std_override: set {:d} logstd tensor(s) to std {:.4f}".format(n, self._action_std_override))
+        return
+
+    def _get_anchor_model(self):
+        """Frozen copy of the model loaded from anchor_model_file, built on first use and kept
+        in a list so it stays out of the module tree (not saved, not trained)."""
+        if (self._anchor_model is None):
+            import copy
+            m = copy.deepcopy(self._model)
+            state_dict = torch.load(self._anchor_model_file, map_location=self._device)
+            p = "_model."
+            m.load_state_dict({k[len(p):]: v for k, v in state_dict.items() if k.startswith(p)})
+            for q in m.parameters():
+                q.requires_grad_(False)
+            m.eval()
+            self._anchor_model = [m]
+            Logger.print("Loaded anchor model from {:s}".format(self._anchor_model_file))
+        return self._anchor_model[0]
 
     def _get_mirror_ops(self):
         """(obs_perm, obs_signs, act_perm, act_signs), built once from the env.
@@ -279,6 +324,7 @@ class PPOAgent(base_agent.BaseAgent):
         actor_batch_size = int(np.ceil(self._actor_batch_size * num_envs))
         num_actor_batches = int(np.ceil(float(num_samples) / actor_batch_size))
         num_actor_steps = num_actor_batches * self._actor_epochs
+        self._actor_updates_seen += 1
         actor_info = self._update_actor(actor_batch_size, num_actor_steps)
         
         train_info = {**critic_info, **actor_info}
@@ -313,6 +359,11 @@ class PPOAgent(base_agent.BaseAgent):
                 loss_info = self._compute_actor_loss(batch)
                 loss = loss_info["actor_loss"]
 
+            if (self._actor_updates_seen <= self._actor_freeze_iters):
+                # frozen: same losses/keys in the log, no step and no lr change
+                loss_info["actor_lr"] = torch.tensor(self._actor_optimizer.get_lr(), device=self._device)
+                torch_util.add_torch_dict(loss_info, info)
+                continue
             self._actor_optimizer.step(loss)
 
             # ASEAgent reimplements _compute_actor_loss instead of extending it,
@@ -431,6 +482,17 @@ class PPOAgent(base_agent.BaseAgent):
 
             if (self._mirror_sym_weight != 0):
                 actor_loss += self._mirror_sym_weight * sym_residual
+
+        if (self._anchor_model_file is not None):
+            # same normalized obs as the loss: the anchor shares the current normalizers
+            # (both start from the same checkpoint in a fine-tune)
+            with torch.no_grad():
+                anchor_mean = self._get_anchor_model().eval_actor(norm_obs).mode
+            anchor_loss = torch.mean(torch.sum(torch.square(a_dist.mode - anchor_mean), dim=-1))
+            info["anchor_loss"] = anchor_loss.detach()
+
+            if (self._anchor_weight != 0):
+                actor_loss += self._anchor_weight * anchor_loss
 
         return info
 

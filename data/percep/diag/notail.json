@@ -1,0 +1,100 @@
+{
+ "_doc": "diag E1 (2026-11-07): base v1 com pose {\"tail_prob\": 0.0}",
+ "version": 1,
+ "dt": 0.03333333333,
+ "pose": {
+  "pos_bias_std": 0.15,
+  "pos_ou_sigma": 0.3,
+  "pos_ou_tau": 1.25,
+  "yaw_bias_std_deg": 1.0,
+  "yaw_ou_sigma_deg": 2.0,
+  "yaw_ou_tau": 1.25,
+  "tail_prob": 0.0,
+  "tail_gap_s": 14.0,
+  "tail_jump_m": [
+   1.0,
+   3.0
+  ],
+  "tail_dur_s": [
+   1.0,
+   3.0
+  ],
+  "_tail_note": "renewal process calibrated to p90 1.5 m (report sec 3.1); the report suggests 10% of episodes, which cannot give p90 1.5 m over ticks"
+ },
+ "ball": {
+  "period_ticks": 3,
+  "period_jitter_prob": 0.1,
+  "delay_s": [
+   0.0,
+   0.1
+  ],
+  "mask_age_s": 0.3,
+  "dist_bins_center": [
+   0.5,
+   1.5,
+   2.5,
+   3.5,
+   4.5,
+   5.5,
+   6.5,
+   7.5,
+   8.5
+  ],
+  "detect_prob": [
+   0.86,
+   0.99,
+   0.97,
+   0.96,
+   0.96,
+   0.82,
+   0.58,
+   0.32,
+   0.22
+  ],
+  "detect_prob_far": 0.1,
+  "dir_sigma_deg": [
+   9.5,
+   5.4,
+   4.6,
+   4.9,
+   4.0,
+   3.9,
+   3.3,
+   3.5,
+   1.8
+  ],
+  "dir_bias_deg": 0.2,
+  "dist_sigma_slope": 0.115,
+  "dist_sigma_off": 0.022,
+  "dist_sigma_min": 0.05,
+  "dist_bias_slope": 0.023,
+  "dist_bias_off": 0.018,
+  "dist_bias_near": -0.07,
+  "hole_stay_prob": 0.6,
+  "outlier_speed_edges": [
+   0.4,
+   0.8,
+   1.2
+  ],
+  "outlier_prob": [
+   0.019,
+   0.054,
+   0.137,
+   0.086
+  ],
+  "outlier_mag_m": [
+   0.8,
+   2.2
+  ],
+  "false_prob": 0.015,
+  "false_range_m": 6.0
+ },
+ "targets": {
+  "_doc": "values the unit test and the A4 gate calibrate against",
+  "pos_err_median_m": 0.43,
+  "pos_err_p90_m": 1.5,
+  "yaw_err_sigma_deg": 2.4,
+  "hole_median": 1,
+  "hole_p90": 6
+ }
+}

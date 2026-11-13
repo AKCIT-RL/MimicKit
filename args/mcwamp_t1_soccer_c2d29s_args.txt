@@ -1,0 +1,12 @@
+# c2d29s: head action-rate weight -0.45 -> -9 (user: head moves too much) (base c2d21: env c2d12 + desired_kl 0.01), warm-start c2d07 it.250.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_c2d29s_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_cw025_kl010_std005_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_c2d29s/

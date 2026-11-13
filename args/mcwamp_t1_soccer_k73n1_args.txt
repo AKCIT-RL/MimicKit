@@ -1,0 +1,12 @@
+# k73n1: Fase A (docs/t1/39) = k73b from scratch + RT-01 noise ramp 10000000.0->40000000.0 on the gated clock, 480M.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_flat_field.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_k73n1_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 480000000
+--out_dir output/t1_soccer_k73n1/

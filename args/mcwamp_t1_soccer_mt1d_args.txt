@@ -1,0 +1,12 @@
+# mt1d: mt1c with the normalizers frozen (normalizer_samples 0), doc 35 ledger 63.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_mt1_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_mt1d_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 30000000
+--out_dir output/t1_soccer_mt1d/

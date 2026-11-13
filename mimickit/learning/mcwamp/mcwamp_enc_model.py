@@ -27,6 +27,7 @@ class MCWAMPEncModel(mcwamp_model.MCWAMPModel):
         self._hist_steps = int(env.get_measurable_hist_steps())
         self._latent_dim = int(config.get("enc_latent_dim", 64))
         self._recon_dim = int(env.get_recon_tar_size())
+        self._mode_heads = bool(config.get("mode_heads", False))
         super().__init__(config, env)
         return
 
@@ -52,7 +53,39 @@ class MCWAMPEncModel(mcwamp_model.MCWAMPModel):
         self._actor_layers, _ = net_builder.build_net(net_name, {"obs": actor_spec},
                                                       activation=self._activation)
         self._action_dist = self._build_action_distribution(config, env, self._actor_layers)
+
+        if self._mode_heads:
+            # doc 35 (87): one actor per mode, routed by the task block; the kick head is
+            # _actor_layers/_action_dist (export prefixes unchanged), nav and drib are extra copies
+            # sharing the encoder and the logstd
+            a_size = self._action_dist._mean_net.out_features
+            h_size = self._action_dist._mean_net.in_features
+            self._head_layers = torch.nn.ModuleList([
+                net_builder.build_net(net_name, {"obs": actor_spec}, activation=self._activation)[0]
+                for _ in range(2)])
+            self._head_means = torch.nn.ModuleList([torch.nn.Linear(h_size, a_size) for _ in range(2)])
+            # raw = normalized * std + mean over [steer(5), ball_mask(1)]; set from the agent's obs
+            # normalizer (fixed in distillation) and saved with the model
+            self.register_buffer("_mode_obs_mean", torch.zeros(6))
+            self.register_buffer("_mode_obs_std", torch.ones(6))
         return
+
+    def _mode_obs_idx(self):
+        f = self._frame_dim
+        return list(range(f - 12, f - 7)) + [f - 1]
+
+    def set_mode_obs_norm(self, mean, std):
+        idx = self._mode_obs_idx()
+        self._mode_obs_mean[:] = mean[idx]
+        self._mode_obs_std[:] = std[idx]
+        return
+
+    def eval_mode(self, frame):
+        """0 kick (steer block all zero), 1 nav (ball mask off), 2 drib."""
+        raw = frame[..., self._mode_obs_idx()] * self._mode_obs_std + self._mode_obs_mean
+        kick = raw[..., :5].abs().sum(-1) < 1e-3
+        nav = raw[..., 5] < 0.5
+        return torch.where(kick, 0, torch.where(nav, 1, 2))
 
     def _split_obs(self, obs):
         frame = obs[..., :self._frame_dim]
@@ -66,8 +99,14 @@ class MCWAMPEncModel(mcwamp_model.MCWAMPModel):
     def eval_actor(self, obs):
         frame, _ = self._split_obs(obs)
         z = self.eval_latent(obs)
-        h = self._actor_layers(torch.cat([frame, z], dim=-1))
-        return self._action_dist(h)
+        x = torch.cat([frame, z], dim=-1)
+        dist = self._action_dist(self._actor_layers(x))
+        if not self._mode_heads:
+            return dist
+        means = torch.stack([dist.mean] + [m(l(x)) for l, m in zip(self._head_layers, self._head_means)], dim=0)
+        mode = self.eval_mode(frame)
+        mean = torch.gather(means, 0, mode[None, ..., None].expand(1, *dist.mean.shape))[0]
+        return dist.__class__(mean=mean, logstd=dist.logstd)
 
     def eval_recon(self, obs):
         z = self.eval_latent(obs)
@@ -77,6 +116,8 @@ class MCWAMPEncModel(mcwamp_model.MCWAMPModel):
         params = super().get_actor_params() \
             + list(self._enc_layers.parameters()) + list(self._enc_out.parameters()) \
             + list(self._dec_layers.parameters()) + list(self._dec_out.parameters())
+        if self._mode_heads:
+            params += list(self._head_layers.parameters()) + list(self._head_means.parameters())
         return params
 
     def _build_critic_input_dict(self, env):

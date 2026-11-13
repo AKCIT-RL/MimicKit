@@ -1,0 +1,12 @@
+# dbl12g: dribble leaf finetune from dbl9k it.200 (doc 34).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_dbl12g_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 60000000
+--out_dir output/t1_soccer_dbl12g/

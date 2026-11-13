@@ -1,0 +1,12 @@
+# p3h: n2k it200 fine-tune with the RT-01 emulator (docs/t1/37). Seeded from n2k_seed1raw/model_0200.pt via seed_finetune_dirs-style copy.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_p3h_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_n2k_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1329000000
+--out_dir output/t1_soccer_p3h/

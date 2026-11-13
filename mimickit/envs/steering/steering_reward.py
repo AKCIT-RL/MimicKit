@@ -397,6 +397,26 @@ def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed
 
 
 @torch.jit.script
+def compute_still_penalty(root_vel_xy, feet_vel_xy, tar_speed, still_speed, foot_w):
+    # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
+    """On stop commands only: ||v_root_xy|| + foot_w * mean over feet ||v_foot_xy||.
+
+    root_vel_xy [N, 2], feet_vel_xy [N, F, 2], tar_speed [N] -> [N]; zero where
+    tar_speed >= still_speed. The two ways of not standing still that the
+    still test measures (2026-10-27): the base creeping (pdx +0.078 m/s) and
+    the feet stepping in place (0.288 m/s) while the base barely moves.
+
+    L1 norms on purpose. The velocity-tracking term that covers stop commands
+    today, exp(-k |v|^2), is flat at zero: a 0.078 m/s creep costs 0.04 of the
+    0.7 it weighs. A norm keeps a constant slope down to rest.
+    """
+    base = torch.sqrt(torch.sum(torch.square(root_vel_xy), dim=-1))
+    feet = torch.mean(torch.sqrt(torch.sum(torch.square(feet_vel_xy), dim=-1)), dim=-1)
+    pen = base + foot_w * feet
+    return torch.where(tar_speed < still_speed, pen, torch.zeros_like(pen))
+
+
+@torch.jit.script
 def compute_hip_roll_adduction_penalty(hip_roll, thresh):
     # type: (Tensor, float) -> Tensor
     """sum over legs of max(0, adduction - thresh)^2, hip_roll [N, 2] (left,

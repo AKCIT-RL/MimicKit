@@ -105,6 +105,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # With action noise the raw yaw rate is mostly jitter (train err ~1.3
         # vs ~0.3 deterministic), which flattens the yaw reward (k94a-c)
         self._nav_vel_filter_s = float(env_config.get("nav_vel_filter_s", 0.0))
+        # stop-command penalty (Olives, steering env 7e525b5; doc 43): on a zero nav command,
+        # ||v_base_xy|| + still_foot_w * mean ||v_foot_xy|| (raw, unfiltered), after still_settle_s
+        # seconds since the command was drawn. L1 on purpose: exp(-e^2/sigma) is flat near 0. 0 = off.
+        self._reward_still_w = float(env_config.get("reward_still_w", 0.0))
+        self._still_foot_w = float(env_config.get("still_foot_w", 0.5))
+        self._still_settle_s = float(env_config.get("still_settle_s", 0.0))
         # evaluation hooks: None = sample; True/False = force nav/kick on
         # every (re)draw; _nav_fixed_cmd [3] replaces the sampled command
         self._nav_force = None
@@ -193,6 +199,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_ball_dist = [float(v) for v in g("cow2_ball_dist", [0.3, 1.5])]
         self._cow2_ball_ang_deg = float(g("cow2_ball_ang_deg", 180.0))
         self._cow2_ball_speed = [float(v) for v in g("cow2_ball_speed", [0.0, 0.0])]
+        # Stage 3 incoming ball (doc 40 stage F): fraction of episodes where the ball starts far and rolls toward the robot (0 = off).
+        self._cow2_d_in_prob = float(g("cow2_d_in_prob", 0.0))
+        self._cow2_d_in_dist = [float(v) for v in g("cow2_d_in_dist", [2.0, 4.0])]
+        self._cow2_d_in_ang_deg = float(g("cow2_d_in_ang_deg", 60.0))
+        self._cow2_d_in_speed = [float(v) for v in g("cow2_d_in_speed", [0.5, 1.5])]
+        self._cow2_d_in_jit_deg = float(g("cow2_d_in_jit_deg", 15.0))
         self._cow2_ctrl_cmd = [float(v) for v in g("cow2_ctrl_cmd", [0.0, 0.0])]  # heading-frame dribble command shown in stage A
         self._cow2_cap_dist = float(g("cow2_cap_dist", 0.7))
         # stage C carry cap: a TOUCH phase longer than touch_max_s with the ball still at the foot is a carry;
@@ -242,10 +254,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_rest_speed = float(g("cow2_rest_speed", 0.1))
         self._cow2_rest_hold = float(g("cow2_rest_hold", 0.3))
         self._cow2_roll_s = float(g("cow2_roll_s", 8.0))
+        # doc 43 S2b power: arrival speed v_T at T drawn in U[cow2_pow_v] m/s with prob cow2_pow_prob; under constant
+        # decel a, passing T at v_T == resting at T + u * v_T^2 / (2a) (same launch command), so P becomes that point
+        # and T is kept for the pass metric (closest approach to T, speed there). Off by default.
+        _pv = g("cow2_pow_v", [0.0, 0.0])
+        self._cow2_pow_v = [float(_pv[0]), float(_pv[1])] if isinstance(_pv, (list, tuple)) else [0.0, float(_pv)]
+        self._cow2_pow_prob = float(g("cow2_pow_prob", 0.0))
+        self._cow2_pow_tol_v = float(g("cow2_pow_tol_v", 0.5))
+        self._cow2_pow_tol_d = float(g("cow2_pow_tol_d", 0.6))
         self._reward_cow2_touch_w = float(g("reward_cow2_touch_w", 0.0))
         # stage C release shaping (doc 40 v2-57): at the 1st touch end, ball velocity vs the one that stops at P
         # (v_req = sqrt(2 a d) toward P); exp(-|v - v_req|^2 / rel_sigma^2). Diag always, reward only if w > 0
         self._reward_cow2_rel_w = float(g("reward_cow2_rel_w", 0.0))
+        self._reward_cow2_pass_w = float(g("reward_cow2_pass_w", 0.0))  # doc 43 S2b: ball passes T at v_T (event)
         self._reward_cow2_sep_w = float(g("reward_cow2_sep_w", 0.0))  # c2c47: pay foot-ball separation (m/s) during TOUCH
         self._cow2_rel_sigma = float(g("cow2_rel_sigma", 0.5))
         self._reward_cow2_hit_w = float(g("reward_cow2_hit_w", 0.0))
@@ -270,6 +291,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_d_free_run = bool(g("cow2_d_free_run", False))  # stage D toque-longo: success drops the robot-ball distance (fd<=cap) and the bonus is paid on the ROBOT arrival time; use with cow2_d_recover_s as the window X
         self._cow2_d_recover_s = float(g("cow2_d_recover_s", 0.0))  # stage D option C: ball reaches the region first, robot must recover within this many s (0 = off = original rule); bonus paid on the ball-arrival time
         self._cow2_d_cmd_gain = float(g("cow2_d_cmd_gain", 1.0))  # stage D: teacher ball-speed command x gain (1 = calibrated launch speed)
+        self._cow2_d_min_ball_opp = float(g("cow2_d_min_ball_opp", 0.0))  # doc 43: >0 pushes the opponent so it spawns at least this far from the ball (0 = off; ~8% of d_in spawns land inside the 0.4 m contact radius)
         self._cow2_d_opp_speed = float(g("cow2_d_opp_speed", 0.0))  # D3: >0 the opponent walks toward the ball (m/s); 0 = still
         self._reward_cow2_d_succ_w = float(g("reward_cow2_d_succ_w", 0.0))
         self._cow2_d_touch_k = float(g("cow2_d_touch_k", 0.0))  # bonus fraction lost per touch beyond the first
@@ -638,6 +660,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_direction_min_vel = float(env_config.get("kick_direction_min_vel", 1.0))
         self._kick_direction_decay = float(env_config.get("kick_direction_decay", 0.2))
         self._kick_direction_max = float(env_config.get("kick_direction_max", 30.0))
+        # kick target T (docs/t1/43): 0 = always the goal (unchanged behaviour)
+        self._kick_tgt_prob = float(env_config.get("kick_tgt_prob", 0.0))
+        self._kick_tgt_dist = [float(v) for v in env_config.get("kick_tgt_dist", [3.0, 10.0])]
+        self._kick_tgt_ang_deg = float(env_config.get("kick_tgt_ang_deg", 60.0))
+        self._kick_tgt_ang_deg_start = float(env_config.get("kick_tgt_ang_deg_start", 0.0))
+        self._kick_tgt_ang_start_samples = int(env_config.get("kick_tgt_ang_start_samples", -1))
+        self._kick_tgt_ang_end_samples = int(env_config.get("kick_tgt_ang_end_samples", -1))
 
         # ball-state reward gating (T1 ball_rolling_scale): while the ball
         # rolls, the robot->ball approach potential is zeroed so chasing the
@@ -1171,6 +1200,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._goal_pos += self._field_offset
         self._goal_dir = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._goal_dir[:, 0] = -1.0
+        # kick target T (docs/t1/43): what the kick obs/rewards aim at. Equal to the goal centre unless
+        # kick_tgt_prob > 0 draws a point on the field per episode (goal scoring keeps using _goal_pos).
+        self._kick_tgt = self._goal_pos.clone()
+        self._kick_tgt_on = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
 
         self._prev_root_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._prev_ball_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
@@ -1206,6 +1239,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._nav_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._nav_cmd = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._nav_cmd_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._nav_cmd_set_t = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._k2n_decided = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._k2n_left = torch.full([num_envs], float("inf"), device=self._device)
         self._k2n_abandon_left = torch.full([num_envs], float("inf"), device=self._device)
@@ -1234,6 +1268,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_since = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._cow2_htime = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._cow2_P = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow2_T = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)  # S2b: target T (P = T when v_T = 0)
+        self._cow2_vT = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_tmin = torch.full([num_envs], 1.0e6, device=self._device, dtype=torch.float)
+        self._cow2_tspd = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._cow2_tdone = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._cow2_ball0 = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)  # ball when P was drawn
         self._cow2_pside = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._cow2_pang = torch.zeros([num_envs], device=self._device, dtype=torch.float)  # P angle (rad) in the draw frame, eval B3 sectors
@@ -1507,7 +1546,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball_vel = self._engine.get_root_vel(self._get_ball_id())
 
         # blue: ball -> goal (the direction the kick-direction reward pays)
-        to_goal = self._goal_pos - ball_pos[:, 0:2]
+        to_goal = self._kick_tgt - ball_pos[:, 0:2]
         to_goal = to_goal / torch.clamp_min(torch.linalg.norm(to_goal, dim=-1, keepdim=True), 1e-6)
         # red: steering command the env feeds into the policy's obs
         steer_cmd = soccer_util.compute_ball_steer_command(
@@ -1641,7 +1680,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         root_pos = self._engine.get_root_pos(char_id)
         root_rot = self._engine.get_root_rot(char_id)
         ball_pos = self._get_ball_pos()
-        goal_pos = self._goal_pos
+        goal_pos = self._kick_tgt
         goal_dir = self._goal_dir
         if (self._cow2_stage == 3 and self._cow_active()):
             # stage D: the opponent replaces the goal centre in the task obs (same dims)
@@ -2273,7 +2312,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # no credit for chasing a ball the robot just kicked
             approach_r = approach_r * (~rolling).float()
         progress_r = soccer_util.compute_goal_progress_reward(ball_pos, self._prev_ball_pos,
-                                                              self._goal_pos)
+                                                              self._kick_tgt)
         chase_r = torch.zeros_like(approach_r)
         if (self._reward_ball_chase_w != 0.0):
             chase_r = soccer_util.compute_ball_chase_reward(
@@ -2301,13 +2340,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             approach_r = approach_r * (~hidden).float()
             progress_r = progress_r * (~hidden).float()
         dir_r = soccer_util.compute_kick_direction_reward(
-            ball_pos, ball_vel, self._goal_pos, self._kick_direction_min_vel,
+            ball_pos, ball_vel, self._kick_tgt, self._kick_direction_min_vel,
             self._kick_direction_decay, self._ball_moving_time, self._kick_direction_max)
-        goal_r = self._goal_scored_buf.float()
+        goal_r = (self._goal_scored_buf & ~self._kick_tgt_on).float()
         position_r = torch.zeros_like(goal_r)
         if (self._reward_kick_position_w != 0.0):
             position_r = soccer_util.compute_kick_position_reward(
-                root_pos, ball_pos, self._goal_pos, self._kick_position_near_dist)
+                root_pos, ball_pos, self._kick_tgt, self._kick_position_near_dist)
 
         # k1 shaping + live kick diagnostics (the foot distance is always computed)
         foot_d = self._min_foot_ball_dist(ball_pos)
@@ -2327,7 +2366,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         impulse_cap = self._kick_impulse_cap
         over_limit = self._kick_overspeed_limit
         if (self._kick_gain_cap_per_m > 0.0):
-            d_ball_goal = torch.linalg.norm(self._goal_pos - ball_pos[:, 0:2], dim=-1)
+            d_ball_goal = torch.linalg.norm(self._kick_tgt - ball_pos[:, 0:2], dim=-1)
             extra = torch.clamp(self._kick_gain_cap_per_m * d_ball_goal - contact_cap, min=0.0,
                                 max=max(self._kick_gain_cap_max - contact_cap, 0.0))
             contact_cap = contact_cap + extra
@@ -2397,7 +2436,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             over = ball_speed if self._kick_overspeed_use_speed else gain
             overspeed_r = near.float() * torch.clamp(torch.clamp_min(over - over_limit, 0.0), max=10.0)
             if (self._kick_overspeed_goal_exempt > 0.0):
-                d_goal = torch.linalg.norm(self._goal_pos - ball_pos[:, 0:2], dim=-1)
+                d_goal = torch.linalg.norm(self._kick_tgt - ball_pos[:, 0:2], dim=-1)
                 overspeed_r = overspeed_r * (d_goal >= self._kick_overspeed_goal_exempt).float()
         swing_r = torch.zeros_like(kick_contact_r)
         if (self._reward_kick_side_swing_w != 0.0):
@@ -2452,6 +2491,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("reward_kick_direction", shaping_mask * self._reward_kick_direction_w * dir_r)
         d.add_mean("reward_kick_position", shaping_mask * self._reward_kick_position_w * position_r)
         d.add_mean("reward_goal_scored", self._reward_goal_scored_w * goal_r)
+        d.add_mean("kick_tgt_frac", self._kick_tgt_on.float())
+        d.add_mean("kick_tgt_dist", torch.linalg.norm(self._kick_tgt - ball_pos[:, 0:2], dim=-1))
         d.add_mean("reward_foot_ball", shaping_mask * self._reward_foot_ball_w * foot_ball_r)
         d.add_mean("reward_kick_contact", shaping_mask * self._reward_kick_contact_w * kick_contact_r)
         d.add_mean("reward_kick_overspeed", shaping_mask * self._reward_kick_overspeed_w * overspeed_r)
@@ -2603,7 +2644,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _kick_aim_gate(self, ball_pos, ball_vel, ball_speed):
         """exp(-(excess / sigma)^2) of the ball launch direction outside the goal's angular half-width, in [0, 1]."""
-        to_goal = self._goal_pos - ball_pos[:, 0:2]
+        to_goal = self._kick_tgt - ball_pos[:, 0:2]
         d_goal = torch.clamp(torch.linalg.norm(to_goal, dim=-1), min=1e-6)
         cos = torch.sum(ball_vel[:, 0:2] * to_goal, dim=-1) / (torch.clamp(ball_speed, min=1e-6) * d_goal)
         err = torch.rad2deg(torch.acos(cos.clamp(-1.0, 1.0)))
@@ -2638,7 +2679,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
     def _update_kick_diag(self, ball_pos, ball_vel, ball_speed, foot_d):
         """Per-episode peak ball speed, the ball direction at that peak (angle to the
         goal, deg) and the closest foot approach; summed at episode end."""
-        to_goal = self._goal_pos[:, 0:2] - ball_pos[:, 0:2]
+        to_goal = self._kick_tgt[:, 0:2] - ball_pos[:, 0:2]
         cosang = torch.sum(ball_vel[:, 0:2] * to_goal, dim=-1) / (
             torch.clamp(ball_speed, min=1e-6) * torch.clamp(torch.linalg.norm(to_goal, dim=-1), min=1e-6))
         ang = torch.rad2deg(torch.acos(torch.clamp(cosang, -1.0, 1.0)))
@@ -2693,7 +2734,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (self._reward_kick_alignment_w != 0.0):
                 kick_align_r += self._reward_kick_alignment_w * \
                     soccer_util.compute_kick_alignment_reward(foot_vel, ball_pos,
-                                                              self._goal_pos, contact,
+                                                              self._kick_tgt, contact,
                                                               self._kick_alignment_power) * kick_m
         aux_r += kick_side_r + kick_fwd_r + kick_align_r
         foot_ball_d = torch.stack([torch.linalg.norm(body_pos[:, f, :] - ball_pos, dim=-1)
@@ -3528,6 +3569,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             still = torch.rand([n], device=self._device) < self._nav_still_prob
             cmd[still] = 0.0
         self._nav_cmd[env_ids] = cmd
+        self._nav_cmd_set_t[env_ids] = self._time_buf[env_ids]
         lo_t, hi_t = self._nav_resample_s
         self._nav_cmd_time[env_ids] = self._time_buf[env_ids] + lo_t \
             + (hi_t - lo_t) * torch.rand([n], device=self._device)
@@ -3876,6 +3918,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball3[:, 0:2] = pos
         vel3 = torch.zeros([n, 3], device=self._device, dtype=torch.float)
         vel3[:, 0:2] = cow2_util.sample_ball_vel(n, self._cow2_ball_speed[0], self._cow2_ball_speed[1], self._device)
+        if (self._cow2_stage == 3 and self._cow2_d_in_prob > 0.0):
+            inc = torch.rand(n, device=self._device) < self._cow2_d_in_prob
+            rel_in = cow2_util.sample_ring(n, self._cow2_d_in_dist[0], self._cow2_d_in_dist[1],
+                                           float(np.deg2rad(self._cow2_d_in_ang_deg)), self._device)
+            pos_in = root + cow2_util.heading_to_world(rel_in, heading)
+            pos_in = torch.stack([torch.clamp(pos_in[:, 0], off[:, 0] - half_x, off[:, 0] + half_x),
+                                  torch.clamp(pos_in[:, 1], off[:, 1] - half_y, off[:, 1] + half_y)], dim=-1)
+            v_in = cow2_util.heading_to_world(cow2_util.sample_ball_vel_toward(
+                rel_in, self._cow2_d_in_speed[0], self._cow2_d_in_speed[1],
+                float(np.deg2rad(self._cow2_d_in_jit_deg)), self._device), heading)
+            ball3[:, 0:2] = torch.where(inc.unsqueeze(-1), pos_in, ball3[:, 0:2])
+            vel3[:, 0:2] = torch.where(inc.unsqueeze(-1), v_in, vel3[:, 0:2])
         self._engine.set_root_pos(env_ids, ball_id, ball3)
         self._engine.set_root_vel(env_ids, ball_id, vel3)
         self._engine.set_root_ang_vel(env_ids, ball_id, torch.zeros_like(vel3))
@@ -3938,6 +3992,24 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         hy = 0.5 * self._field_width - 0.5
         P = torch.stack([torch.clamp(P[:, 0], off[:, 0] - hx, off[:, 0] + hx),
                          torch.clamp(P[:, 1], off[:, 1] - hy, off[:, 1] + hy)], dim=-1)
+        self._cow2_T[env_ids] = P
+        vT = torch.zeros_like(P[:, 0])
+        if (self._cow2_pow_prob > 0.0 and self._cow2_pow_v[1] > 0.0):
+            on = torch.rand_like(vT) < self._cow2_pow_prob
+            vT = torch.where(on, self._cow2_pow_v[0] + (self._cow2_pow_v[1] - self._cow2_pow_v[0]) * torch.rand_like(vT), vT)
+            u = P - ball
+            u = u / torch.clamp(torch.linalg.norm(u, dim=-1, keepdim=True), min=1.0e-6)
+            Pe = P + u * (vT * vT / (2.0 * float(self._cow_ball_decel))).unsqueeze(-1)
+            Pe = torch.stack([torch.clamp(Pe[:, 0], off[:, 0] - hx, off[:, 0] + hx),
+                              torch.clamp(Pe[:, 1], off[:, 1] - hy, off[:, 1] + hy)], dim=-1)
+            # field clamp: keep the v_T the clamped point implies (along the ball->T line)
+            vT = torch.sqrt(torch.clamp(2.0 * float(self._cow_ball_decel) * ((Pe - P) * u).sum(-1), min=0.0))
+            self._diag.add_mean("cow2p_vT", vT)
+            P = Pe
+        self._cow2_vT[env_ids] = vT
+        self._cow2_tmin[env_ids] = 1.0e6
+        self._cow2_tspd[env_ids] = 0.0
+        self._cow2_tdone[env_ids] = False
         self._cow2_P[env_ids] = P
         self._cow2_ball0[env_ids] = ball
         self._cow2_pside[env_ids] = side
@@ -3948,7 +4020,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_since[env_ids] = 0.0
         self._cow2_htime[env_ids] = 0.0
         self._cow2_hold[env_ids] = 0.0
-        self._drib_cmd[env_ids] = cow2_util.target_cmd(ball, P, heading, self._cow2_p_scale, self._cow2_cmd_decel())
+        if (self._cow2_pow_prob > 0.0):
+            self._drib_cmd[env_ids] = cow2_util.target_cmd(ball, self._cow2_T[env_ids], heading, self._cow2_p_scale,
+                                                           self._cow2_cmd_decel(), self._cow2_vT[env_ids].unsqueeze(-1))
+        else:
+            self._drib_cmd[env_ids] = cow2_util.target_cmd(ball, P, heading, self._cow2_p_scale, self._cow2_cmd_decel())
         return
 
     def _cow2d_new(self, env_ids):
@@ -3974,6 +4050,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         frame = torch.where(fits.unsqueeze(-1), heading, to_c)
         opp = clamp(root + cow2_util.heading_to_world(opp_rel, frame))
         R = clamp(root + cow2_util.heading_to_world(reg_rel, frame))
+        if (self._cow2_d_min_ball_opp > 0.0):
+            b0 = self._get_ball_pos()[env_ids, 0:2]
+            dv = opp - b0
+            dn = torch.linalg.norm(dv, dim=-1, keepdim=True)
+            u = torch.where(dn > 1.0e-4, dv / torch.clamp(dn, min=1.0e-4), heading)
+            opp = clamp(torch.where(dn < self._cow2_d_min_ball_opp, b0 + u * self._cow2_d_min_ball_opp, opp))
         self._diag.add_sum("cow2d_spawn_n", torch.ones_like(fits, dtype=torch.float))
         self._diag.add_sum("cow2d_spawn_center", (~fits).float())
         ball = self._get_ball_pos()[env_ids, 0:2]
@@ -4235,6 +4317,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         dist = torch.linalg.norm(ball - root, dim=-1)
         speed = torch.linalg.norm(vel, dim=-1)
         fd = self._min_foot_ball_dist(ball3)
+        if (self._cow2_pow_prob > 0.0):  # S2b: rest target on the current ball->T line (frozen while the ball rolls)
+            _u = self._cow2_T - ball
+            _dT = torch.linalg.norm(_u, dim=-1, keepdim=True)
+            _Pe = ball + _u / torch.clamp(_dT, min=1.0e-6) * (_dT + (self._cow2_vT * self._cow2_vT).unsqueeze(-1) / (2.0 * float(self._cow_ball_decel)))
+            _mv = cow & (self._cow2_phase != cow2_util.PH_ROLL) & (self._cow2_vT > 0.0)
+            self._cow2_P[:] = torch.where(_mv.unsqueeze(-1), _Pe, self._cow2_P)
         P = self._cow2_P
         pd = torch.linalg.norm(P - ball, dim=-1)
         ph = self._cow2_phase
@@ -4263,6 +4351,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         rest = roll_ph & ((self._cow2_hold >= self._cow2_rest_hold - 1.0e-6) | (self._cow2_htime >= self._cow2_roll_s))
         err = pd
         hit = rest & (err <= self._cow2_hit_dist)
+        # S2b pass metric (eval): closest approach of the rolling ball to T and its speed there; the event fires once
+        # per target, when the ball moves away from T (> 5 cm past the minimum) or rests
+        td = torch.linalg.norm(self._cow2_T - ball, dim=-1)
+        trk = roll_ph & ~self._cow2_tdone
+        closer = trk & (td < self._cow2_tmin)
+        self._cow2_tmin[:] = torch.where(closer, td, self._cow2_tmin)
+        self._cow2_tspd[:] = torch.where(closer, speed, self._cow2_tspd)
+        pev = trk & ((td > self._cow2_tmin + 0.05) | rest)
+        self._cow2_tdone[:] = self._cow2_tdone | pev
+        pok = pev & (self._cow2_tmin <= self._cow2_pow_tol_d) & (torch.abs(self._cow2_tspd - self._cow2_vT) <= self._cow2_pow_tol_v)
         hit_r = cow2_util.touch_target_reward(ball, P, self._cow2_p_sigma)
         lost = cow & (dist > self._cow2_lost_dist) & ~rest
         fail_time = ctrl_ph & ~first & (self._cow2_since >= self._cow2_seek_s)
@@ -4315,7 +4413,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         setup_gate = (ctrl_ph & (dist < self._cow2_setup_dist)).float()
         r_setup = self._reward_cow2_setup_w * setup_gate * (setup_pot - _setup_pot(self._prev_root_pos[:, 0:2]))
         r_wait = -self._reward_cow2_wait_w * ctrl_ph.float()
-        r = r_chase + r_prog + r_touch + r_hit + r_idle + r_lost + r_timeout + r_fall + r_setup + r_wait + r_rel + r_sep
+        r_pass = self._reward_cow2_pass_w * pok.float()
+        r = r_chase + r_prog + r_touch + r_hit + r_idle + r_lost + r_timeout + r_fall + r_setup + r_wait + r_rel + r_sep + r_pass
         if (self._cow2_replace_reward):
             self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
         else:
@@ -4325,7 +4424,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("cow2_frac", cf)
         for name, val in (("chase", r_chase), ("prog", r_prog), ("touch", r_touch), ("hit", r_hit), ("idle", r_idle),
                           ("lost", r_lost), ("timeout", r_timeout), ("fall", r_fall), ("setup", r_setup), ("wait", r_wait),
-                          ("rel", r_rel), ("sep", r_sep)):
+                          ("rel", r_rel), ("sep", r_sep), ("pass", r_pass)):
             d.add_mean("reward_cow2_" + name, cf * val)
         d.add_sum("cow2c_sep_n", touch_ph.float())
         d.add_sum("cow2c_sep_v", touch_ph.float() * torch.clamp((fd - self._cow2_prev_fd) / dt, -1.0, 1.0))
@@ -4341,6 +4440,20 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_sum("cow2b_touch_le3", (first & (touch_time <= 3.0 + 1.0e-6)).float())
         d.add_sum("cow2b_rest", rest.float())
         d.add_sum("cow2b_hit", hit.float())
+        d.add_sum("cow2p_ev", pev.float())
+        d.add_sum("cow2p_ok", pok.float())
+        d.add_sum("cow2p_ok_pow", (pok & (self._cow2_vT > 0.0)).float())
+        d.add_sum("cow2p_ev_pow", (pev & (self._cow2_vT > 0.0)).float())
+        d.add_sum("cow2p_fail_pow", ((fail_time | lost) & (self._cow2_vT > 0.0)).float())
+        d.add_sum("cow2p_dmin", pev.float() * self._cow2_tmin)
+        d.add_sum("cow2p_verr", pev.float() * torch.abs(self._cow2_tspd - self._cow2_vT))
+        d.add_sum("cow2p_vsgn", pev.float() * (self._cow2_tspd - self._cow2_vT))
+        for _nm, _lo, _hi in (("lo", 0.0, 1.0), ("mid", 1.0, 1.6), ("hi", 1.6, 99.0)):
+            _m = (self._cow2_vT > _lo) & (self._cow2_vT <= _hi)
+            d.add_sum("cow2p_ev_" + _nm, (pev & _m).float())
+            d.add_sum("cow2p_ok_" + _nm, (pok & _m).float())
+            d.add_sum("cow2p_vsgn_" + _nm, (pev & _m).float() * (self._cow2_tspd - self._cow2_vT))
+            d.add_sum("cow2p_dok_" + _nm, (pev & _m & (self._cow2_tmin <= self._cow2_pow_tol_d)).float())
         d.add_sum("cow2b_err", rest.float() * err)
         d.add_sum("cow2b_err_le1", (rest & (err <= 1.0)).float())
         d.add_sum("cow2b_pred_err", rest.float() * torch.linalg.norm(self._cow2_pred - ball, dim=-1))
@@ -4415,8 +4528,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # P as the dribble command, re-expressed in the current heading every tick
         cids = cow.nonzero(as_tuple=False).flatten()
         if (len(cids) > 0):
-            self._drib_cmd[cids] = cow2_util.target_cmd(ball[cids], self._cow2_P[cids], self._cow_heading_dir(cids),
-                                                        self._cow2_p_scale, self._cow2_cmd_decel())
+            if (self._cow2_pow_prob > 0.0):  # S2b: aim at T from the current ball, launch speed sqrt(v_T^2 + 2 a d)
+                self._drib_cmd[cids] = cow2_util.target_cmd(ball[cids], self._cow2_T[cids], self._cow_heading_dir(cids),
+                                                            self._cow2_p_scale, self._cow2_cmd_decel(),
+                                                            self._cow2_vT[cids].unsqueeze(-1))
+            else:
+                self._drib_cmd[cids] = cow2_util.target_cmd(ball[cids], self._cow2_P[cids], self._cow_heading_dir(cids),
+                                                            self._cow2_p_scale, self._cow2_cmd_decel())
             if (self._cow2_roll_zero_cmd):
                 rz = cids[self._cow2_phase[cids] == cow2_util.PH_ROLL]
                 self._drib_cmd[rz] = 0.0
@@ -4478,7 +4596,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 "cow2c_carry_rate": ratio(g("cow2c_carry"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
                 "cow2c_ph_ctrl_s": ratio(g("cow2c_ph_ctrl"), g("cow2b_rest")) / 30.0,
                 "cow2c_ph_pend_s": ratio(g("cow2c_ph_pend"), g("cow2c_cyc")) / 30.0,
-                "cow2b_hit_n": g("cow2b_hit"), "cow2b_rest_n": g("cow2b_rest")}
+                "cow2b_hit_n": g("cow2b_hit"), "cow2b_rest_n": g("cow2b_rest"),
+                # S2b pass metric (doc 43): ok = closest approach to T <= tol_d with |v - v_T| <= tol_v
+                "cow2p_ok_n": g("cow2p_ok"), "cow2p_ev_n": g("cow2p_ev"), "cow2p_ok_pow_n": g("cow2p_ok_pow"),
+                "cow2p_ev_pow_n": g("cow2p_ev_pow"), "cow2p_fail_pow_n": g("cow2p_fail_pow"),
+                "cow2p_vsgn_mean": ratio(g("cow2p_vsgn"), g("cow2p_ev")),
+                **{"cow2p_%s_%s" % (q, k): ratio(g("cow2p_%s_%s" % (q0, k)), g("cow2p_ev_" + k))
+                   for k in ("lo", "mid", "hi") for q, q0 in (("ok_rate", "ok"), ("vsgn_mean", "vsgn"), ("dok_rate", "dok"))},
+                "cow2p_dmin_mean": ratio(g("cow2p_dmin"), g("cow2p_ev")), "cow2p_verr_mean": ratio(g("cow2p_verr"), g("cow2p_ev"))}
 
     def _update_cow(self):
         """One tick of the cow episodes: phase machine, rewards (replace the task reward), respawn on
@@ -4626,6 +4751,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         wz = self._engine.get_root_ang_vel(char_id)[:, 2]
         heading_inv = torch_util.calc_heading_quat_inv(root_rot)
         v_local = torch_util.quat_rotate(heading_inv, root_vel)[:, 0:2]
+        raw_v_local = v_local
         raw_yaw_err = self._nav_cmd[:, 2] - wz
         if (self._nav_vel_filter_s > 0.0):
             alpha = min(1.0, self._engine.get_timestep() / self._nav_vel_filter_s)
@@ -4638,6 +4764,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         lin_r = torch.exp(-lin_err2 / self._nav_lin_sigma)
         yaw_r = torch.exp(-torch.square(yaw_err) / self._nav_yaw_sigma)
         nav_r = self._reward_nav_lin_w * lin_r + self._reward_nav_yaw_w * yaw_r
+        # stop-command penalty; always computed so the raw value reaches the diag log at weight 0
+        feet_v = self._engine.get_body_vel(char_id)[:, self._foot_body_ids, 0:2]
+        still_pen = compute_still_penalty(raw_v_local, feet_v, self._nav_cmd, self._still_foot_w)
+        settled = (self._time_buf - self._nav_cmd_set_t) >= self._still_settle_s
+        still_pen = torch.where(settled, still_pen, torch.zeros_like(still_pen))
+        nav_r = nav_r + self._reward_still_w * still_pen
         nav = self._nav_mode
         self._task_reward_buf[:] = torch.where(nav, nav_r, self._task_reward_buf)
         navf = nav.float()
@@ -4645,6 +4777,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("nav_frac", navf)
         d.add_mean("reward_nav_lin", navf * self._reward_nav_lin_w * lin_r)
         d.add_mean("reward_nav_yaw", navf * self._reward_nav_yaw_w * yaw_r)
+        d.add_mean("reward_still", navf * self._reward_still_w * still_pen)
+        d.add_mean("still_pen_raw", navf * still_pen)
         d.add_sum("nav_steps", navf)
         d.add_sum("nav_lin_err", navf * torch.sqrt(lin_err2))
         d.add_sum("nav_yaw_err", navf * torch.abs(yaw_err))
@@ -4818,11 +4952,50 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             t_ab = lo_a + (hi_a - lo_a) * torch.rand([n], device=self._device)
             take = torch.rand([n], device=self._device) < self._k2n_abandon_prob
             self._k2n_abandon_left[env_ids] = torch.where(take, t_ab, self._k2n_abandon_left[env_ids])
+        self._resample_kick_tgt(env_ids, ball_pos)
+        return
+
+    def _resample_kick_tgt(self, env_ids, ball_pos):
+        """Per-episode kick target (docs/t1/43, P1a). With probability kick_tgt_prob the target is a point at
+        distance U(d_lo, d_hi) from the ball, at an angle U(-A, A) around the ball->goal direction (A grows with
+        the sample schedule from kick_tgt_ang_deg_start to kick_tgt_ang_deg), clamped into the field.
+        Otherwise it is the goal centre, which is the pre-existing behaviour."""
+        goal = self._goal_pos[env_ids]
+        self._kick_tgt[env_ids] = goal
+        self._kick_tgt_on[env_ids] = False
+        if (self._kick_tgt_prob <= 0.0):
+            return
+        n = env_ids.shape[0]
+        use = torch.rand([n], device=self._device) < self._kick_tgt_prob
+        if (self._kick_tgt_ang_start_samples >= 0):
+            prog = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(), self._kick_tgt_ang_start_samples, self._kick_tgt_ang_end_samples)
+            amax = self._kick_tgt_ang_deg_start + prog * (self._kick_tgt_ang_deg - self._kick_tgt_ang_deg_start)
+        else:
+            amax = self._kick_tgt_ang_deg
+        tgt = soccer_util.sample_kick_target(ball_pos[:, 0:2], goal, self._kick_tgt_dist[0], self._kick_tgt_dist[1],
+                                             float(np.deg2rad(amax)), self._field_length, self._field_width,
+                                             self._field_offset[env_ids], self._ball_spawn_margin)
+        self._kick_tgt[env_ids] = torch.where(use.unsqueeze(-1), tgt, goal)
+        self._kick_tgt_on[env_ids] = use
         return
 
 
 
 @torch.jit.script
+@torch.jit.script
+def compute_still_penalty(root_vel_xy, feet_vel_xy, nav_cmd, foot_w):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Olives' stop penalty (steering env, 7e525b5) on our (vx, vy, wz) command: where the whole command is
+    zero, ||v_root_xy|| + foot_w * mean over feet ||v_foot_xy||; zero elsewhere. root_vel_xy [N, 2],
+    feet_vel_xy [N, F, 2], nav_cmd [N, 3] -> [N]."""
+    base = torch.sqrt(torch.sum(torch.square(root_vel_xy), dim=-1))
+    feet = torch.mean(torch.sqrt(torch.sum(torch.square(feet_vel_xy), dim=-1)), dim=-1)
+    pen = base + foot_w * feet
+    stop = torch.sum(torch.abs(nav_cmd), dim=-1) < 1e-6
+    return torch.where(stop, pen, torch.zeros_like(pen))
+
+
 def compute_nav_cmd_obs(cmd, face_horizon):
     # type: (Tensor, float) -> Tensor
     """Velocity command in the steering-slot layout (heading frame):

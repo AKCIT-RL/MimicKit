@@ -701,3 +701,18 @@ class GateClock:
     def info(self):
         return {"gate_clock": self.clock, "gate_idx": float(self.idx),
                 "gate_hold": float(self.hold), "gate_stalled_iters": float(self.stalled_iters)}
+
+
+def sample_kick_target(ball_xy, goal_xy, d_lo, d_hi, ang_max, field_length, field_width, field_offset, margin):
+    # type: (Tensor, Tensor, float, float, float, float, float, Tensor, float) -> Tensor
+    """Kick target T [N, 2] (world): d ~ U(d_lo, d_hi) from the ball, at an angle U(-ang_max, ang_max)
+    (rad) around the ball->goal direction, clamped into the field (margin from the lines)."""
+    n = ball_xy.shape[0]
+    to_goal = goal_xy - ball_xy
+    base = torch.atan2(to_goal[:, 1], to_goal[:, 0])
+    ang = base + (2.0 * torch.rand([n], device=ball_xy.device) - 1.0) * ang_max
+    d = d_lo + (d_hi - d_lo) * torch.rand([n], device=ball_xy.device)
+    tgt = ball_xy + d.unsqueeze(-1) * torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+    lo = field_offset + torch.tensor([-0.5 * field_length + margin, -0.5 * field_width + margin], device=ball_xy.device)
+    hi = field_offset + torch.tensor([0.5 * field_length - margin, 0.5 * field_width - margin], device=ball_xy.device)
+    return torch.max(torch.min(tgt, hi), lo)

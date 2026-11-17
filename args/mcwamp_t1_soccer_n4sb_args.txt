@@ -1,0 +1,13 @@
+# nave6f: yaw (doc 36)
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all.yaml
+--env_config data/envs/mcwamp_t1_soccer_enc_n4sb_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_k74b_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 60000000
+--out_dir output/t1_soccer_n4sb/
+--model_file output_lab/nave6f_seed1/model.pt

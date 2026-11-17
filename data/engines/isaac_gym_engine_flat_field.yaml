@@ -1,0 +1,14 @@
+# Gym twin of isaac_lab_engine_flat_field.yaml (flat plane used by the soccer kick benchmarks), env_spacing 0 as in Lab;
+# only engine_name differ. Lucas, 2026-11-16.
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0
+
+ground:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

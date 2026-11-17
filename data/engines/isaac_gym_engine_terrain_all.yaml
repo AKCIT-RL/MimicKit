@@ -1,0 +1,22 @@
+# Gym twin of isaac_lab_engine_terrain_all.yaml (the engine of n2k it200 and its teachers), same ground/rates;
+# only engine_name differ.
+# PhysX 4/0 iterations are the Gym default (isaac_gym_engine.py:73-74), as in the Lab SimulationCfg. Lucas, 2026-11-16.
+engine_name: "isaac_gym"
+
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 0 # one global ground; the env spreads fields itself (as in the Isaac Gym twin)
+
+ground:
+  type: "uneven"
+  random_height: 0.02 # m (base; each level below overrides it)
+  horizontal_scale: 0.5 # m (bump spacing)
+  tile_levels:
+  - {random_height: 0.001}
+  - {random_height: 0.005}
+  - {random_height: 0.02}
+  - {random_height: 0.05, horizontal_scale: 0.25, step_height_range: [0.01, 0.02], step_size: [1.0, 2.0], step_density: 0.2}
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

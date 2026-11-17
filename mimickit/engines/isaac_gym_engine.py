@@ -342,7 +342,25 @@ class IsaacGymEngine(engine.Engine):
         return self._obj_dof_vel[obj_id]
     
     def get_dof_forces(self, obj_id):
-        return self._obj_dof_forces[obj_id]
+        if (self._enable_dof_force_sensors()):
+            return self._obj_dof_forces[obj_id]
+        return self._calc_obj_applied_torque(obj_id)
+
+    def _calc_obj_applied_torque(self, obj_id):
+        # Isaac Lab parity (articulation.data.applied_torque) with the dof force sensors off:
+        # torque/pd_explicit -> the clipped torque last sent to PhysX (last substep);
+        # pos -> the drive's PD law at the current state clipped by the effort, which is what
+        #        Lab's ImplicitActuator reports (PhysX does not expose the drive torque);
+        # other modes -> zeros.
+        if (self._control_mode in (engine.ControlMode.torque, engine.ControlMode.pd_explicit)):
+            return self._obj_applied_torque[obj_id]
+        elif (self._control_mode == engine.ControlMode.pos):
+            dof_pos = self._obj_dof_pos[obj_id]
+            dof_vel = self._obj_dof_vel[obj_id]
+            tau = self._obj_kp[obj_id] * (self._obj_dof_cmd[obj_id] - dof_pos) - self._obj_kd[obj_id] * dof_vel
+            lim = self._obj_torque_lim[obj_id]
+            return torch.clip(tau, -lim, lim)
+        return torch.zeros_like(self._obj_dof_pos[obj_id])
     
     def get_body_pos(self, obj_id):
         return self._obj_body_pos[obj_id]
@@ -462,6 +480,14 @@ class IsaacGymEngine(engine.Engine):
 
         if (env_id is None or len(env_id) > 0):
             self._has_body_forces = True
+        return
+
+    def set_body_wrench(self, env_id, obj_id, body_id, forces, torques):
+        """World-frame force AND torque on one body (Isaac Lab API, used by task_soccer_env pushes).
+        Gym clears the wrench after each step; the soccer env re-issues it every control step while a
+        push is active, so the applied wrench matches Lab's (kept until overwritten)."""
+        self.set_body_forces(env_id, obj_id, body_id, forces)
+        self.set_body_torques(env_id, obj_id, body_id, torques)
         return
 
     def set_body_torques(self, env_id, obj_id, body_id, torques):
@@ -907,6 +933,7 @@ class IsaacGymEngine(engine.Engine):
 
     def _set_actuation_torque(self, torque):
         torque_clip = torch.clip(torque, -self._torque_lim_raw, self._torque_lim_raw)
+        self._applied_torque_raw[:] = torque_clip  # read by get_dof_forces
         torque_tensor = gymtorch.unwrap_tensor(torque_clip)
         self._gym.set_dof_actuation_force_tensor(self._sim, torque_tensor)
         return
@@ -1172,6 +1199,7 @@ class IsaacGymEngine(engine.Engine):
         self._torque_lim_raw = torch.stack(self._torque_lim_raw, dim=0)
 
         self._dof_cmd_raw = torch.zeros_like(self._kp_raw)
+        self._applied_torque_raw = torch.zeros_like(self._kp_raw)
         # Coulomb joint friction (Nm) for pd_explicit; zeros = the plain PD.
         # Written per env by set_obj_dof_friction (Booster Gym randomizes it,
         # U(0, 2) Nm; real motors have it, PhysX and the MuJoCo deploy do not).
@@ -1182,6 +1210,7 @@ class IsaacGymEngine(engine.Engine):
         self._obj_kd = []
         self._obj_torque_lim = []
         self._obj_dof_cmd = []
+        self._obj_applied_torque = []
 
         dof_idx0 = 0
         objs_per_env = self.get_objs_per_env()
@@ -1198,6 +1227,7 @@ class IsaacGymEngine(engine.Engine):
             self._obj_kd.append(obj_kd)
             self._obj_torque_lim.append(obj_torque_lim)
             self._obj_dof_cmd.append(obj_dof_cmd)
+            self._obj_applied_torque.append(self._applied_torque_raw[..., dof_idx0:dof_idx1])
 
             dof_idx0 = dof_idx1
 

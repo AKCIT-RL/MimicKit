@@ -93,6 +93,9 @@ class IsaacLabEngine(engine.Engine):
             self._control_mode = engine.ControlMode[config["control_mode"]]
         else:
             self._control_mode = engine.ControlMode.none
+        # pd_explicit: per-joint {regex: [kp, kd, effort_limit]}. The articulation reads 0 / 1e9 for explicit
+        # actuators (the USD drive is not kept), so the gains must be given here (check_pd_explicit, 2026-11-16)
+        self._pd_explicit_gains = config.get("pd_explicit_gains", None)
 
         self._env_offsets = self._compute_env_offsets(num_envs)
         self._build_ground()
@@ -917,7 +920,12 @@ class IsaacLabEngine(engine.Engine):
         elif (control_mode == engine.ControlMode.torque):
             actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"], stiffness=0, damping=0, effort_limit=None)
         elif (control_mode == engine.ControlMode.pd_explicit):
-            actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"], stiffness=None, damping=None, effort_limit=None)
+            gains = self._pd_explicit_gains
+            assert(gains is not None), "pd_explicit needs pd_explicit_gains in the engine config"
+            actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"],
+                                              stiffness={k: float(v[0]) for k, v in gains.items()},
+                                              damping={k: float(v[1]) for k, v in gains.items()},
+                                              effort_limit={k: float(v[2]) for k, v in gains.items()})
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
 

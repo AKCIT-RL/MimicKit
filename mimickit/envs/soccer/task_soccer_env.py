@@ -105,6 +105,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # With action noise the raw yaw rate is mostly jitter (train err ~1.3
         # vs ~0.3 deterministic), which flattens the yaw reward (k94a-c)
         self._nav_vel_filter_s = float(env_config.get("nav_vel_filter_s", 0.0))
+        # stop-command penalty (Olives, steering env 7e525b5; doc 43): on a zero nav command,
+        # ||v_base_xy|| + still_foot_w * mean ||v_foot_xy|| (raw, unfiltered), after still_settle_s
+        # seconds since the command was drawn. L1 on purpose: exp(-e^2/sigma) is flat near 0. 0 = off.
+        self._reward_still_w = float(env_config.get("reward_still_w", 0.0))
+        self._still_foot_w = float(env_config.get("still_foot_w", 0.5))
+        self._still_settle_s = float(env_config.get("still_settle_s", 0.0))
         # evaluation hooks: None = sample; True/False = force nav/kick on
         # every (re)draw; _nav_fixed_cmd [3] replaces the sampled command
         self._nav_force = None
@@ -193,6 +199,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_ball_dist = [float(v) for v in g("cow2_ball_dist", [0.3, 1.5])]
         self._cow2_ball_ang_deg = float(g("cow2_ball_ang_deg", 180.0))
         self._cow2_ball_speed = [float(v) for v in g("cow2_ball_speed", [0.0, 0.0])]
+        # Stage 3 incoming ball (doc 40 stage F): fraction of episodes where the ball starts far and rolls toward the robot (0 = off).
+        self._cow2_d_in_prob = float(g("cow2_d_in_prob", 0.0))
+        self._cow2_d_in_dist = [float(v) for v in g("cow2_d_in_dist", [2.0, 4.0])]
+        self._cow2_d_in_ang_deg = float(g("cow2_d_in_ang_deg", 60.0))
+        self._cow2_d_in_speed = [float(v) for v in g("cow2_d_in_speed", [0.5, 1.5])]
+        self._cow2_d_in_jit_deg = float(g("cow2_d_in_jit_deg", 15.0))
         self._cow2_ctrl_cmd = [float(v) for v in g("cow2_ctrl_cmd", [0.0, 0.0])]  # heading-frame dribble command shown in stage A
         self._cow2_cap_dist = float(g("cow2_cap_dist", 0.7))
         # stage C carry cap: a TOUCH phase longer than touch_max_s with the ball still at the foot is a carry;
@@ -249,6 +261,31 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_cow2_sep_w = float(g("reward_cow2_sep_w", 0.0))  # c2c47: pay foot-ball separation (m/s) during TOUCH
         self._cow2_rel_sigma = float(g("cow2_rel_sigma", 0.5))
         self._reward_cow2_hit_w = float(g("reward_cow2_hit_w", 0.0))
+        # "area" scenario (doc 43): stage-B touch to P, wide P, area radius growing with the distance d0 = |P - ball0|
+        # (hit_dist + hit_k d0, sigma + sigma_k d0), success = ball rests in the area AND the robot ends still and upright
+        # (area_still), pays a success bonus, penalises extra touches; after a rest the scenario is respawned around the
+        # robot (area_respawn). All off by default: other envs are unchanged.
+        self._cow2_hit_k = float(g("cow2_hit_k", 0.0))
+        self._cow2_p_sigma_k = float(g("cow2_p_sigma_k", 0.0))
+        self._cow2_area_still = bool(g("cow2_area_still", False))
+        self._cow2_area_respawn = bool(g("cow2_area_respawn", False))
+        self._cow2_area_ball_vmax = float(g("cow2_area_ball_vmax", 0.0))  # >0: ball may still roll slower than this inside the area
+        self._cow2_area_tilt_cos = float(g("cow2_area_tilt_cos", 0.99))  # torso up-vector z >= this (about 8 deg)
+        self._cow2_area_min_h = float(g("cow2_area_min_h", 0.55))
+        self._cow2_area_wmax = float(g("cow2_area_wmax", 0.3))  # trunk angular speed limit (rad/s)
+        self._cow2_still_sigma = float(g("cow2_still_sigma", 0.3))
+        self._cow2_still_tilt_sigma = float(g("cow2_still_tilt_sigma", 0.0))  # >0: pose factor of the still reward
+        self._reward_cow2_still_w = float(g("reward_cow2_still_w", 0.0))  # ROLL phase: exp(-(v/sigma)^2) of the robot speed
+        self._reward_cow2_retouch_w = float(g("reward_cow2_retouch_w", 0.0))  # penalty per extra touch while rolling
+        self._reward_cow2_succ_w = float(g("reward_cow2_succ_w", 0.0))  # bonus at area success
+        # one touch, then the robot STAYS where it kicked while the ball rolls (doc 43): max drift from the touch-end spot
+        # allowed for a success (0 = off), penalty weight on the drift (m, capped at 1) during the roll
+        self._cow2_stay_r = float(g("cow2_stay_r", 0.0))
+        self._cow2_stay_first = bool(g("cow2_stay_from_first", False))  # drift measured from the 1st touch (not the last touch end)
+        self._cow2_stay_clamp = float(g("cow2_stay_clamp", 1.0))  # saturation of the drift penalty (m)
+        self._cow2_stay_touch = bool(g("cow2_stay_in_touch", False))  # drift penalty also while the ball is at the foot
+        self._cow2_max_touches = float(g("cow2_max_touches", 0.0))  # >0: success needs at most this many touches
+        self._reward_cow2_stay_w = float(g("reward_cow2_stay_w", 0.0))
         self._reward_cow2_prog_w = float(g("reward_cow2_prog_w", 0.0))
         self._cow2_prog_roll_only = bool(g("cow2_prog_roll_only", False))  # c2c44: prog only while the ball rolls (no pay for carry)
         # stage D (cow2_stage 3, doc 40 sec 4b): ball at the robot's feet, still virtual opponent ahead, region beside/behind it;
@@ -1206,6 +1243,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._nav_mode = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._nav_cmd = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._nav_cmd_time = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        self._nav_cmd_set_t = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._k2n_decided = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._k2n_left = torch.full([num_envs], float("inf"), device=self._device)
         self._k2n_abandon_left = torch.full([num_envs], float("inf"), device=self._device)
@@ -1244,6 +1282,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._cow2_isA = torch.zeros([num_envs], device=self._device, dtype=torch.bool)  # stage-A episode (cow2_mix_a)
         self._cow2_tdur = torch.zeros([num_envs], device=self._device, dtype=torch.float)  # time in the TOUCH phase
         self._cow2_pred = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._cow2_stay_pos = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._cow2_touches = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._cow2_prev_fd = torch.full([num_envs], 10.0, device=self._device, dtype=torch.float)
         self._cow2_prev_speed = torch.zeros([num_envs], device=self._device, dtype=torch.float)
@@ -3528,6 +3567,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             still = torch.rand([n], device=self._device) < self._nav_still_prob
             cmd[still] = 0.0
         self._nav_cmd[env_ids] = cmd
+        self._nav_cmd_set_t[env_ids] = self._time_buf[env_ids]
         lo_t, hi_t = self._nav_resample_s
         self._nav_cmd_time[env_ids] = self._time_buf[env_ids] + lo_t \
             + (hi_t - lo_t) * torch.rand([n], device=self._device)
@@ -3876,6 +3916,18 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         ball3[:, 0:2] = pos
         vel3 = torch.zeros([n, 3], device=self._device, dtype=torch.float)
         vel3[:, 0:2] = cow2_util.sample_ball_vel(n, self._cow2_ball_speed[0], self._cow2_ball_speed[1], self._device)
+        if (self._cow2_stage == 3 and self._cow2_d_in_prob > 0.0):
+            inc = torch.rand(n, device=self._device) < self._cow2_d_in_prob
+            rel_in = cow2_util.sample_ring(n, self._cow2_d_in_dist[0], self._cow2_d_in_dist[1],
+                                           float(np.deg2rad(self._cow2_d_in_ang_deg)), self._device)
+            pos_in = root + cow2_util.heading_to_world(rel_in, heading)
+            pos_in = torch.stack([torch.clamp(pos_in[:, 0], off[:, 0] - half_x, off[:, 0] + half_x),
+                                  torch.clamp(pos_in[:, 1], off[:, 1] - half_y, off[:, 1] + half_y)], dim=-1)
+            v_in = cow2_util.heading_to_world(cow2_util.sample_ball_vel_toward(
+                rel_in, self._cow2_d_in_speed[0], self._cow2_d_in_speed[1],
+                float(np.deg2rad(self._cow2_d_in_jit_deg)), self._device), heading)
+            ball3[:, 0:2] = torch.where(inc.unsqueeze(-1), pos_in, ball3[:, 0:2])
+            vel3[:, 0:2] = torch.where(inc.unsqueeze(-1), v_in, vel3[:, 0:2])
         self._engine.set_root_pos(env_ids, ball_id, ball3)
         self._engine.set_root_vel(env_ids, ball_id, vel3)
         self._engine.set_root_ang_vel(env_ids, ball_id, torch.zeros_like(vel3))
@@ -4255,15 +4307,37 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                  | (first & (fd > self._cow2_touch_end)))
         pred = cow2_util.predict_rest(ball, vel, self._cow_ball_decel)
         self._cow2_pred[:] = torch.where(end_t.unsqueeze(-1), pred, self._cow2_pred)
-        touch_r = cow2_util.touch_target_reward(pred, P, self._cow2_p_sigma)
+        stay_set = first if self._cow2_stay_first else end_t
+        self._cow2_stay_pos[:] = torch.where(stay_set.unsqueeze(-1), root3[:, 0:2], self._cow2_stay_pos)
+        stay_d = torch.linalg.norm(root3[:, 0:2] - self._cow2_stay_pos, dim=-1)  # drift since the touch ended
+        # area scenario: tolerance and sigma grow with the distance d0 = |P - ball0| (k = 0: constants, old behaviour)
+        d0 = torch.linalg.norm(P - self._cow2_ball0, dim=-1)
+        hit_d = self._cow2_hit_dist + self._cow2_hit_k * d0
+        sig = self._cow2_p_sigma + self._cow2_p_sigma_k * d0 if self._cow2_p_sigma_k > 0.0 else self._cow2_p_sigma
+        touch_r = cow2_util.touch_target_reward(pred, P, sig)
+        # robot "still and in a good pose": slow, torso upright, standing height, low trunk angular speed
+        rot = self._engine.get_root_rot(char_id)
+        up_z = torch_util.quat_rotate(rot, torch.tensor([0.0, 0.0, 1.0], device=self._device).expand(rot.shape[0], 3))[:, 2]
+        wnorm = torch.linalg.norm(self._engine.get_root_ang_vel(char_id), dim=-1)
+        rstill = ((rspeed < self._cow2_still_speed) & (up_z >= self._cow2_area_tilt_cos)
+                  & (root3[:, 2] >= self._cow2_area_min_h) & (wnorm < self._cow2_area_wmax))
         # rest: slow for rest_hold s while rolling (or roll timeout)
         slow = speed < self._cow2_rest_speed
+        if (self._cow2_area_ball_vmax > 0.0):  # a ball still rolling slowly inside the area counts as arrived
+            slow = slow | ((speed < self._cow2_area_ball_vmax) & (pd <= hit_d))
+        if (self._cow2_area_still):  # the scenario ends only with the robot still (or on the roll timeout)
+            slow = slow & rstill
         self._cow2_hold[:] = torch.where(roll_ph & slow, self._cow2_hold + dt, torch.where(roll_ph, torch.zeros_like(self._cow2_hold), self._cow2_hold))
         self._cow2_htime[:] = torch.where(roll_ph, self._cow2_htime + dt, self._cow2_htime)
         rest = roll_ph & ((self._cow2_hold >= self._cow2_rest_hold - 1.0e-6) | (self._cow2_htime >= self._cow2_roll_s))
         err = pd
-        hit = rest & (err <= self._cow2_hit_dist)
-        hit_r = cow2_util.touch_target_reward(ball, P, self._cow2_p_sigma)
+        hit = rest & (err <= hit_d)
+        succ = hit & rstill if self._cow2_area_still else hit
+        if (self._cow2_stay_r > 0.0):
+            succ = succ & (stay_d <= self._cow2_stay_r)
+        if (self._cow2_max_touches > 0.0):
+            succ = succ & (self._cow2_touches <= self._cow2_max_touches)
+        hit_r = cow2_util.touch_target_reward(ball, P, sig)
         lost = cow & (dist > self._cow2_lost_dist) & ~rest
         fail_time = ctrl_ph & ~first & (self._cow2_since >= self._cow2_seek_s)
         self._cow2_tdur[:] = torch.where(touch_ph, self._cow2_tdur + dt, torch.zeros_like(self._cow2_tdur))
@@ -4315,7 +4389,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         setup_gate = (ctrl_ph & (dist < self._cow2_setup_dist)).float()
         r_setup = self._reward_cow2_setup_w * setup_gate * (setup_pot - _setup_pot(self._prev_root_pos[:, 0:2]))
         r_wait = -self._reward_cow2_wait_w * ctrl_ph.float()
-        r = r_chase + r_prog + r_touch + r_hit + r_idle + r_lost + r_timeout + r_fall + r_setup + r_wait + r_rel + r_sep
+        r_still = self._reward_cow2_still_w * roll_ph.float() * torch.exp(-torch.square(rspeed / max(self._cow2_still_sigma, 1.0e-6)))
+        if self._cow2_still_tilt_sigma > 0.0:
+            r_still = r_still * torch.exp(-torch.square((1.0 - up_z).clamp(min=0.0) / self._cow2_still_tilt_sigma))
+        stay_ph = (roll_ph | touch_ph) if self._cow2_stay_touch else roll_ph
+        r_stay = -self._reward_cow2_stay_w * stay_ph.float() * torch.clamp(stay_d, max=self._cow2_stay_clamp)
+        r_still = r_still + r_stay
+        r_retouch = -self._reward_cow2_retouch_w * extra.float()
+        r_succ = self._reward_cow2_succ_w * succ.float()
+        r = (r_chase + r_prog + r_touch + r_hit + r_idle + r_lost + r_timeout + r_fall + r_setup + r_wait + r_rel + r_sep
+             + r_still + r_retouch + r_succ)
         if (self._cow2_replace_reward):
             self._task_reward_buf[:] = torch.where(cow, r, self._task_reward_buf)
         else:
@@ -4325,8 +4408,21 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("cow2_frac", cf)
         for name, val in (("chase", r_chase), ("prog", r_prog), ("touch", r_touch), ("hit", r_hit), ("idle", r_idle),
                           ("lost", r_lost), ("timeout", r_timeout), ("fall", r_fall), ("setup", r_setup), ("wait", r_wait),
-                          ("rel", r_rel), ("sep", r_sep)):
+                          ("rel", r_rel), ("sep", r_sep), ("still", r_still), ("retouch", r_retouch), ("succ", r_succ)):
             d.add_mean("reward_cow2_" + name, cf * val)
+        # area scenario (doc 43): success, robot-still at rest, distance buckets (near < 3 m, mid 3-7 m, far >= 7 m)
+        d.add_sum("cow2b_succ", succ.float())
+        d.add_sum("cow2b_rest_still", (rest & rstill).float())
+        d.add_sum("cow2b_up_z", rest.float() * up_z)
+        d.add_sum("cow2b_stay_d", rest.float() * stay_d)
+        d.add_sum("cow2b_stay_ok", (rest & (stay_d <= 0.5)).float())
+        d.add_sum("cow2b_roll_n", roll_ph.float())
+        d.add_sum("cow2b_roll_moving", (roll_ph & (rspeed > 0.2)).float())
+        d.add_sum("cow2b_d0", rest.float() * d0)
+        for nm, bk in (("near", d0 < 3.0), ("mid", (d0 >= 3.0) & (d0 < 7.0)), ("far", d0 >= 7.0)):
+            d.add_sum("cow2b_rest_" + nm, (rest & bk).float())
+            d.add_sum("cow2b_succ_" + nm, (succ & bk).float())
+            d.add_sum("cow2b_err_" + nm, (rest & bk).float() * err)
         d.add_sum("cow2c_sep_n", touch_ph.float())
         d.add_sum("cow2c_sep_v", touch_ph.float() * torch.clamp((fd - self._cow2_prev_fd) / dt, -1.0, 1.0))
         d.add_sum("cow2c_rel_n", rf)
@@ -4403,7 +4499,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 if (self._virtual_perception):
                     self._reset_perception(a_ids)
                 self._record_reset_prev_states(a_ids)
-        if (len(ids) > 0):
+        if (len(ids) > 0 and self._cow2_area_respawn):  # area scenario: a fresh scenario around the (standing) robot
+            self._cow2_spawn(ids)
+            if (self._virtual_perception):
+                self._reset_perception(ids)
+            self._record_reset_prev_states(ids)
+        elif (len(ids) > 0):
             self._cow2_new_target(ids)
         ids = (lost | fail_time).nonzero(as_tuple=False).flatten()  # respawn the ball near the robot (+ new P)
         if (len(ids) > 0):
@@ -4463,6 +4564,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 "cow2b_one_touch_rate": ratio(g("cow2b_one_touch"), g("cow2b_rest")),
                 "cow2b_timeout_rate": ratio(g("cow2b_fail_time"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
                 "cow2b_lost_rate": ratio(g("cow2b_lost"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2b_succ_rate": ratio(g("cow2b_succ"), g("cow2b_rest") + g("cow2b_fail_time") + g("cow2b_lost")),
+                "cow2b_rest_still_rate": ratio(g("cow2b_rest_still"), g("cow2b_rest")),
+                "cow2b_stay_d_mean": ratio(g("cow2b_stay_d"), g("cow2b_rest")),
+                "cow2b_stay_ok_rate": ratio(g("cow2b_stay_ok"), g("cow2b_rest")),
+                "cow2b_roll_moving_rate": ratio(g("cow2b_roll_moving"), g("cow2b_roll_n")),
+                "cow2b_up_z_mean": ratio(g("cow2b_up_z"), g("cow2b_rest")),
+                "cow2b_d0_mean": ratio(g("cow2b_d0"), g("cow2b_rest")),
+                "cow2b_succ_near_rate": ratio(g("cow2b_succ_near"), g("cow2b_rest_near")),
+                "cow2b_succ_mid_rate": ratio(g("cow2b_succ_mid"), g("cow2b_rest_mid")),
+                "cow2b_succ_far_rate": ratio(g("cow2b_succ_far"), g("cow2b_rest_far")),
+                "cow2b_err_near_mean": ratio(g("cow2b_err_near"), g("cow2b_rest_near")),
+                "cow2b_err_mid_mean": ratio(g("cow2b_err_mid"), g("cow2b_rest_mid")),
+                "cow2b_err_far_mean": ratio(g("cow2b_err_far"), g("cow2b_rest_far")),
                 "cow2b_hit_pos_rate": ratio(g("cow2b_hit_pos"), g("cow2b_rest_pos")),
                 "cow2b_hit_neg_rate": ratio(g("cow2b_hit_neg"), g("cow2b_rest_neg")),
                 "cow2b_still_frac": ratio(g("cow2b_ctrl_still"), g("cow2b_ctrl_steps")),
@@ -4626,6 +4740,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         wz = self._engine.get_root_ang_vel(char_id)[:, 2]
         heading_inv = torch_util.calc_heading_quat_inv(root_rot)
         v_local = torch_util.quat_rotate(heading_inv, root_vel)[:, 0:2]
+        raw_v_local = v_local
         raw_yaw_err = self._nav_cmd[:, 2] - wz
         if (self._nav_vel_filter_s > 0.0):
             alpha = min(1.0, self._engine.get_timestep() / self._nav_vel_filter_s)
@@ -4638,6 +4753,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         lin_r = torch.exp(-lin_err2 / self._nav_lin_sigma)
         yaw_r = torch.exp(-torch.square(yaw_err) / self._nav_yaw_sigma)
         nav_r = self._reward_nav_lin_w * lin_r + self._reward_nav_yaw_w * yaw_r
+        # stop-command penalty; always computed so the raw value reaches the diag log at weight 0
+        feet_v = self._engine.get_body_vel(char_id)[:, self._foot_body_ids, 0:2]
+        still_pen = compute_still_penalty(raw_v_local, feet_v, self._nav_cmd, self._still_foot_w)
+        settled = (self._time_buf - self._nav_cmd_set_t) >= self._still_settle_s
+        still_pen = torch.where(settled, still_pen, torch.zeros_like(still_pen))
+        nav_r = nav_r + self._reward_still_w * still_pen
         nav = self._nav_mode
         self._task_reward_buf[:] = torch.where(nav, nav_r, self._task_reward_buf)
         navf = nav.float()
@@ -4645,6 +4766,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("nav_frac", navf)
         d.add_mean("reward_nav_lin", navf * self._reward_nav_lin_w * lin_r)
         d.add_mean("reward_nav_yaw", navf * self._reward_nav_yaw_w * yaw_r)
+        d.add_mean("reward_still", navf * self._reward_still_w * still_pen)
+        d.add_mean("still_pen_raw", navf * still_pen)
         d.add_sum("nav_steps", navf)
         d.add_sum("nav_lin_err", navf * torch.sqrt(lin_err2))
         d.add_sum("nav_yaw_err", navf * torch.abs(yaw_err))
@@ -4823,6 +4946,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
 
 @torch.jit.script
+@torch.jit.script
+def compute_still_penalty(root_vel_xy, feet_vel_xy, nav_cmd, foot_w):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Olives' stop penalty (steering env, 7e525b5) on our (vx, vy, wz) command: where the whole command is
+    zero, ||v_root_xy|| + foot_w * mean over feet ||v_foot_xy||; zero elsewhere. root_vel_xy [N, 2],
+    feet_vel_xy [N, F, 2], nav_cmd [N, 3] -> [N]."""
+    base = torch.sqrt(torch.sum(torch.square(root_vel_xy), dim=-1))
+    feet = torch.mean(torch.sqrt(torch.sum(torch.square(feet_vel_xy), dim=-1)), dim=-1)
+    pen = base + foot_w * feet
+    stop = torch.sum(torch.abs(nav_cmd), dim=-1) < 1e-6
+    return torch.where(stop, pen, torch.zeros_like(pen))
+
+
 def compute_nav_cmd_obs(cmd, face_horizon):
     # type: (Tensor, float) -> Tensor
     """Velocity command in the steering-slot layout (heading frame):

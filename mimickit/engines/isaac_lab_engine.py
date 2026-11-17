@@ -93,6 +93,9 @@ class IsaacLabEngine(engine.Engine):
             self._control_mode = engine.ControlMode[config["control_mode"]]
         else:
             self._control_mode = engine.ControlMode.none
+        # pd_explicit: per-joint {regex: [kp, kd, effort_limit]}. The articulation reads 0 / 1e9 for explicit
+        # actuators (the USD drive is not kept), so the gains must be given here (check_pd_explicit, 2026-11-16)
+        self._pd_explicit_gains = config.get("pd_explicit_gains", None)
 
         self._env_offsets = self._compute_env_offsets(num_envs)
         self._build_ground()
@@ -222,6 +225,8 @@ class IsaacLabEngine(engine.Engine):
             obj.set_joint_effort_target(sim_cmd)
         elif (self._control_mode == engine.ControlMode.pd_explicit):
             obj.set_joint_position_target(sim_cmd)
+            # the delayed blend reads _latest_cmd; without this the start pose is replayed every substep
+            self._latest_cmd[obj_id] = sim_cmd.clone()
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
         return
@@ -659,7 +664,7 @@ class IsaacLabEngine(engine.Engine):
 
     def scale_obj_pd_gains(self, env_id, obj_id, kp_scales, kd_scales):
         """Scale this env's motor gains in place (Table 2). Scales come in the common
-        DOF order; the implicit actuator and the PhysX drive are both updated."""
+        DOF order; the actuator is always updated, the PhysX drive only in "pos" mode."""
         obj = self._objs[obj_id]
         order = self._dof_order_common2sim[obj_id]
         kp_s = torch.as_tensor(kp_scales, device=self._device, dtype=torch.float32)[order]
@@ -669,9 +674,12 @@ class IsaacLabEngine(engine.Engine):
         actuator.stiffness[env_id] *= kp_s
         actuator.damping[env_id] *= kd_s
 
-        env_ids = torch.tensor([env_id], device=self._device, dtype=torch.int32)
-        obj.write_joint_stiffness_to_sim(actuator.stiffness[env_id].unsqueeze(0), env_ids=env_ids)
-        obj.write_joint_damping_to_sim(actuator.damping[env_id].unsqueeze(0), env_ids=env_ids)
+        # Only the implicit actuator ("pos") is the PhysX drive. With pd_explicit the torque comes from
+        # the IdealPD actuator (scaled above) and the PhysX drive must stay at zero, else the PD is applied twice.
+        if (self._control_mode == engine.ControlMode.pos):
+            env_ids = torch.tensor([env_id], device=self._device, dtype=torch.int32)
+            obj.write_joint_stiffness_to_sim(actuator.stiffness[env_id].unsqueeze(0), env_ids=env_ids)
+            obj.write_joint_damping_to_sim(actuator.damping[env_id].unsqueeze(0), env_ids=env_ids)
         return
 
     def scale_obj_masses(self, env_id, obj_id, mass_scales, com_offsets=None):
@@ -912,7 +920,12 @@ class IsaacLabEngine(engine.Engine):
         elif (control_mode == engine.ControlMode.torque):
             actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"], stiffness=0, damping=0, effort_limit=None)
         elif (control_mode == engine.ControlMode.pd_explicit):
-            actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"], stiffness=None, damping=None, effort_limit=None)
+            gains = self._pd_explicit_gains
+            assert(gains is not None), "pd_explicit needs pd_explicit_gains in the engine config"
+            actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"],
+                                              stiffness={k: float(v[0]) for k, v in gains.items()},
+                                              damping={k: float(v[1]) for k, v in gains.items()},
+                                              effort_limit={k: float(v[2]) for k, v in gains.items()})
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
 

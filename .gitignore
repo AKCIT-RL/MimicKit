@@ -10,3 +10,7 @@ wandb/
 crash_*.txt
 *.dmp.zip
 *.dmp.zip.toml
+
+# runs e logs locais (checkpoints de GB)
+output_lab/
+logs/

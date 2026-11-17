@@ -36,6 +36,15 @@ def sample_ball_vel(n, s_lo, s_hi, device):
     return torch.stack([sp * torch.cos(a), sp * torch.sin(a)], dim=-1)
 
 
+def sample_ball_vel_toward(pos_rel, s_lo, s_hi, jitter, device):
+    """[n, 2] heading-frame velocity pointing from the ball (pos_rel, robot at the origin) to the robot,
+    speed U[s_lo, s_hi], direction jittered by U[-jitter, jitter] rad."""
+    n = pos_rel.shape[0]
+    sp = s_lo + (s_hi - s_lo) * torch.rand([n], device=device)
+    a = torch.atan2(-pos_rel[:, 1], -pos_rel[:, 0]) + (2.0 * torch.rand([n], device=device) - 1.0) * jitter
+    return torch.stack([sp * torch.cos(a), sp * torch.sin(a)], dim=-1)
+
+
 def predict_rest(pos, vel, decel):
     """Rest point of a ball under constant deceleration: p + v |v| / (2 a). decel <= 0: the position."""
     if decel <= 0.0:
@@ -53,6 +62,8 @@ def capture_step(hold, dist, speed, dt, cap_dist, cap_speed):
 def touch_target_reward(rest, target, sigma):
     """exp(-(d / sigma)^2) of the predicted rest point to the target: >= 0, 'close is good enough'."""
     d = torch.linalg.norm(rest - target, dim=-1)
+    if torch.is_tensor(sigma):  # per-scenario sigma (area scenario: grows with the distance)
+        return torch.exp(-torch.square(d / torch.clamp(sigma, min=1.0e-6)))
     return torch.exp(-torch.square(d / max(sigma, 1.0e-6)))
 
 

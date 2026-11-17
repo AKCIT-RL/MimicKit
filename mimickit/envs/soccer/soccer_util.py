@@ -701,3 +701,73 @@ class GateClock:
     def info(self):
         return {"gate_clock": self.clock, "gate_idx": float(self.idx),
                 "gate_hold": float(self.hold), "gate_stalled_iters": float(self.stalled_iters)}
+
+
+def sample_kick_target(ball_xy, goal_xy, d_lo, d_hi, ang_max, field_length, field_width, field_offset, margin):
+    # type: (Tensor, Tensor, float, float, float, float, float, Tensor, float) -> Tensor
+    """Kick target T [N, 2] (world): d ~ U(d_lo, d_hi) from the ball, at an angle U(-ang_max, ang_max)
+    (rad) around the ball->goal direction, clamped into the field (margin from the lines)."""
+    n = ball_xy.shape[0]
+    to_goal = goal_xy - ball_xy
+    base = torch.atan2(to_goal[:, 1], to_goal[:, 0])
+    ang = base + (2.0 * torch.rand([n], device=ball_xy.device) - 1.0) * ang_max
+    d = d_lo + (d_hi - d_lo) * torch.rand([n], device=ball_xy.device)
+    tgt = ball_xy + d.unsqueeze(-1) * torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+    lo = field_offset + torch.tensor([-0.5 * field_length + margin, -0.5 * field_width + margin], device=ball_xy.device)
+    hi = field_offset + torch.tensor([0.5 * field_length - margin, 0.5 * field_width - margin], device=ball_xy.device)
+    return torch.max(torch.min(tgt, hi), lo)
+
+
+# ---------------------------------------------------------------------------
+# kick power (docs/t1/44): p in [0, 1] commands the ball launch speed
+# v0 = vmin + p * (vmax - vmin); the BT converts distance / arrival speed to p.
+
+def kick_pow_target_speed(p, vmin, vmax):
+    # type: (Tensor, float, float) -> Tensor
+    return vmin + p * (vmax - vmin)
+
+
+def compute_kick_pow_obs(p):
+    # type: (Tensor) -> Tensor
+    """Power block in the 5-float steering slots: [0, 0, p, -1, 0]. The (0, 0) direction and the -1 flag never
+    occur in the nav layout [unit dir, |v|, cos, sin] (unit dir) nor in the dribble layout [dir, |v|, 1, 0];
+    an all-zero block is the legacy kick (goal, full power)."""
+    z = torch.zeros_like(p)
+    return torch.stack([z, z, p, -torch.ones_like(p), z], dim=-1)
+
+
+def step_kick_pow(active, kick_event, ball_speed, ball_dir_xy, tgt_dir_xy, p, n, peak, derr, paid, paid_t,
+                  dt, window_steps, vmin, vmax, sig_a, sig_b, dir_sig_deg, retouch_s):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, int, float, float, float, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    """One step of the power-kick event logic (pure; the env stores the state).
+
+    State per env: n = steps since the first kick event (-1 = none yet), peak = ball peak speed in the window,
+    derr = direction error (deg) at the peak, paid, paid_t = time since payment.
+    The window opens on the first kick event; after window_steps steps the event is paid once:
+      r_speed = exp(-((peak - v0) / (sig_a + sig_b * v0))^2), r_dir = exp(-(derr / dir_sig_deg)^2).
+    A kick event within retouch_s after the payment counts as a retouch (penalty term = 1 per event).
+    tgt_dir_xy is the ball->target direction at the first contact (any norm); ball_dir_xy the ball velocity.
+    Returns (n, peak, derr, paid, paid_t, r_speed, r_dir, r_retouch, pay, err) with err = peak - v0 on pay."""
+    start = active & kick_event & (n < 0) & ~paid
+    n = torch.where(start, torch.zeros_like(n), n)
+    inwin = active & (n >= 0) & ~paid
+    bn = torch.linalg.norm(ball_dir_xy, dim=-1).clamp_min(1.0e-6)
+    tn = torch.linalg.norm(tgt_dir_xy, dim=-1).clamp_min(1.0e-6)
+    cos = ((ball_dir_xy * tgt_dir_xy).sum(-1) / (bn * tn)).clamp(-1.0, 1.0)
+    ang = torch.rad2deg(torch.acos(cos))
+    better = inwin & (ball_speed > peak)
+    peak = torch.where(better, ball_speed, peak)
+    derr = torch.where(better, ang, derr)
+    pay = inwin & (n >= window_steps)
+    v0 = kick_pow_target_speed(p, vmin, vmax)
+    err = peak - v0
+    sig = sig_a + sig_b * v0
+    r_speed = pay.float() * torch.exp(-torch.square(err / sig))
+    r_dir = pay.float() * torch.exp(-torch.square(derr / dir_sig_deg))
+    was_paid = paid
+    paid = paid | pay
+    paid_t = torch.where(pay, torch.zeros_like(paid_t), torch.where(was_paid, paid_t + dt, paid_t))
+    n = torch.where(inwin & ~pay, n + 1, n)
+    r_retouch = (active & was_paid & kick_event & (paid_t < retouch_s)).float()
+    err = torch.where(pay, err, torch.zeros_like(err))
+    return n, peak, derr, paid, paid_t, r_speed, r_dir, r_retouch, pay, err

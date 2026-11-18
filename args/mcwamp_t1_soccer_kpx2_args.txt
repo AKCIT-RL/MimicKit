@@ -1,0 +1,15 @@
+# kpx2: Lucas' kfjft (Isaac Gym, pd_explicit, delay from step 0) + kick power (docs/t1/44, exp power/kpx2).
+# Warm-start = kfj (base of kfjft). If the trained kfjft model.pt exists on the machine, point --model_file at it instead
+# and record the swap in experiments/power/kpx2.yaml.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpx2_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kfjft_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 200000000
+--out_dir output/t1_soccer_kpx2/
+--model_file output_lab/kfj_seed1/model.pt

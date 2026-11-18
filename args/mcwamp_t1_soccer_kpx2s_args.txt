@@ -1,6 +1,5 @@
 # kpx2s: Lucas' kfjft (Isaac Gym, pd_explicit, delay from step 0) + kick power (docs/t1/44, exp power/kpx2). Smoke: power weights 0 (diag only).
-# Warm-start = kfj (base of kfjft). If the trained kfjft model.pt exists on the machine, point --model_file at it instead
-# and record the swap in experiments/power/kpx2.yaml.
+# Warm-start = kfjft treinado do Lucas (n2k_ft_kfj_r2/model.pt, sha256 05e04f6a...); troca registrada em experiments/power/kpx2.yaml.
 --num_envs 2048
 --visualize false
 
@@ -12,4 +11,4 @@
 --save_int_models true
 --max_samples 6000000
 --out_dir output/t1_soccer_kpx2s/
---model_file output_lab/kfj_seed1/model.pt
+--model_file output_lab/kfjft/model.pt

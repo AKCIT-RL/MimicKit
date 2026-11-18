@@ -706,6 +706,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_window_steps = int(env_config.get("kick_pow_window_steps", 6))
         self._kick_pow_sigma_a = float(env_config.get("kick_pow_sigma_a", 0.3))
         self._kick_pow_sigma_b = float(env_config.get("kick_pow_sigma_b", 0.1))
+        self._kick_pow_tail_w = float(env_config.get("kick_pow_tail_w", 0.0))
+        self._kick_pow_tail_s = float(env_config.get("kick_pow_tail_s", 2.0))
         self._kick_pow_dir_sigma_deg = float(env_config.get("kick_pow_dir_sigma_deg", 10.0))
         self._kick_pow_retouch_s = float(env_config.get("kick_pow_retouch_s", 1.5))
         self._kick_pow_end_s = float(env_config.get("kick_pow_end_s", -1.0))  # >= 0: SUCC (soft) this long after pay
@@ -2524,7 +2526,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._kick_pow_p, self._kick_pow_n, self._kick_pow_peak, self._kick_pow_derr, self._kick_pow_paid,
                 self._kick_pow_paid_t, self._engine.get_timestep(), self._kick_pow_window_steps,
                 self._kick_pow_vmin, self._kick_pow_vmax, self._kick_pow_sigma_a, self._kick_pow_sigma_b,
-                self._kick_pow_dir_sigma_deg, self._kick_pow_retouch_s)
+                self._kick_pow_dir_sigma_deg, self._kick_pow_retouch_s,
+                self._kick_pow_tail_w, self._kick_pow_tail_s)
             # power episodes: the strength and goal terms are off (the speed term replaces them)
             keep = (~pow_act).float()
             kick_contact_r = kick_contact_r * keep

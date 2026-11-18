@@ -737,14 +737,15 @@ def compute_kick_pow_obs(p):
 
 
 def step_kick_pow(active, kick_event, ball_speed, ball_dir_xy, tgt_dir_xy, p, n, peak, derr, paid, paid_t,
-                  dt, window_steps, vmin, vmax, sig_a, sig_b, dir_sig_deg, retouch_s):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, int, float, float, float, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+                  dt, window_steps, vmin, vmax, sig_a, sig_b, dir_sig_deg, retouch_s, tail_w=0.0, tail_s=2.0):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, int, float, float, float, float, float, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
     """One step of the power-kick event logic (pure; the env stores the state).
 
     State per env: n = steps since the first kick event (-1 = none yet), peak = ball peak speed in the window,
     derr = direction error (deg) at the peak, paid, paid_t = time since payment.
     The window opens on the first kick event; after window_steps steps the event is paid once:
-      r_speed = exp(-((peak - v0) / (sig_a + sig_b * v0))^2), r_dir = exp(-(derr / dir_sig_deg)^2).
+      r_speed = exp(-((peak - v0) / (sig_a + sig_b * v0))^2) + tail_w * exp(-|peak - v0| / tail_s), r_dir = exp(-(derr / dir_sig_deg)^2).
+    tail_w > 0 adds a heavy-tailed (Laplace) term so the speed reward keeps a gradient far from v0 (default 0: unchanged).
     A kick event within retouch_s after the payment counts as a retouch (penalty term = 1 per event).
     tgt_dir_xy is the ball->target direction at the first contact (any norm); ball_dir_xy the ball velocity.
     Returns (n, peak, derr, paid, paid_t, r_speed, r_dir, r_retouch, pay, err) with err = peak - v0 on pay."""
@@ -762,7 +763,7 @@ def step_kick_pow(active, kick_event, ball_speed, ball_dir_xy, tgt_dir_xy, p, n,
     v0 = kick_pow_target_speed(p, vmin, vmax)
     err = peak - v0
     sig = sig_a + sig_b * v0
-    r_speed = pay.float() * torch.exp(-torch.square(err / sig))
+    r_speed = pay.float() * (torch.exp(-torch.square(err / sig)) + tail_w * torch.exp(-torch.abs(err) / tail_s))
     r_dir = pay.float() * torch.exp(-torch.square(derr / dir_sig_deg))
     was_paid = paid
     paid = paid | pay

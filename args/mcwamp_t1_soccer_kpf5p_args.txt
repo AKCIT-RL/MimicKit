@@ -1,0 +1,14 @@
+# kpf5p: kpf4p with aux_style_weight 10 -> 2 (exp power/kpf5).
+# Warm-start = kpf3 model_0000000820 (output_lab/kpf5p_ws/model.pt, sha256 em experiments/power/kpf5.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf4p_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpf5_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 25000000
+--out_dir output/t1_soccer_kpf5p/
+--model_file output_lab/kpf5p_ws/model.pt

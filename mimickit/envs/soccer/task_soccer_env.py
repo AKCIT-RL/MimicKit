@@ -699,6 +699,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_vmin = float(env_config.get("kick_pow_vmin", 0.8))
         self._kick_pow_vmax = float(env_config.get("kick_pow_vmax", 7.0))
         self._kick_pow_p_lo = float(env_config.get("kick_pow_p_lo", 0.0))
+        self._kick_pow_p_slot4 = bool(env_config.get("kick_pow_p_slot4", False))  # kpx5: p also in steering slot 4
         self._kick_pow_p_lo_start = float(env_config.get("kick_pow_p_lo_start", self._kick_pow_p_lo))
         self._kick_pow_p_lo_start_samples = int(env_config.get("kick_pow_p_lo_start_samples", -1))
         self._kick_pow_p_lo_end_samples = int(env_config.get("kick_pow_p_lo_end_samples", -1))
@@ -1832,7 +1833,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 act = act[env_ids]
                 pw = pw[env_ids]
             if (act.any()):
-                steer_obs = torch.where(act.unsqueeze(-1), soccer_util.compute_kick_pow_obs(pw), steer_obs)
+                steer_obs = torch.where(act.unsqueeze(-1), soccer_util.compute_kick_pow_obs(pw, self._kick_pow_p_slot4), steer_obs)
         return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
 
     def _compute_measurable_frame(self, env_ids=None):

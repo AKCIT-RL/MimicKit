@@ -727,13 +727,15 @@ def kick_pow_target_speed(p, vmin, vmax):
     return vmin + p * (vmax - vmin)
 
 
-def compute_kick_pow_obs(p):
-    # type: (Tensor) -> Tensor
+def compute_kick_pow_obs(p, p_slot4=False):
+    # type: (Tensor, bool) -> Tensor
     """Power block in the 5-float steering slots: [0, 0, p, -1, 0]. The (0, 0) direction and the -1 flag never
     occur in the nav layout [unit dir, |v|, cos, sin] (unit dir) nor in the dribble layout [dir, |v|, 1, 0];
-    an all-zero block is the legacy kick (goal, full power)."""
+    an all-zero block is the legacy kick (goal, full power). p_slot4 (exp power/kpx5) repeats p in the last slot:
+    [0, 0, p, -1, p], an unsaturated copy of p for a warm-start whose frozen normalizer saturates slot 2."""
     z = torch.zeros_like(p)
-    return torch.stack([z, z, p, -torch.ones_like(p), z], dim=-1)
+    last = p if p_slot4 else z
+    return torch.stack([z, z, p, -torch.ones_like(p), last], dim=-1)
 
 
 def step_kick_pow(active, kick_event, ball_speed, ball_dir_xy, tgt_dir_xy, p, n, peak, derr, paid, paid_t,

@@ -1,0 +1,14 @@
+# kpx5s: p also in steering slot 4 (exp power/kpx5); warm-start = kpx2 int_model with slots 0,1,4 normalizer patched.
+# Warm-start = kpx2 int_model (output_lab/kpx2_wsN/model.pt, sha256 em experiments/power/kpx5.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpx5_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kfjft_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpx5s/
+--model_file output_lab/kpx5_ws/model.pt

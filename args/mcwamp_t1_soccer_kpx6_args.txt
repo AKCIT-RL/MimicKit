@@ -1,0 +1,14 @@
+# kpx6: adaptive top-down p curriculum + skill-learning agent (exp power/kpx6); warm-start = kpx5 it500.
+# Warm-start = kpx5 int_model_0000000500 (output_lab/kpx6_ws/model.pt, sha256 em experiments/power/kpx6.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpx6_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_kpx6/
+--model_file output_lab/kpx6_ws/model.pt

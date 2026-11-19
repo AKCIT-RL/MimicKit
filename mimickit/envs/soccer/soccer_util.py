@@ -727,6 +727,17 @@ def kick_pow_target_speed(p, vmin, vmax):
     return vmin + p * (vmax - vmin)
 
 
+def update_kick_pow_adapt(lo, n_ev, n_ok, min_events, thr, step, lo_min):
+    """Adaptive top-down power curriculum (exp power/kpx6). The frontier is p in [lo, lo + win); once it has
+    min_events paid kicks, lo drops by `step` (floored at lo_min) when their ok rate (|v - v0| <= tol) is >= thr.
+    The window restarts either way. Returns (lo, n_ev, n_ok, decided)."""
+    if (n_ev < min_events):
+        return lo, n_ev, n_ok, False
+    if (float(n_ok) / float(n_ev) >= thr):
+        lo = max(lo - step, lo_min)
+    return lo, 0, 0, True
+
+
 def compute_kick_pow_obs(p, p_slot4=False):
     # type: (Tensor, bool) -> Tensor
     """Power block in the 5-float steering slots: [0, 0, p, -1, 0]. The (0, 0) direction and the -1 flag never

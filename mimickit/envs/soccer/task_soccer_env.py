@@ -704,6 +704,19 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_p_lo_start_samples = int(env_config.get("kick_pow_p_lo_start_samples", -1))
         self._kick_pow_p_lo_end_samples = int(env_config.get("kick_pow_p_lo_end_samples", -1))
         self._kick_pow_p_fixed = float(env_config.get("kick_pow_p_fixed", -1.0))  # >= 0: eval at a fixed p
+        # kpx6: adaptive top-down curriculum on p (soccer_util.update_kick_pow_adapt); off by default
+        self._kick_pow_adapt = bool(env_config.get("kick_pow_adapt", False))
+        self._kick_pow_adapt_lo = float(env_config.get("kick_pow_adapt_lo_start", 0.68))
+        self._kick_pow_adapt_lo_min = float(env_config.get("kick_pow_adapt_lo_min", 0.0))
+        self._kick_pow_adapt_win = float(env_config.get("kick_pow_adapt_win", 0.15))
+        self._kick_pow_adapt_front_prob = float(env_config.get("kick_pow_adapt_front_prob", 0.5))
+        self._kick_pow_adapt_thr = float(env_config.get("kick_pow_adapt_thr", 0.5))
+        self._kick_pow_adapt_step = float(env_config.get("kick_pow_adapt_step", 0.05))
+        self._kick_pow_adapt_min_events = int(env_config.get("kick_pow_adapt_min_events", 300))
+        self._kick_pow_adapt_every = int(env_config.get("kick_pow_adapt_every", 30))
+        self._kick_pow_adapt_tick = 0
+        self._kick_pow_adapt_n_ev = 0
+        self._kick_pow_adapt_n_ok = 0
         self._kick_pow_window_steps = int(env_config.get("kick_pow_window_steps", 6))
         self._kick_pow_sigma_a = float(env_config.get("kick_pow_sigma_a", 0.3))
         self._kick_pow_sigma_b = float(env_config.get("kick_pow_sigma_b", 0.1))
@@ -2548,6 +2561,22 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 inb = (v0 >= lo_v) & (v0 < hi_v)
                 d.add_sum("kick_pow_pay_b%d" % b, (pow_pay & inb).float())
                 d.add_sum("kick_pow_ok_b%d" % b, (okp & inb).float())
+            if (self._kick_pow_adapt):
+                front = pow_pay & (self._kick_pow_p >= self._kick_pow_adapt_lo) \
+                    & (self._kick_pow_p < self._kick_pow_adapt_lo + self._kick_pow_adapt_win)
+                if (not hasattr(self, "_kick_pow_adapt_acc")):
+                    self._kick_pow_adapt_acc = torch.zeros(2, device=self._device)
+                self._kick_pow_adapt_acc += torch.stack([front.float().sum(), (front & okp).float().sum()])
+                self._kick_pow_adapt_tick += 1
+                if (self._kick_pow_adapt_tick % self._kick_pow_adapt_every == 0):
+                    acc = self._kick_pow_adapt_acc.tolist()
+                    self._kick_pow_adapt_acc.zero_()
+                    (self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev, self._kick_pow_adapt_n_ok, _) = \
+                        soccer_util.update_kick_pow_adapt(
+                            self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev + int(acc[0]),
+                            self._kick_pow_adapt_n_ok + int(acc[1]), self._kick_pow_adapt_min_events,
+                            self._kick_pow_adapt_thr, self._kick_pow_adapt_step, self._kick_pow_adapt_lo_min)
+                d.add_mean("kick_pow_adapt_lo", torch.full_like(v0, self._kick_pow_adapt_lo))
         self._update_kick_diag(ball_pos, ball_vel, ball_speed, foot_d)
         self._prev_foot_ball_dist[:] = foot_d
         self._prev_ball_speed[:] = ball_speed
@@ -5189,7 +5218,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 prog = soccer_util.compute_curriculum_progress(
                     self._get_schedule_samples(), self._kick_pow_p_lo_start_samples, self._kick_pow_p_lo_end_samples)
                 lo = self._kick_pow_p_lo_start + prog * (self._kick_pow_p_lo - self._kick_pow_p_lo_start)
-            p = lo + (1.0 - lo) * torch.rand([n], device=self._device)
+            if (self._kick_pow_adapt):
+                # half of the draws on the frontier [lo, lo + win), the rest on [lo, 1]
+                lo = self._kick_pow_adapt_lo
+                hi = torch.where(torch.rand([n], device=self._device) < self._kick_pow_adapt_front_prob,
+                                 torch.full([n], min(lo + self._kick_pow_adapt_win, 1.0), device=self._device),
+                                 torch.ones([n], device=self._device))
+                p = lo + (hi - lo) * torch.rand([n], device=self._device)
+            else:
+                p = lo + (1.0 - lo) * torch.rand([n], device=self._device)
         self._kick_pow_on[env_ids] = use
         self._kick_pow_p[env_ids] = torch.where(use, p, torch.zeros_like(p))
         self._kick_pow_n[env_ids] = -1

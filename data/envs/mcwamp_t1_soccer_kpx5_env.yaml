@@ -1,5 +1,5 @@
 # kpx5 (exp power/kpx5): kpx3 recipe (p ~ U(0,1), vmax 5.5, tail 0.5) + p also in steering slot 4 (kick_pow_p_slot4), whose
-# normalizer is patched to mean 0/std 1 (tools/lab/patch_obs_norm_steer.py --roles 0,1,4); slots 2,3 keep kpx2's saturated values.
+# normalizer is patched to mean 0/std 1 (tools/lab/patch_obs_norm_steer.py --roles 0,1,4 --zero_w_roles 0,1,4: first-layer weights of those slots cut, bias-compensated); slots 2,3 keep kpx2's saturated values.
 # kpx2: Lucas' kfjft (kfj + Gym pd_explicit, action delay from step 0, torque-sat, joint limit on action; filter 0.5 kept) + kick power block of kpx1 (docs/t1/44, exp power/kpx2)
 # kfjft (2026-11-17, Lucas): actuator/delay fine-tune of the n2k teacher kfj in Isaac Gym (pd_explicit).
 # Byte-identical to the env_config.yaml saved in the kfj run (deploy/n2k_it200_insumos/teachers/kfj_env_config.yaml).

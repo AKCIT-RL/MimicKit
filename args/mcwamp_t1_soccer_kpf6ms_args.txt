@@ -1,0 +1,14 @@
+# kpf6ms: kpf4m (v0 3.3) with kick_pow_mask_dir true (exp power/kpf6).
+# Warm-start = kpf3 model_0000000320 (output_lab/kpf6m_ws/model.pt, sha256 em experiments/power/kpf6.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf6m_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpf6ms/
+--model_file output_lab/kpf6m_ws/model.pt

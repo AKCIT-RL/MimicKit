@@ -1,0 +1,14 @@
+# kpf6pc: continuation of kpf6p (final, it381) with the same config (exp power/kpf6).
+# Warm-start = kpf6p model.pt (it381) (output_lab/kpf6pc_ws/model.pt, sha256 em experiments/power/kpf6.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf6p_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 25000000
+--out_dir output/t1_soccer_kpf6pc/
+--model_file output_lab/kpf6pc_ws/model.pt

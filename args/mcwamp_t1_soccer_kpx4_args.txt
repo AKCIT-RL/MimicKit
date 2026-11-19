@@ -1,0 +1,14 @@
+# kpx4: Lucas' kfjft (Isaac Gym, pd_explicit, delay from step 0) + kick power (docs/t1/44, exp power/kpx2).
+# Warm-start = kpx2 int_model (output_lab/kpx2_wsN/model.pt, sha256 em experiments/power/kpx4.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpx4_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kfjft_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 200000000
+--out_dir output/t1_soccer_kpx4/
+--model_file output_lab/kpx4_ws/model.pt

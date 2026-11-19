@@ -714,6 +714,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_adapt_step = float(env_config.get("kick_pow_adapt_step", 0.05))
         self._kick_pow_adapt_min_events = int(env_config.get("kick_pow_adapt_min_events", 300))
         self._kick_pow_adapt_every = int(env_config.get("kick_pow_adapt_every", 30))
+        # kpf2: >= 0 switches the ladder criterion to |mean signed error| <= bias_tol (update_kick_pow_adapt_bias)
+        self._kick_pow_adapt_bias_tol = float(env_config.get("kick_pow_adapt_bias_tol", -1.0))
+        self._kick_pow_adapt_s_err = 0.0
         self._kick_pow_adapt_tick = 0
         self._kick_pow_adapt_n_ev = 0
         self._kick_pow_adapt_n_ok = 0
@@ -2552,6 +2555,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             d.add_mean("kick_pow_frac", pow_act.float())
             d.add_sum("kick_pow_pay", pow_pay.float())
             d.add_sum("kick_pow_abserr", torch.abs(pow_err) * pow_pay.float())
+            d.add_sum("kick_pow_err", pow_err * pow_pay.float())  # signed (peak - v0), kpf2
             d.add_sum("kick_pow_ok", (pow_pay & (torch.abs(pow_err) <= 0.5)).float())
             d.add_sum("kick_pow_derr", self._kick_pow_derr * pow_pay.float())
             d.add_sum("kick_pow_retouch_ev", pow_retouch_r)
@@ -2565,17 +2569,25 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 front = pow_pay & (self._kick_pow_p >= self._kick_pow_adapt_lo) \
                     & (self._kick_pow_p < self._kick_pow_adapt_lo + self._kick_pow_adapt_win)
                 if (not hasattr(self, "_kick_pow_adapt_acc")):
-                    self._kick_pow_adapt_acc = torch.zeros(2, device=self._device)
-                self._kick_pow_adapt_acc += torch.stack([front.float().sum(), (front & okp).float().sum()])
+                    self._kick_pow_adapt_acc = torch.zeros(3, device=self._device)
+                self._kick_pow_adapt_acc += torch.stack([front.float().sum(), (front & okp).float().sum(),
+                                                         (pow_err * front.float()).sum()])
                 self._kick_pow_adapt_tick += 1
                 if (self._kick_pow_adapt_tick % self._kick_pow_adapt_every == 0):
                     acc = self._kick_pow_adapt_acc.tolist()
                     self._kick_pow_adapt_acc.zero_()
-                    (self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev, self._kick_pow_adapt_n_ok, _) = \
-                        soccer_util.update_kick_pow_adapt(
-                            self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev + int(acc[0]),
-                            self._kick_pow_adapt_n_ok + int(acc[1]), self._kick_pow_adapt_min_events,
-                            self._kick_pow_adapt_thr, self._kick_pow_adapt_step, self._kick_pow_adapt_lo_min)
+                    if (self._kick_pow_adapt_bias_tol >= 0.0):
+                        (self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev, self._kick_pow_adapt_s_err, _) = \
+                            soccer_util.update_kick_pow_adapt_bias(
+                                self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev + int(acc[0]),
+                                self._kick_pow_adapt_s_err + float(acc[2]), self._kick_pow_adapt_min_events,
+                                self._kick_pow_adapt_bias_tol, self._kick_pow_adapt_step, self._kick_pow_adapt_lo_min)
+                    else:
+                        (self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev, self._kick_pow_adapt_n_ok, _) = \
+                            soccer_util.update_kick_pow_adapt(
+                                self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev + int(acc[0]),
+                                self._kick_pow_adapt_n_ok + int(acc[1]), self._kick_pow_adapt_min_events,
+                                self._kick_pow_adapt_thr, self._kick_pow_adapt_step, self._kick_pow_adapt_lo_min)
                 d.add_mean("kick_pow_adapt_lo", torch.full_like(v0, self._kick_pow_adapt_lo))
         self._update_kick_diag(ball_pos, ball_vel, ball_speed, foot_d)
         self._prev_foot_ball_dist[:] = foot_d
@@ -3201,6 +3213,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             pr = lambda a, b: a / b if b > 0.0 else 0.0
             diags["kick_pow_pay_rate"] = pr(pays, sums.get("kick_pow_ep_done", 0.0))
             diags["kick_pow_abserr"] = pr(sums.get("kick_pow_abserr", 0.0), pays)
+            diags["kick_pow_err"] = pr(sums.get("kick_pow_err", 0.0), pays)
             diags["kick_pow_ok_rate"] = pr(sums.get("kick_pow_ok", 0.0), pays)
             diags["kick_pow_derr_deg"] = pr(sums.get("kick_pow_derr", 0.0), pays)
             diags["kick_pow_retouch_rate"] = pr(sums.get("kick_pow_retouch_ev", 0.0), pays)

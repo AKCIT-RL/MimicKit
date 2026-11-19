@@ -738,6 +738,18 @@ def update_kick_pow_adapt(lo, n_ev, n_ok, min_events, thr, step, lo_min):
     return lo, 0, 0, True
 
 
+def update_kick_pow_adapt_bias(lo, n_ev, s_err, min_events, bias_tol, step, lo_min):
+    """Ladder variant of update_kick_pow_adapt (exp power/kpf2): lo drops by `step` once the frontier's mean SIGNED
+    speed error (peak - v0) over >= min_events paid kicks is within bias_tol. The exploration noise widens the spread
+    of the kicks (training ok rate ~0.3 while the deterministic eval gives 0.6) but barely moves their mean.
+    Returns (lo, n_ev, s_err, decided)."""
+    if (n_ev < min_events):
+        return lo, n_ev, s_err, False
+    if (abs(float(s_err) / float(n_ev)) <= bias_tol):
+        lo = max(lo - step, lo_min)
+    return lo, 0, 0.0, True
+
+
 def compute_kick_pow_obs(p, p_slot4=False):
     # type: (Tensor, bool) -> Tensor
     """Power block in the 5-float steering slots: [0, 0, p, -1, 0]. The (0, 0) direction and the -1 flag never

@@ -700,6 +700,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_vmax = float(env_config.get("kick_pow_vmax", 7.0))
         self._kick_pow_p_lo = float(env_config.get("kick_pow_p_lo", 0.0))
         self._kick_pow_p_slot4 = bool(env_config.get("kick_pow_p_slot4", False))  # kpx5: p also in steering slot 4
+        # kpf6: kick_direction pays ~linearly in ball speed (100 * (v - min_vel), decayed); on in power episodes it
+        # pulls the kick above v0. True masks it there (pow_dir_r already scores the aim)
+        self._kick_pow_mask_dir = bool(env_config.get("kick_pow_mask_dir", False))
         self._kick_pow_p_lo_start = float(env_config.get("kick_pow_p_lo_start", self._kick_pow_p_lo))
         self._kick_pow_p_lo_start_samples = int(env_config.get("kick_pow_p_lo_start_samples", -1))
         self._kick_pow_p_lo_end_samples = int(env_config.get("kick_pow_p_lo_end_samples", -1))
@@ -2553,6 +2556,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             impulse_r = impulse_r * keep
             overspeed_r = overspeed_r * keep
             progress_r = progress_r * keep
+            if (self._kick_pow_mask_dir):
+                dir_r = dir_r * keep
             d = self._diag
             d.add_mean("kick_pow_frac", pow_act.float())
             d.add_sum("kick_pow_pay", pow_pay.float())

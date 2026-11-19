@@ -1,0 +1,14 @@
+# kpf3: fixed-power ladder fed by deterministic test kicks (exp power/kpf3).
+# Warm-start = kpf2 smoke model.pt (3M; output_lab/kpf3_ws/model.pt, sha256 em experiments/power/kpf3.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf3_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpf3_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 150000000
+--out_dir output/t1_soccer_kpf3/
+--model_file output_lab/kpf3_ws/model.pt

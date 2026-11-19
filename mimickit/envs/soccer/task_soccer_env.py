@@ -717,6 +717,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # kpf2: >= 0 switches the ladder criterion to |mean signed error| <= bias_tol (update_kick_pow_adapt_bias)
         self._kick_pow_adapt_bias_tol = float(env_config.get("kick_pow_adapt_bias_tol", -1.0))
         self._kick_pow_adapt_s_err = 0.0
+        # kpf3: count only the deterministic test-phase kicks (the exploration noise biases training kicks low)
+        self._kick_pow_adapt_test_only = bool(env_config.get("kick_pow_adapt_test_only", False))
         self._kick_pow_adapt_tick = 0
         self._kick_pow_adapt_n_ev = 0
         self._kick_pow_adapt_n_ok = 0
@@ -2565,7 +2567,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 inb = (v0 >= lo_v) & (v0 < hi_v)
                 d.add_sum("kick_pow_pay_b%d" % b, (pow_pay & inb).float())
                 d.add_sum("kick_pow_ok_b%d" % b, (okp & inb).float())
-            if (self._kick_pow_adapt):
+            if (self._kick_pow_adapt and (not self._kick_pow_adapt_test_only
+                                          or self._mode == base_env.EnvMode.TEST)):
                 front = pow_pay & (self._kick_pow_p >= self._kick_pow_adapt_lo) \
                     & (self._kick_pow_p < self._kick_pow_adapt_lo + self._kick_pow_adapt_win)
                 if (not hasattr(self, "_kick_pow_adapt_acc")):
@@ -2588,6 +2591,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                                 self._kick_pow_adapt_lo, self._kick_pow_adapt_n_ev + int(acc[0]),
                                 self._kick_pow_adapt_n_ok + int(acc[1]), self._kick_pow_adapt_min_events,
                                 self._kick_pow_adapt_thr, self._kick_pow_adapt_step, self._kick_pow_adapt_lo_min)
+            if (self._kick_pow_adapt):
                 d.add_mean("kick_pow_adapt_lo", torch.full_like(v0, self._kick_pow_adapt_lo))
         self._update_kick_diag(ball_pos, ball_vel, ball_speed, foot_d)
         self._prev_foot_ball_dist[:] = foot_d

@@ -1,0 +1,13 @@
+# kpf7ls: kpf6 recipe at v0 1.4 (exp power/kpf7). Warm-start = kpf6pc-final (pico 2,17) (output_lab/kpf7l_ws/model.pt, sha256 em experiments/power/kpf7.yaml).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf7l_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpf7ls/
+--model_file output_lab/kpf7l_ws/model.pt

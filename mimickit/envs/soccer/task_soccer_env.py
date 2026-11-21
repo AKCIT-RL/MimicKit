@@ -706,6 +706,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # n9b: in power episodes the per-event kick-shape terms (chapa, pitch target, toe face/out, strike dir, medial)
         # pay only on the first kick event; otherwise every extra contact step of a harder kick pays them again
         self._kick_pow_shape_first_only = bool(env_config.get("kick_pow_shape_first_only", False))
+        # n9d: share of the power episodes that start like the spatial benchmark (tools/lab/eval_kick_pow_lab.py):
+        # stand pose at the field centre, ball still at r U(0.5, 2.5) m, angle U(-40, 40) deg ahead (0: off)
+        self._kick_pow_bench_start_prob = float(env_config.get("kick_pow_bench_start_prob", 0.0))
         # exp power/kpf7x3: keep the legacy (all-zero) steering block in power episodes, so a pre-power kicker
         # (kfjft) can be fine-tuned as a fixed-power teacher without seeing an observation it never met
         self._kick_pow_obs_zero = bool(env_config.get("kick_pow_obs_zero", False))
@@ -3481,6 +3484,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             # key-body obs will mix the old pose with the new root position
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
+            if (self._kick_pow_enable and self._kick_pow_bench_start_prob > 0.0):
+                self._kick_pow_bench_start(env_ids)
             self._reset_nav_mode(env_ids)
             self._reset_drib_mode(env_ids)
             if (self._virtual_perception):
@@ -5242,6 +5247,63 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_tgt_on[env_ids] = use
         if (self._kick_pow_enable):
             self._resample_kick_pow(env_ids, use)
+        return
+
+    def _kick_pow_bench_start(self, env_ids):
+        """n9d: a kick_pow_bench_start_prob share of the power episodes starts as the spatial benchmark does
+        (reset_to_spatial_benchmark + the ball draw of eval_kick_pow_lab), keeping p; the target is redrawn
+        around the new ball. Runs inside _reset_envs right after _reset_ball."""
+        sel = self._kick_pow_on[env_ids] & \
+            (torch.rand([env_ids.shape[0]], device=self._device) < self._kick_pow_bench_start_prob)
+        ids = env_ids[sel]
+        n = ids.shape[0]
+        if (n == 0):
+            return
+        char_id = self._get_char_id()
+        root_pos = self._init_root_pos.unsqueeze(0).repeat(n, 1)
+        if (self._stand_start_root_z is not None):
+            root_pos[:, 2] = self._stand_start_root_z
+        root_pos[:, 0:2] = self._field_offset[ids]
+        root_pos[:, 2] += self._ground_z(ids)
+        root_rot = self._init_root_rot.unsqueeze(0).repeat(n, 1)
+        init_dof = self._init_dof_pos if self._stand_start_dof_pos is None else self._stand_start_dof_pos
+        zero_vel = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        self._engine.set_root_pos(ids, char_id, root_pos)
+        self._engine.set_root_rot(ids, char_id, root_rot)
+        self._engine.set_root_vel(ids, char_id, zero_vel)
+        self._engine.set_root_ang_vel(ids, char_id, zero_vel)
+        self._engine.set_dof_pos(ids, char_id, init_dof.unsqueeze(0).repeat(n, 1))
+        self._engine.set_dof_vel(ids, char_id, 0.0)
+        self._engine.set_body_vel(ids, char_id, 0.0)
+        self._engine.set_body_ang_vel(ids, char_id, 0.0)
+        self._reset_char_rigid_body_state(ids)
+
+        r = 0.5 + 2.0 * torch.rand([n], device=self._device)
+        th = torch.deg2rad(-40.0 + 80.0 * torch.rand([n], device=self._device))
+        ball_id = self._get_ball_id()
+        ball_pos = torch.zeros([n, 3], device=self._device, dtype=torch.float)
+        ball_pos[:, 0] = r * torch.cos(th) + self._field_offset[ids, 0]
+        ball_pos[:, 1] = r * torch.sin(th) + self._field_offset[ids, 1]
+        ball_pos[:, 2] = self._ball_radius + self._ground_z(ids)
+        ball_rot = torch.zeros([n, 4], device=self._device, dtype=torch.float)
+        ball_rot[:, 3] = 1.0
+        self._engine.set_root_pos(ids, ball_id, ball_pos)
+        self._engine.set_root_rot(ids, ball_id, ball_rot)
+        self._engine.set_root_vel(ids, ball_id, zero_vel)
+        self._engine.set_root_ang_vel(ids, ball_id, zero_vel)
+        self._prev_ball_pos[ids] = ball_pos
+        self._reset_kick_prev(ids, ball_pos)
+
+        goal = self._goal_pos[ids]
+        if (self._kick_tgt_ang_start_samples >= 0):
+            prog = soccer_util.compute_curriculum_progress(
+                self._get_schedule_samples(), self._kick_tgt_ang_start_samples, self._kick_tgt_ang_end_samples)
+            amax = self._kick_tgt_ang_deg_start + prog * (self._kick_tgt_ang_deg - self._kick_tgt_ang_deg_start)
+        else:
+            amax = self._kick_tgt_ang_deg
+        self._kick_tgt[ids] = soccer_util.sample_kick_target(
+            ball_pos[:, 0:2], goal, self._kick_tgt_dist[0], self._kick_tgt_dist[1], float(np.deg2rad(amax)),
+            self._field_length, self._field_width, self._field_offset[ids], self._ball_spawn_margin)
         return
 
     def _resample_kick_pow(self, env_ids, use):

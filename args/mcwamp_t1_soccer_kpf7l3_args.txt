@@ -1,0 +1,13 @@
+# kpf7l3: kpf7l it250 continued at v0 1.25, retouch -500 (exp power/kpf7). Warm-start = kpf7l int_models/model_0000000250.pt (sha256 5149152d...).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf7l3_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 10000000
+--out_dir output/t1_soccer_kpf7l3/
+--model_file output_lab/kpf7l3_ws/model.pt

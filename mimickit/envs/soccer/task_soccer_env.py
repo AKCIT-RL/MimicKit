@@ -703,6 +703,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # kpf6: kick_direction pays ~linearly in ball speed (100 * (v - min_vel), decayed); on in power episodes it
         # pulls the kick above v0. True masks it there (pow_dir_r already scores the aim)
         self._kick_pow_mask_dir = bool(env_config.get("kick_pow_mask_dir", False))
+        # n9b: in power episodes the per-event kick-shape terms (chapa, pitch target, toe face/out, strike dir, medial)
+        # pay only on the first kick event; otherwise every extra contact step of a harder kick pays them again
+        self._kick_pow_shape_first_only = bool(env_config.get("kick_pow_shape_first_only", False))
         # exp power/kpf7x3: keep the legacy (all-zero) steering block in power episodes, so a pre-power kicker
         # (kfjft) can be fine-tuned as a fixed-power teacher without seeing an observation it never met
         self._kick_pow_obs_zero = bool(env_config.get("kick_pow_obs_zero", False))
@@ -2561,6 +2564,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             progress_r = progress_r * keep
             if (self._kick_pow_mask_dir):
                 dir_r = dir_r * keep
+            self._diag.add_sum("kick_pow_shape_ev", (pow_act & kick_event).float())
+            if (self._kick_pow_shape_first_only):
+                first = torch.where(pow_act, start, torch.ones_like(start)).float()
+                chapa_r = chapa_r * first
+                ptarget_r = ptarget_r * first
+                toe_face_r = toe_face_r * first
+                toe_out_r = toe_out_r * first
+                strike_dir_r = strike_dir_r * first
+                medial_r = medial_r * first
             d = self._diag
             d.add_mean("kick_pow_frac", pow_act.float())
             d.add_sum("kick_pow_pay", pow_pay.float())
@@ -3229,6 +3241,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             diags["kick_pow_ok_rate"] = pr(sums.get("kick_pow_ok", 0.0), pays)
             diags["kick_pow_derr_deg"] = pr(sums.get("kick_pow_derr", 0.0), pays)
             diags["kick_pow_retouch_rate"] = pr(sums.get("kick_pow_retouch_ev", 0.0), pays)
+            diags["kick_pow_events_per_pay"] = pr(sums.get("kick_pow_shape_ev", 0.0), pays)
             for b in range(3):
                 diags["kick_pow_ok_rate_b%d" % b] = pr(sums.get("kick_pow_ok_b%d" % b, 0.0),
                                                        sums.get("kick_pow_pay_b%d" % b, 0.0))

@@ -1,0 +1,13 @@
+# n9es (exp power/n9e): n9d with kick_tgt_prob 1.0 and kick_pow_bench_start_prob 1.0.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_n9e_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_n9c_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_n9es/
+--model_file output_lab/n8b_final/model.pt

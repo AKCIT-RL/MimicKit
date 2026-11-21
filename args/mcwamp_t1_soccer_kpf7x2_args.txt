@@ -1,0 +1,13 @@
+# kpf7x2 (exp power/kpf7): kpf7x (kpf6 recipe, v0 5.5) with warm-start = kfjft (legacy kicker, peak median 5.48 at p=1 but ok 0.49: spread, not bias), was kpf1 it200 (kpf7x ok 0.60, peak 5.13). sha256 05e04f6a0b11b09b3c49a05efc184b54051108791091414bf9767d405fb7dee0.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf7x_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 15000000
+--out_dir output/t1_soccer_kpf7x2/
+--model_file output_lab/kpf7x2_ws/model.pt

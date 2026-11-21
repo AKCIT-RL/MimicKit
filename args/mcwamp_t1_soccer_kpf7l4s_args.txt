@@ -1,0 +1,13 @@
+# kpf7l4s (exp power/kpf7): kpf7l3 final continued 10M, same env (v0 1.25, retouch -500); kpf7l3 peak still falling 1.96 -> 1.46, ok 0.61-0.64. Warm-start sha256 e3941954630c5fda...
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf7l3_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpx6_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpf7l4s/
+--model_file output_lab/kpf7l4_ws/model.pt

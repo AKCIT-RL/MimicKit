@@ -1,0 +1,390 @@
+# kpf7x3 (exp power/kpf7): kpf7x env + kick_pow_obs_zero (power block left all-zero, the legacy kick obs) for a warm-start from kfjft; kpf7x2 (same warm-start, power block on) fell 100% from iteration 0.
+# kpf7x (exp power/kpf7): kpf6 recipe (kick_pow_mask_dir, sigma 0.15+0.05 v0, ladder frozen) at v0 5.5 m/s (p 0.999).
+# Warm-start: kpf1 it200 (pico 4,70). Gate points of eval_kick_pow_lab need teachers near 1.2/1.6, 3.0, 4.5, 5.5 m/s.
+# kpf6p (exp power/kpf6): kpf4p with kick_pow_mask_dir true only. kick_direction (w 100, ~linear in ball speed) stayed on
+# in power episodes and pulled the kick ~0.5 m/s above v0 (kpf4p control: err +0.34 -> +0.6); pow_dir_r already scores the aim.
+# kpf4p (exp power/kpf4): consolidation of the fixed-power teacher at v0 2.2 m/s (p 0.298, ladder frozen: lo_start = lo_min)
+# with a 2x narrower speed reward (sigma 0.15 + 0.05 v0, was 0.3 + 0.1 v0): kpf3 kept the median on target but
+# |v - v0| <= 0.5 plateaued at ~0.5 (the wide gaussian pays ~full for a 0.4 m/s miss). Warm-start: kpf3 model_0000000820.
+# kpf2 (exp power/kpf2): kpf1 with the ladder criterion |mean signed speed error| <= 0.2 m/s over >= 300 paid kicks
+# (kick_pow_adapt_bias_tol). kpf1's 70% ok threshold is unreachable under exploration noise (std 0.15): training ok ~0.31
+# while the deterministic eval gave ok 0.60 at v0 4.5 (peak 4.70). Teachers are still validated at the gate (eval ok >= 70%).
+# kpf1 (exp power/kpf1): fixed-power teacher ladder. kpx6 env with EVERY episode in power mode (kick_tgt_prob 1.0, no legacy)
+# and a single target speed per moment: p = lo (window 0.001, front_prob 1.0); lo starts at v0 4.5 m/s (0.787) and drops 0.03
+# (~0.14 m/s) whenever >= 70% of >= 300 paid kicks are within 0.5 m/s, down to v0 1.6 m/s (0.170). Checkpoints at
+# v0 ~3.5 and ~2.0 become the medium/pass teachers; the student (n8) picks among teachers by p.
+# kpx5 (exp power/kpx5): kpx3 recipe (p ~ U(0,1), vmax 5.5, tail 0.5) + p also in steering slot 4 (kick_pow_p_slot4), whose
+# normalizer is patched to mean 0/std 1 (tools/lab/patch_obs_norm_steer.py --roles 0,1,4 --zero_w_roles 0,1,4: first-layer weights of those slots cut, bias-compensated); slots 2,3 keep kpx2's saturated values.
+# kpx2: Lucas' kfjft (kfj + Gym pd_explicit, action delay from step 0, torque-sat, joint limit on action; filter 0.5 kept) + kick power block of kpx1 (docs/t1/44, exp power/kpx2)
+# kfjft (2026-11-17, Lucas): actuator/delay fine-tune of the n2k teacher kfj in Isaac Gym (pd_explicit).
+# Byte-identical to the env_config.yaml saved in the kfj run (deploy/n2k_it200_insumos/teachers/kfj_env_config.yaml).
+# Its clock (curriculum_sample_offset ~1229M) is past every gate/stage/switch, so DR runtime (kp/kd, bias, delay)
+# and pushes are on from the first step, as in the teacher run.
+env_name: task_soccer
+char_file: data/assets/t1_deploy/t1.xml
+camera_mode: track
+episode_length: 8.0
+global_obs: false
+root_height_obs: true
+pose_termination: false
+enable_phase_obs: false
+enable_tar_obs: false
+num_disc_obs_steps: 10
+rand_reset: true
+zero_center_action: true
+ref_char_offset:
+- 2.0
+- 0.0
+- 0.0
+init_pose:
+- 0
+- 0
+- 0.69
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+enable_early_termination: true
+key_bodies:
+- left_ankle_roll_link
+- right_ankle_roll_link
+- aahead_pitch_link
+- left_elbow_yaw_link
+- right_elbow_yaw_link
+contact_bodies:
+- left_knee_pitch_link
+- left_ankle_pitch_link
+- left_ankle_roll_link
+- right_knee_pitch_link
+- right_ankle_pitch_link
+- right_ankle_roll_link
+motion_file: data/datasets/dataset_t1_accad_walk_omni_kick_run_collider_med.yaml
+field_length: 14.0
+field_width: 9.0
+goal_width: 2.6
+ball_radius: 0.11
+spawn_margin: 1.0
+ball_soft_reset_far: false
+kick_direction_min_vel: 0.3
+visualize_field: true
+visualize_debug_arrows: true
+ball_spawn_min_dist: 0.3
+ball_spawn_margin: 0.4
+ball_goal_strip_prob: 0.0
+ball_goal_strip_min: 4.8
+ball_goal_core_prob: 0.0
+ball_goal_core_min: 5.6
+ball_goal_core_y: 1.5
+steer_speed_max: 2.0
+steer_stop_dist: 0.45
+steer_anneal_start_samples: 0
+steer_anneal_end_samples: 1
+ball_spawn_near: true
+ball_spawn_front_min: 0.5
+ball_spawn_front_max: 2.0
+ball_spawn_lateral: 0.25
+percep_curriculum_start_samples: 1000000000000
+percep_curriculum_end_samples: 1000000000001
+ball_curriculum_start_samples: 10000001
+ball_curriculum_end_samples: 15000000
+ball_curriculum_far_prob: 0.0
+curriculum_sample_offset: 1229000001.0
+ball_perturb_time_min: 4.0
+ball_perturb_time_max: 8.0
+ball_perturb_teleport_prob: 0.5
+ball_perturb_speed_min: 1.0
+ball_perturb_speed_max: 4.0
+rand_ball_props: true
+rand_ball_friction:
+- 0.1
+- 0.3
+rand_ball_restitution:
+- 0.0
+- 1.0
+domain_randomization: true
+dr_seed: 1
+rand_char_props: false
+char_push_enable: false
+measurable_obs: true
+measurable_hist_steps: 30
+virtual_perception: true
+percep_fov_body: aahead_pitch_link
+percep_fov_deg: 90.0
+reward_head_gaze_w: 0.0
+reward_goal_scored_w: 15.0
+reward_ball_approach_w: 50.0
+reward_goal_progress_w: 500.0
+reward_survival_w: 3.0
+reward_termination_w: -200.0
+reward_stagnation_w: -100.0
+reward_kick_sideways_w: 0.0
+reward_kick_forward_w: 0.0
+reward_foot_proximity_w: -5.0
+reward_action_rate_w: -1.0
+reward_joint_limit_w: -0.110531
+reward_knee_bend_w: 0.0
+knee_bend_min: 0.25
+reward_base_accel_w: -0.00073277
+reward_waiting_w: 0.0
+waiting_time_max: 3.0
+stagnation_window: 1.0
+stagnation_move_threshold: 0.1
+ball_contact_dist: 0.25
+foot_min_dist: 0.2
+kick_feet_bodies:
+- left_ankle_roll_link
+- right_ankle_roll_link
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+ball_event_gauss_start_samples: 20000001
+ball_event_gauss_end_samples: 25000000
+ball_event_gauss_prob: 0.0
+ball_event_gauss_sigma: 1.0
+percep_potential_freeze: true
+search_sweep_w: 0.0
+search_sweep_cap: 1.5
+reward_kick_alignment_w: 90.0
+reward_kick_position_w: 2.0
+kick_position_near_dist: 1.5
+ball_behind_start_samples: 20000001
+ball_behind_end_samples: 25000000
+ball_behind_prob: 0.5
+ball_behind_dist_min: 1.0
+ball_behind_dist_max: 4.0
+ball_behind_half_cone_deg: 60.0
+kick_alignment_power: 64.0
+reward_torso_lean_w: 0.0
+torso_lean_max: 0.15
+reward_arm_pose_w: -2.0
+arm_pose_tol: 0.15
+arm_pose_target:
+- 0.05
+- -1.25
+- -0.09
+- -0.56
+- 0.08
+- 1.27
+- 0.01
+- 0.6
+near_ball_penalty_extra: 0.0
+reward_foot_ball_w: 50.0
+reward_kick_contact_w: 100.0
+kick_contact_dist: 0.2
+kick_contact_min_gain: 0.3
+kick_contact_gain_cap: 8.0
+kick_contact_min_height: 0.58
+kick_contact_hold_steps: 30
+reward_kick_overspeed_w: -50.0
+kick_overspeed_limit: 6.0
+kick_overspeed_goal_exempt: 2.5
+ball_perturb_enable: true
+stand_start_prob: 0.0
+reward_ball_chase_w: 0.0
+reward_ball_align_w: 0.0
+ball_align_baseline: 1.0
+motion_kick_weight_early: 1.0
+motion_kick_weight_end_samples: 10000001
+motion_kick_weight_ramp_samples: 5000000
+ball_spawn_front_early:
+- 0.35
+- 0.6
+dr_runtime_start_samples: 30000001
+char_push_start_samples: 30000001
+rand_ball_mass_kg:
+- 0.4
+- 0.45
+reward_stagnation_start_samples: 40000001
+ball_perturb_start_samples: 50000001
+goal_odom_noise: false
+episode_length_late: 60.0
+episode_length_late_start_samples: 50000001
+stage_params:
+- at: 10000001
+  episode_length: 15.0
+- at: 20000001
+  ball_curriculum_far_prob: 0.7
+  stand_start_prob: 0.5
+  reward_ball_chase_w: 20.0
+  reward_ball_align_w: 5.0
+  ball_goal_strip_prob: 0.15
+  ball_goal_core_prob: 0.15
+curriculum_gates:
+- at: 10000000
+  hold_iters: 5
+  min_episodes: 64
+  kicked_ep_frac:
+  - '>='
+  - 0.3
+  ep_fall_rate:
+  - <=
+  - 0.2
+- at: 20000000
+  hold_iters: 5
+  min_episodes: 64
+  kicked_ep_frac:
+  - '>='
+  - 0.22
+  ep_fall_rate:
+  - <=
+  - 0.12
+- at: 30000000
+  hold_iters: 5
+  min_episodes: 64
+  kicked_ep_frac:
+  - '>='
+  - 0.33
+  ep_fall_rate:
+  - <=
+  - 0.14
+- at: 40000000
+  hold_iters: 5
+  min_episodes: 64
+  kicked_ep_frac:
+  - '>='
+  - 0.22
+  ep_fall_rate:
+  - <=
+  - 0.24
+- at: 50000000
+  hold_iters: 5
+  min_episodes: 64
+  kicked_ep_frac:
+  - '>='
+  - 2.0
+critic_paper_obs: true
+recon_paper_targets: true
+dr_critic_torso_obs: true
+obs_noise_gravity: 0.01
+obs_noise_ang_vel: 0.1
+obs_noise_dof_pos: 0.01
+obs_noise_dof_vel: 0.1
+dr_ranges:
+  action_delay_ms:
+  - 0.0
+  - 33.3
+  foot_friction:
+  - 0.1
+  - 2.0
+  foot_compliance:
+  - 0.5
+  - 1.5
+  foot_restitution:
+  - 0.1
+  - 0.9
+dr_foot_props_per_foot: true
+kick_interval_s: 2.0
+kick_lin_vel_std: 0.1
+kick_ang_vel_std: 0.02
+push_interval_s: 5.0
+push_duration_s: 1.0
+push_force_std: 10.0
+push_torque_std: 2.0
+push_impulse_scale: 0.1
+joint_limit_on_action: true
+reward_head_action_rate_w: -0.451349
+reward_leg_action_rate_w: -0.041542
+reward_collision_w: -0.089033
+kick_still_speed: 0.5
+reward_kick_chapa_w: 100.0
+reward_torque_sat_w: -1000.0
+reward_arm_vel_w: -0.25
+arm_dof_bodies:
+- left_shoulder_pitch_link
+- left_shoulder_roll_link
+- left_elbow_pitch_link
+- left_elbow_yaw_link
+- right_shoulder_pitch_link
+- right_shoulder_roll_link
+- right_elbow_pitch_link
+- right_elbow_yaw_link
+kick_pitch_gate_prev: true
+kick_pitch_mix: 1.0
+kick_pitch_sigma_deg: 15.0
+reward_kick_pitch_dense_w: -2500.0
+reward_kick_toe_face_w: -1000.0
+reward_kick_toe_out_w: 300.0
+kick_toe_out_target_deg: 20.0
+kick_toe_out_sigma_deg: 12.0
+reward_kick_pitch_target_w: 200.0
+kick_pitch_target_deg: -15.0
+kick_pitch_target_sigma_deg: 20.0
+kick_style_aim_mix: 1.0
+reward_ball_oob_w: -50.0
+reward_kick_direction_w: 100.0
+reward_kick_impulse_w: 10.0
+kick_impulse_cap: 8.0
+reward_joint_acc_w: -0.5
+joint_acc_scale: 0.0001
+kick_gain_cap_per_m: 0.0
+kick_gain_cap_max: 8.0
+action_filter_alpha: 0.5
+
+# --- kpx2 (docs/t1/44, same block as kpx1): kick target T + power p. 60% of the kick episodes carry (T, p); 40% legacy (goal, full power).
+kick_tgt_prob: 1.0
+kick_tgt_dist: [3.0, 10.0]
+kick_tgt_ang_deg_start: 20.0
+kick_tgt_ang_deg: 60.0
+kick_tgt_ang_start_samples: 1228000000
+kick_tgt_ang_end_samples: 1228000001
+kick_pow_enable: true
+kick_pow_vmin: 0.8
+kick_pow_vmax: 5.5
+kick_pow_p_lo_start: 0.0
+kick_pow_p_lo: 0.0
+kick_pow_p_lo_start_samples: -1
+kick_pow_p_lo_end_samples: -1
+kick_pow_window_steps: 6
+kick_pow_sigma_a: 0.15
+kick_pow_sigma_b: 0.05
+kick_pow_tail_w: 0.5
+kick_pow_tail_s: 2.0
+kick_pow_p_slot4: true
+kick_pow_adapt: true
+kick_pow_adapt_lo_start: 0.999
+kick_pow_adapt_lo_min: 0.999
+kick_pow_adapt_win: 0.001
+kick_pow_adapt_front_prob: 1.0
+kick_pow_adapt_thr: 0.7
+kick_pow_adapt_step: 0.03
+kick_pow_adapt_min_events: 300
+kick_pow_adapt_every: 30
+kick_pow_adapt_bias_tol: 0.2
+kick_pow_adapt_test_only: true
+kick_pow_dir_sigma_deg: 10.0
+kick_pow_retouch_s: 1.5
+kick_pow_end_s: 1.0
+reward_kick_pow_speed_w: 1500.0
+reward_kick_pow_dir_w: 500.0
+reward_kick_pow_retouch_w: -500.0
+kick_pow_mask_dir: true
+kick_pow_obs_zero: true

@@ -703,6 +703,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # kpf6: kick_direction pays ~linearly in ball speed (100 * (v - min_vel), decayed); on in power episodes it
         # pulls the kick above v0. True masks it there (pow_dir_r already scores the aim)
         self._kick_pow_mask_dir = bool(env_config.get("kick_pow_mask_dir", False))
+        # exp power/kpf7x3: keep the legacy (all-zero) steering block in power episodes, so a pre-power kicker
+        # (kfjft) can be fine-tuned as a fixed-power teacher without seeing an observation it never met
+        self._kick_pow_obs_zero = bool(env_config.get("kick_pow_obs_zero", False))
         self._kick_pow_p_lo_start = float(env_config.get("kick_pow_p_lo_start", self._kick_pow_p_lo))
         self._kick_pow_p_lo_start_samples = int(env_config.get("kick_pow_p_lo_start_samples", -1))
         self._kick_pow_p_lo_end_samples = int(env_config.get("kick_pow_p_lo_end_samples", -1))
@@ -1853,7 +1856,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             if (env_ids is not None):
                 act = act[env_ids]
                 pw = pw[env_ids]
-            if (act.any()):
+            if (act.any() and not self._kick_pow_obs_zero):
                 steer_obs = torch.where(act.unsqueeze(-1), soccer_util.compute_kick_pow_obs(pw, self._kick_pow_p_slot4), steer_obs)
         return torch.cat([steer_obs, task_obs, ball_mask], dim=-1)
 

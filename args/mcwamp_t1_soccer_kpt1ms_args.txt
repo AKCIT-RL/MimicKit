@@ -1,0 +1,13 @@
+# kpt1ms (exp power/kpt1): fixed-power teacher fine-tune, kpf6m-it280 re-centred at v0 3.0, action std 0.05 (n9c: std 0.15 drives the kick up and blurs it).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpt1m_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpc1_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpt1ms/
+--model_file output_lab/kpf6m_it280/model.pt

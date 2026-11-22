@@ -1,0 +1,13 @@
+# kpt2hs (exp power/kpt3): kpf7h-it250 (v0 4.5) fine-tuned with action std 0.05 (kpt1 recipe; L/M gained +0.03-0.06).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_gym_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kpf7h_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_kpc1_agent.yaml
+
+--logger txt
+--save_int_models true
+--max_samples 3000000
+--out_dir output/t1_soccer_kpt2hs/
+--model_file output_lab/kpf7h-it250/model.pt

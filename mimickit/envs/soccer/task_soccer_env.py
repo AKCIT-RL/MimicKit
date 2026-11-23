@@ -1100,7 +1100,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                          "cow_ctrl2_past", "cow_prob", "cow_ang_deg", "cow_goal_blend", "cow_opp_speed", "cow_ball_decel",
                          "reward_cow_ctrl_w", "reward_cow_chase_w", "reward_cow_chase2_w", "reward_cow_ctrl2_w", "reward_cow_touch_w", "reward_cow_idle_w",
                          "reward_cow_rec_w", "reward_cow_goal_w", "reward_cow_succ_w", "reward_cow_fail_w", "reward_cow_fall_w",
-                         "cow_obs_noise_pos", "cow_obs_noise_vel", "cow_vis_dropout_p"}
+                         "cow_obs_noise_pos", "cow_obs_noise_vel", "cow_vis_dropout_p",
+                         # exp power/kps (doc 44 4e): the k75b..kfj chain terms and the power block switched on by
+                         # stage in ONE from-scratch run. All are read every step, so a mid-run setattr takes effect.
+                         "reward_kick_alignment_w", "reward_kick_chapa_w", "reward_kick_direction_w",
+                         "reward_kick_impulse_w", "reward_kick_pitch_dense_w", "reward_kick_pitch_target_w",
+                         "reward_kick_toe_face_w", "reward_kick_toe_out_w", "reward_torque_sat_w",
+                         "reward_arm_pose_w", "reward_arm_vel_w", "reward_ball_oob_w", "reward_joint_acc_w",
+                         "kick_pitch_mix", "kick_style_aim_mix", "kick_tgt_prob",
+                         "reward_kick_pow_speed_w", "reward_kick_pow_dir_w", "reward_kick_pow_retouch_w"}
 
     def _ground_z(self, env_ids, keepdim=False):
         """Spawn lift of the ground under env_ids (None = all envs): the scalar _ground_z_offset unless

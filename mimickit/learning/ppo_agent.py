@@ -12,6 +12,28 @@ import util.mp_util as mp_util
 import util.torch_util as torch_util
 from util.logger import Logger
 
+
+def parse_action_std_schedule(raw):
+    """[[samples, std], ...] -> sorted list of (float, float); None when absent or empty."""
+    if (not raw):
+        return None
+    pts = [(float(s), float(v)) for s, v in raw]
+    for i, (s, v) in enumerate(pts):
+        assert(v > 0.0), "action_std_schedule: std must be > 0"
+        assert(i == 0 or s > pts[i - 1][0]), "action_std_schedule: samples must be strictly increasing"
+    return pts
+
+
+def action_std_at(pts, samples):
+    """Piecewise-linear std at `samples`, held constant before the first and after the last point."""
+    if (samples <= pts[0][0]):
+        return pts[0][1]
+    for (s0, v0), (s1, v1) in zip(pts[:-1], pts[1:]):
+        if (samples <= s1):
+            return v0 + (v1 - v0) * (samples - s0) / (s1 - s0)
+    return pts[-1][1]
+
+
 class PPOAgent(base_agent.BaseAgent):
     def __init__(self, config, env, device):
         super().__init__(config, env, device)
@@ -69,6 +91,35 @@ class PPOAgent(base_agent.BaseAgent):
         # The FIXED logstd is a saved parameter, so action_std in the config is ignored when a
         # checkpoint is loaded. action_std_override (optional) rewrites it after every load.
         self._action_std_override = config.get("action_std_override", None)
+        # action_std_schedule (optional, exp power/kps): [[samples, std], ...] piecewise linear in the
+        # agent's sample count, written into the FIXED logstd at the start of every iteration. Lets a
+        # from-scratch run explore at 0.15 and condition at 0.05 later (doc 44 4e). Off when absent.
+        self._action_std_schedule = parse_action_std_schedule(config.get("action_std_schedule", None))
+        self._action_std_cur = None
+        self._action_std_logged = None
+        return
+
+    def _train_iter(self):
+        self._apply_action_std_schedule()
+        return super()._train_iter()
+
+    def _apply_action_std_schedule(self):
+        if (self._action_std_schedule is None):
+            return
+        std = action_std_at(self._action_std_schedule, self._sample_count)
+        if (self._action_std_cur is not None and abs(std - self._action_std_cur) < 1e-9):
+            return
+        n = 0
+        with torch.no_grad():
+            for name, p in self._model.named_parameters():
+                if (name.endswith("_logstd_net") and not p.requires_grad):
+                    p.fill_(float(np.log(std)))
+                    n += 1
+        assert(n > 0), "action_std_schedule: no FIXED logstd parameter found"
+        if (self._action_std_logged is None or abs(std - self._action_std_logged) >= 0.005):
+            Logger.print("action_std_schedule: std {:.4f} at {:d} samples".format(std, int(self._sample_count)))
+            self._action_std_logged = std
+        self._action_std_cur = std
         return
 
     def load(self, in_file):

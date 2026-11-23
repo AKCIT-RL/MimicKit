@@ -1,0 +1,12 @@
+# kps1a (exp power/kps1, doc 44 4e): professor de chute do zero com potencia linear; env kps1a, agente kps1, Lab pdx. Corte em 200M (inclinacao < 0,5).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1a_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 600000000
+--out_dir output/t1_soccer_kps1a/

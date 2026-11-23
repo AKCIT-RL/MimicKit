@@ -3003,11 +3003,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             near_scale = soccer_util.compute_near_ball_scale(
                 self._engine.get_root_pos(char_id), ball_pos,
                 self._near_ball_pen_radius, self._near_ball_pen_extra)
+        # reward_* diag keys are emitted always (0 with the weight off): the logger fixes its keys in the first
+        # iteration, so a gated stage that turns a weight on mid-run (kps1 S5/S6) must not introduce a new key
+        arm = near_scale * soccer_util.compute_arm_pose_penalty(
+            dof_pos, self._arm_dof_ids, self._arm_pose_target, self._arm_pose_tol)
         if (self._reward_arm_pose_w != 0.0):
-            arm = near_scale * soccer_util.compute_arm_pose_penalty(
-                dof_pos, self._arm_dof_ids, self._arm_pose_target, self._arm_pose_tol)
             aux_r += self._reward_arm_pose_w * arm
-            self._diag.add_mean("reward_arm_pose", self._reward_arm_pose_w * arm)
+        self._diag.add_mean("reward_arm_pose", self._reward_arm_pose_w * arm)
         # arm speed: raw diagnostics always (smoke before the weight is raised), penalty only with the weight on
         arm_qd = self._engine.get_dof_vel(char_id).index_select(-1, self._arm_vel_dof_ids)
         arm_vel_pen = torch.mean(torch.square(torch.clamp_min(torch.abs(arm_qd) - self._arm_vel_tol, 0.0)), dim=-1)
@@ -3022,10 +3024,10 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._diag.add_mean("torque_sat_pen_raw", torque_sat_pen)
         if (self._reward_torque_sat_w != 0.0):
             aux_r += self._reward_torque_sat_w * torque_sat_pen
-            self._diag.add_mean("reward_torque_sat", self._reward_torque_sat_w * torque_sat_pen)
+        self._diag.add_mean("reward_torque_sat", self._reward_torque_sat_w * torque_sat_pen)
         if (self._reward_arm_vel_w != 0.0):
             aux_r += self._reward_arm_vel_w * arm_vel_pen
-            self._diag.add_mean("reward_arm_vel", self._reward_arm_vel_w * arm_vel_pen)
+        self._diag.add_mean("reward_arm_vel", self._reward_arm_vel_w * arm_vel_pen)
         if (self._reward_torso_lean_w != 0.0):
             lean = near_scale * soccer_util.compute_torso_lean_penalty(
                 self._engine.get_root_rot(char_id), self._torso_lean_max)
@@ -3044,7 +3046,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             self._diag.add_mean("joint_acc_peak", torch.amax(torch.abs(ddq), dim=-1))
             if (self._reward_joint_acc_w != 0.0):
                 aux_r += self._reward_joint_acc_w * joint_acc
-                self._diag.add_mean("reward_joint_acc", self._reward_joint_acc_w * joint_acc)
+            self._diag.add_mean("reward_joint_acc", self._reward_joint_acc_w * joint_acc)
 
         # waiting penalty (T1): grows quadratically with ball-still time,
         # saturating at waiting_time_max; zero while the ball rolls

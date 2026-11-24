@@ -1,0 +1,12 @@
+# kps1d (exp power/kps1d): kps1c retomado com G2 de queda 0,24 no terreno; max 1B amostras (o kps1c parou em ~471M com o relogio em 30M).
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1d_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1000000000
+--out_dir output/t1_soccer_kps1d/

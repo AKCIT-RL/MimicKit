@@ -19,6 +19,7 @@ import math
 import torch
 
 import util.torch_util as torch_util
+import envs.base_env as base_env
 
 
 # HiFAR / AGILE / HoST weights (doc 47 section 4); "w_" keys are per-second weights
@@ -349,9 +350,14 @@ class GetupMode:
         return
 
     def mask_done(self, done_buf, null_val, fail_val):
-        """Body contact does not end a get-up episode."""
+        """Body contact does not end a get-up episode. compute_done writes FAIL over TIME, so a
+        lying robot at the time limit must get TIME back (else the episode never ends)."""
+        env = self._env
         fail = (done_buf == fail_val) & self.mode
-        done_buf[:] = torch.where(fail, torch.full_like(done_buf, null_val), done_buf)
+        timeout = env._time_buf >= env._episode_length
+        repl = torch.where(timeout, torch.full_like(done_buf, base_env.DoneFlags.TIME.value),
+                           torch.full_like(done_buf, null_val))
+        done_buf[:] = torch.where(fail, repl, done_buf)
         return
 
     def final_done(self, done_buf, null_val, fail_val):

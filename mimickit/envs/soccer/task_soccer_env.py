@@ -740,6 +740,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_tail_w = float(env_config.get("kick_pow_tail_w", 0.0))
         self._kick_pow_tail_s = float(env_config.get("kick_pow_tail_s", 2.0))
         self._kick_pow_dir_sigma_deg = float(env_config.get("kick_pow_dir_sigma_deg", 10.0))
+        # True: the speed reward is paid only in the right direction (r_speed *= r_dir); default False = unchanged
+        self._kick_pow_speed_dir_mult = bool(env_config.get("kick_pow_speed_dir_mult", False))
         self._kick_pow_retouch_s = float(env_config.get("kick_pow_retouch_s", 1.5))
         self._kick_pow_end_s = float(env_config.get("kick_pow_end_s", -1.0))  # >= 0: SUCC (soft) this long after pay
         self._reward_kick_pow_speed_w = float(env_config.get("reward_kick_pow_speed_w", 0.0))
@@ -2567,6 +2569,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._kick_pow_vmin, self._kick_pow_vmax, self._kick_pow_sigma_a, self._kick_pow_sigma_b,
                 self._kick_pow_dir_sigma_deg, self._kick_pow_retouch_s,
                 self._kick_pow_tail_w, self._kick_pow_tail_s)
+            if (self._kick_pow_speed_dir_mult):
+                pow_speed_r = pow_speed_r * pow_dir_r
             # power episodes: the strength and goal terms are off (the speed term replaces them)
             keep = (~pow_act).float()
             kick_contact_r = kick_contact_r * keep

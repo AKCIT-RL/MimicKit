@@ -1,0 +1,12 @@
+# kps1g (exp power/kps1g): kps1f com a direcao multiplicando a velocidade (kick_pow_speed_dir_mult); retomado do kps1f it1550.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1g_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1000000000
+--out_dir output/t1_soccer_kps1g/

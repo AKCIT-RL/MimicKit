@@ -15,6 +15,7 @@ weight * term * dt. The actor observation is NOT changed: the student sees the s
 and infers "fallen" from the projected gravity already in its frame.
 """
 import math
+import re
 
 import torch
 
@@ -35,7 +36,8 @@ _DEFAULTS = {
     "stand_upz": 0.9,            # body z axis . world z for "standing"
     "succ_hold_s": 1.0,          # s standing in a row = success
     "head_frac": 0.85,           # head height target = frac * head height standing
-    "explode_v2": 80.0,          # |v|^2 + |w|^2 above this ends the episode (HiFAR)
+    "explode_v2": 1000.0,        # |v|^2 + |w|^2 above this ends the episode (HiFAR; 80 cut 92% of the up0s
+                                 # episodes: a 31 kg robot falling/flailing passes 9 rad/s)
     "episode_length": 10.0,      # s
     # task stream
     "w_height": [2.0, 8.0, 16.0],      # AGILE base_height rough / medium / fine
@@ -106,6 +108,17 @@ class GetupMode:
         self.feet_ids = env._build_body_ids_tensor(["left_ankle_roll_link", "right_ankle_roll_link"])
         hip_roll = [i for i, nm in enumerate(self._dof_names()) if "hip_roll" in nm]
         self.hip_roll_ids = torch.tensor(hip_roll, device=dev, dtype=torch.long)
+        # torque limits: with pd_explicit PhysX reports 1e9 (env._torque_lim), the real effort limit is
+        # in the engine's pd_explicit_gains {regex: [kp, kd, effort]}, matched on the joint names
+        self.tau_lim = env._torque_lim.clone()
+        gains = getattr(env._engine, "_pd_explicit_gains", None)
+        if gains:
+            for i, nm in enumerate(self._dof_names()):
+                for rx, v in gains.items():
+                    if re.fullmatch(rx, nm):
+                        self.tau_lim[i] = float(v[2])
+                        break
+        assert bool((self.tau_lim < 1e6).all()), "getup: torque limits not resolved %s" % self.tau_lim.tolist()
 
         # head height standing: FK of the default pose with the root at the target height
         root_pos = torch.zeros([1, 3], device=dev)
@@ -306,7 +319,7 @@ class GetupMode:
         # ---- aux (regularization)
         reg = {}
         reg["torques"] = c["w_torques"] * torch.sum(torch.square(tau), dim=-1)
-        ratio = tau / env._torque_lim
+        ratio = tau / self.tau_lim
         reg["tiredness"] = c["w_tiredness"] * torch.sum(torch.clamp(torch.square(ratio), max=1.0), dim=-1)
         reg["power"] = c["w_power"] * torch.sum(torch.clamp(tau * qd, min=0.0), dim=-1)
         reg["dof_vel"] = c["w_dof_vel"] * torch.sum(torch.square(qd), dim=-1)
@@ -367,6 +380,8 @@ class GetupMode:
         v2 = torch.sum(torch.square(env._engine.get_root_vel(char_id)), dim=-1) \
             + torch.sum(torch.square(env._engine.get_root_ang_vel(char_id)), dim=-1)
         boom = self.mode & (v2 > float(self.cfg["explode_v2"])) & (done_buf == null_val)
+        if bool(self.mode.any()):
+            env._diag.add_mean("up_v2", v2[self.mode])
         done_buf[:] = torch.where(boom, torch.full_like(done_buf, fail_val), done_buf)
         ended = self.mode & (done_buf != null_val)
         d = env._diag

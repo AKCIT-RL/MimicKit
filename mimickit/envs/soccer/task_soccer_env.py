@@ -981,6 +981,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._visualize_field = bool(env_config.get("visualize_field", False))
         self._visualize_debug_arrows = bool(env_config.get("visualize_debug_arrows", False))
 
+        # doc 47: get-up (fall recovery) teacher mode; off = byte-identical soccer env
+        self._getup = None
+        if (bool(env_config.get("getup_enable", False))):
+            from envs.soccer.getup_util import GetupMode
+            self._getup = GetupMode(self, env_config.get("getup", {}))
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
@@ -1599,6 +1605,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._goal_odom_yaw = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._goal_odom_dir = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._goal_odom_next_redraw = torch.zeros([num_envs], device=self._device, dtype=torch.float)
+        if (self._getup is not None):
+            self._getup.build()
         return
 
     def _get_ball_id(self):
@@ -1687,6 +1695,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)
+        if (self._getup is not None):
+            self._getup.on_action(actions)
         self._record_prev_states()
         self._total_env_steps += 1
         self._gate_clock.advance(self.get_num_envs())
@@ -1985,6 +1995,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 self._update_cow2()
             else:
                 self._update_cow()
+        if (self._getup is not None):
+            self._getup.compute_rewards()
 
         # 3. goal / out of bounds terminate the episode (paper 4.1); the
         #    flags become dones in _update_done and the reset keeps the
@@ -3101,6 +3113,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
 
     def _update_done(self):
         super()._update_done()
+        if (self._getup is not None):
+            self._getup.mask_done(self._done_buf, base_env.DoneFlags.NULL.value, base_env.DoneFlags.FAIL.value)
         # fall termination penalty joins the aux stream once dones are known;
         # gated BEFORE ball events also become FAIL (out-of-bounds ends the
         # episode but pays no fall penalty)
@@ -3144,6 +3158,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (self._kick_pow_enable):
             d.add_sum("kick_pow_ep_done", torch.logical_and(
                 done != base_env.DoneFlags.NULL.value, self._kick_pow_active()).float())
+        if (self._getup is not None):
+            self._getup.final_done(done, base_env.DoneFlags.NULL.value, base_env.DoneFlags.FAIL.value)
+            soft = soft & (done != base_env.DoneFlags.FAIL.value)
         self._done_buf[:] = done
         self._soft_done_buf[:] = soft
         ended = torch.logical_and(done != base_env.DoneFlags.NULL.value, kick_ep)
@@ -3248,6 +3265,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         reacq_count = sums.get("reacq_count", 0.0)
         diags["ep_goal_rate"] = goals / eps if eps > 0.0 else 0.0
         diags["ep_fall_rate"] = sums.get("ep_falls", 0.0) / eps if eps > 0.0 else 0.0
+        if (self._getup is not None):
+            self._getup.summarize(sums, diags)
         diags["ep_oob_rate"] = sums.get("ep_oob", 0.0) / eps if eps > 0.0 else 0.0
         if (self._kick_pow_enable):
             pays = sums.get("kick_pow_pay", 0.0)
@@ -3493,11 +3512,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (len(env_ids) > 0):
             self._reset_goal_odom(env_ids)
             self._reset_char_placement(env_ids)
+            if (self._getup is not None):
+                self._getup.reset(env_ids)
             # the placement moved/rotated the root, so the rigid body state
             # written by char_env's reset is stale; recompute it with FK or
             # key-body obs will mix the old pose with the new root position
             self._reset_char_rigid_body_state(env_ids)
             self._reset_ball(env_ids)
+            if (self._getup is not None):
+                self._getup.park_ball(env_ids)
             if (self._kick_pow_enable and self._kick_pow_bench_start_prob > 0.0):
                 self._kick_pow_bench_start(env_ids)
             self._reset_nav_mode(env_ids)

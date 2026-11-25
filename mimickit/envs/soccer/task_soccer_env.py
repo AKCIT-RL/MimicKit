@@ -718,12 +718,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._feet_lat_dist_ref = float(env_config.get("feet_lat_dist_ref", 0.12))
         self._feet_lat_dist_cap = float(env_config.get("feet_lat_dist_cap", 0.1))
         self._feet_contact_force = float(env_config.get("feet_contact_force", 1.0))  # N on the foot body
+        # swing-foot clearance (steering_reward.compute_feet_clearance_penalty), same speed gain; 0 = off
+        self._reward_feet_clearance_w = float(env_config.get("reward_feet_clearance_w", 0.0))
+        self._feet_clearance_h = float(env_config.get("feet_clearance_h", 0.05))  # m above the lowest foot
         self._gait_speed_k = float(env_config.get("gait_speed_k", 1.0))
         self._gait_speed_lo = float(env_config.get("gait_speed_lo", 0.1))
         self._gait_speed_hi = float(env_config.get("gait_speed_hi", 0.6))
         self._gait_terms_diag = bool(env_config.get("gait_terms_diag", False))
         self._gait_terms_on = self._gait_terms_diag or any(
-            w != 0.0 for w in (self._reward_feet_slip_w, self._reward_feet_yaw_diff_w, self._reward_feet_lat_dist_w))
+            w != 0.0 for w in (self._reward_feet_slip_w, self._reward_feet_yaw_diff_w, self._reward_feet_lat_dist_w,
+                               self._reward_feet_clearance_w))
         self._reward_action_rate_w = float(env_config.get("reward_action_rate_w", -1.0))
         self._reward_joint_limit_w = float(env_config.get("reward_joint_limit_w", -100.0))
         # knee-bend shortfall penalty (diagnostic crutch for the straight-leg gait); off by default
@@ -4769,11 +4773,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         base_yaw = torch_util.quat_to_euler_xyz(self._engine.get_root_rot(char_id))[..., 2]
         lat = steering_reward.compute_feet_lateral_distance_penalty(
             base_yaw, f_pos[:, 0, :], f_pos[:, 1, :], self._feet_lat_dist_ref, self._feet_lat_dist_cap)
+        clear = steering_reward.compute_feet_clearance_penalty(f_pos[..., 2], f_vel[..., 0:2], contact,
+                                                               self._feet_clearance_h)
         speed = torch.linalg.norm(self._nav_cmd[:, 0:2], dim=-1)
         gain = steering_reward.compute_speed_gain(speed, self._gait_speed_lo, self._gait_speed_hi, self._gait_speed_k)
         navf = self._nav_mode.float()
         r = navf * gain * (self._reward_feet_slip_w * slip + self._reward_feet_yaw_diff_w * yaw_diff
-                           + self._reward_feet_lat_dist_w * lat)
+                           + self._reward_feet_lat_dist_w * lat + self._reward_feet_clearance_w * clear)
         # raw means and second moments, over all nav steps and over the 0.1-0.5 m/s band, so the
         # doc-12 weight rule (|w| * std = 0.0312) can be applied from a weight-0 run's log
         d = self._diag
@@ -4782,7 +4788,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         d.add_mean("gait_gain", navf * gain)
         d.add_mean("reward_gait", r)
         d.add_mean("feet_contact_frac", navf.unsqueeze(-1).mul(contact.float()).mean(dim=-1))
-        for name, x in (("feet_slip", slip), ("feet_yaw_diff", yaw_diff), ("feet_lat_dist", lat)):
+        for name, x in (("feet_slip", slip), ("feet_yaw_diff", yaw_diff), ("feet_lat_dist", lat),
+                        ("feet_clearance", clear)):
             d.add_mean(name + "_raw", navf * x)
             d.add_mean(name + "_sq", navf * x * x)
             d.add_mean(name + "_raw_band", band * x)

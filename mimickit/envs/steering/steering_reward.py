@@ -397,6 +397,22 @@ def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed
 
 
 @torch.jit.script
+def compute_feet_clearance_penalty(foot_z, foot_vel_xy, contact, h):
+    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+    """Sum over the feet OFF the ground of max(0, h - dz) * |v_xy|: a swing foot that moves
+    forward low (dragging) pays, a foot in contact or standing still does not.
+
+    foot_z [N, F], foot_vel_xy [N, F, 2], contact [N, F] bool. dz = height above the LOWEST
+    foot, the stance reference on uneven ground without a height lookup; the deficit is capped
+    at h. No gait clock: the swing phase comes from contact, so the policy obs need not change.
+    """
+    dz = foot_z - torch.min(foot_z, dim=-1, keepdim=True)[0]
+    deficit = torch.clamp(h - dz, 0.0, h)
+    speed = torch.linalg.norm(foot_vel_xy, dim=-1)
+    return torch.sum((~contact).to(foot_z.dtype) * deficit * speed, dim=-1)
+
+
+@torch.jit.script
 def compute_speed_gain(speed, lo, hi, k):
     # type: (Tensor, float, float, float) -> Tensor
     """Weight multiplier of the gait terms by commanded speed: k at lo, fading

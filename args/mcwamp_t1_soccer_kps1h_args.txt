@@ -1,0 +1,12 @@
+# kps1h (exp power/kps1h): kps1g com kick_pow_mask_align (alinhamento por passo desligado em episodio de potencia); retomado do kps1g it2450.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1h_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1000000000
+--out_dir output/t1_soccer_kps1h/

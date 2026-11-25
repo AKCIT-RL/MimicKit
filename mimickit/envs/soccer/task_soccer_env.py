@@ -742,6 +742,9 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_dir_sigma_deg = float(env_config.get("kick_pow_dir_sigma_deg", 10.0))
         # True: the speed reward is paid only in the right direction (r_speed *= r_dir); default False = unchanged
         self._kick_pow_speed_dir_mult = bool(env_config.get("kick_pow_speed_dir_mult", False))
+        # True: the per-step kick alignment reward (foot in contact moving toward the target) is off in power episodes,
+        # so slow pushes no longer pay; the one-time power payment is the only kick reward there. Default False = unchanged
+        self._kick_pow_mask_align = bool(env_config.get("kick_pow_mask_align", False))
         self._kick_pow_retouch_s = float(env_config.get("kick_pow_retouch_s", 1.5))
         self._kick_pow_end_s = float(env_config.get("kick_pow_end_s", -1.0))  # >= 0: SUCC (soft) this long after pay
         self._reward_kick_pow_speed_w = float(env_config.get("reward_kick_pow_speed_w", 0.0))
@@ -2940,6 +2943,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                     soccer_util.compute_kick_alignment_reward(foot_vel, ball_pos,
                                                               self._kick_tgt, contact,
                                                               self._kick_alignment_power) * kick_m
+        if (self._kick_pow_enable and self._kick_pow_mask_align):
+            kick_align_r = kick_align_r * (~self._kick_pow_active()).float()
         aux_r += kick_side_r + kick_fwd_r + kick_align_r
         foot_ball_d = torch.stack([torch.linalg.norm(body_pos[:, f, :] - ball_pos, dim=-1)
                                    for f in self._foot_body_ids], dim=-1).min(dim=-1).values

@@ -397,6 +397,20 @@ def restore_still_tar_reward(reward, root_pos, prev_root_pos, tar_dir, tar_speed
 
 
 @torch.jit.script
+def compute_speed_gain(speed, lo, hi, k):
+    # type: (Tensor, float, float, float) -> Tensor
+    """Weight multiplier of the gait terms by commanded speed: k at lo, fading
+    linearly to 1 at hi and staying 1 above; 1 below lo (stop commands keep
+    their own terms). k = 1 is the identity (the term's original weight).
+
+    m(v) = 1 + (k - 1) * clip((hi - v) / (hi - lo), 0, 1) for v >= lo, else 1.
+    """
+    ramp = torch.clamp((hi - speed) / (hi - lo), 0.0, 1.0)
+    gain = 1.0 + (k - 1.0) * ramp
+    return torch.where(speed < lo, torch.ones_like(gain), gain)
+
+
+@torch.jit.script
 def compute_still_penalty(root_vel_xy, feet_vel_xy, tar_speed, still_speed, foot_w):
     # type: (Tensor, Tensor, Tensor, float, float) -> Tensor
     """On stop commands only: ||v_root_xy|| + foot_w * mean over feet ||v_foot_xy||.

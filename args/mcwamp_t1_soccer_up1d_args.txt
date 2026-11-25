@@ -1,0 +1,12 @@
+# up1d (exp getup/up1d, doc 47): up1 + penalidade de torque comandado; retomado do up1 it6300.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_flat_field_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_up1d_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_up0_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1000000000
+--out_dir output/t1_getup_up1d/

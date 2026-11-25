@@ -1,0 +1,20 @@
+# Only the walking clips of dataset_t1_locomotion_wrturn_hiprel_yaw0_collider_med.yaml (same
+# files, same weight): stand_to_walk + the 7 walk_turn clips. Dropped: the 7 run_turn clips and
+# walk_to_run (running up to 1.98 m/s), for the 0-0.5 m/s command range (v05walk arms).
+motions:
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_stand_to_walk.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_left45.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_left90.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_left135.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_right45.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_right90.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_right135.pkl
+  weight: 1.0
+- file: data/motions/t1_hiprel_yaw0_collider_med/t1_walk_turn_around.pkl
+  weight: 1.0

@@ -63,6 +63,16 @@ _DEFAULTS = {
     "w_dof_limits": -1.0,               # HiFAR dof_pos_limits
     "dof_soft_limit": 0.95,
     "w_hip_roll": 0.0,                  # HiFAR stage 2: -50
+    # up1 smoothness (doc 47 4.2; off in up0): AGILE dof_vel_limits / torque_limits, both on the excess over
+    # a soft fraction of the limit; action_rate curriculum -0.01 -> -0.1 (AGILE) is set through w_action_rate
+    "w_dof_vel_limits": 0.0,            # AGILE -0.01 (sum of rad/s over soft_vel * lim)
+    "dof_soft_vel": 0.8,
+    "w_torque_limits": 0.0,             # AGILE -0.01 (sum of N.m over soft_tau * lim)
+    "dof_soft_tau": 0.9,
+    # T1 URDF (resources/T1/T1_locomotion.urdf) velocity limits, rad/s, matched on the sim joint names
+    "dof_vel_lim": {"aahead_.*": 12.56, ".*_shoulder_.*": 18.84, ".*_elbow_.*": 18.84, "waist_yaw_joint": 10.88,
+                    ".*_hip_pitch_joint": 12.5, ".*_hip_roll_joint": 10.9, ".*_hip_yaw_joint": 10.9,
+                    ".*_knee_pitch_joint": 11.7, ".*_ankle_pitch_joint": 18.8, ".*_ankle_roll_joint": 12.4},
     "style_when_down": 0.0,             # AMP style gain while not standing (state-dependent AMP gate)
 }
 
@@ -119,6 +129,13 @@ class GetupMode:
                         self.tau_lim[i] = float(v[2])
                         break
         assert bool((self.tau_lim < 1e6).all()), "getup: torque limits not resolved %s" % self.tau_lim.tolist()
+        self.vel_lim = torch.full_like(self.tau_lim, -1.0)
+        for i, nm in enumerate(self._dof_names()):
+            for rx, v in self.cfg["dof_vel_lim"].items():
+                if re.fullmatch(rx, nm):
+                    self.vel_lim[i] = float(v)
+                    break
+        assert bool((self.vel_lim > 0).all()), "getup: velocity limits not resolved %s" % self._dof_names()
 
         # head height standing: FK of the default pose with the root at the target height
         root_pos = torch.zeros([1, 3], device=dev)
@@ -331,6 +348,10 @@ class GetupMode:
             torch.square(self.act0 - 2.0 * self.act1 + self.act2), dim=-1)
         viol = torch.clamp(self.soft_lo - q, min=0.0) + torch.clamp(q - self.soft_hi, min=0.0)
         reg["dof_limits"] = c["w_dof_limits"] * torch.sum(viol, dim=-1)
+        reg["dof_vel_limits"] = c["w_dof_vel_limits"] * torch.sum(
+            torch.clamp(torch.abs(qd) - float(c["dof_soft_vel"]) * self.vel_lim, min=0.0), dim=-1)
+        reg["torque_limits"] = c["w_torque_limits"] * torch.sum(
+            torch.clamp(torch.abs(tau) - float(c["dof_soft_tau"]) * self.tau_lim, min=0.0), dim=-1)
         if (float(c["w_hip_roll"]) != 0.0):
             reg["hip_roll"] = c["w_hip_roll"] * torch.sum(
                 torch.square(q.index_select(-1, self.hip_roll_ids) - q0[:, self.hip_roll_ids]), dim=-1)
@@ -360,6 +381,11 @@ class GetupMode:
             d.add_mean("up_height", h[m])
             d.add_mean("up_standing", sf[m])
             d.add_mean("up_tau_sat95", torch.mean((torch.abs(ratio[m]) >= 0.95).float(), dim=-1))
+            # raw (unweighted) smoothness signals, visible in up0 where their weights are 0
+            d.add_mean("up_vel_over_soft", torch.mean((torch.abs(qd[m]) > float(c["dof_soft_vel"])
+                                                       * self.vel_lim).float(), dim=-1))
+            d.add_mean("up_vel_ratio_max", torch.max(torch.abs(qd[m]) / self.vel_lim, dim=-1)[0])
+            d.add_mean("up_act_rate", torch.sum(torch.square(self.act0[m] - self.act1[m]), dim=-1))
         return
 
     def mask_done(self, done_buf, null_val, fail_val):

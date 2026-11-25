@@ -1,4 +1,4 @@
-# up1f (exp getup/up1f, doc 47): sobrefit de torque. up1d com w_torque_cmd_excess -500 e w_torque_limits -2.0 (20x), mantidos por 60M amostras e reduzidos linearmente a 5% (-25 e -0.1, os pesos do up1d) ate 260M (clock do env = curriculum_sample_offset 1,229e9 + amostras do processo). Clock = amostras desde o inicio do processo (requeue reinicia a rampa).
+# up1f (exp getup/up1f, doc 47): sobrefit de torque. up1d com w_torque_cmd_excess -500 e w_torque_limits -2.0 (20x), mantidos por 60M amostras e reduzidos linearmente a 5% (-25 e -0.1, os pesos do up1d) ate 260M (clock do env = curriculum_sample_offset 1,229e9 + amostras consumidas, retomadas no resume: 104,9M no inicio, logo start 1,3939e9 e end 1,5939e9; requeue preserva a rampa). 
 # up1c (exp getup/up1c, doc 47): up1 + penalidade no torque COMANDADO (sem corte) acima de 0.9 x esforco, peso -5.
 # Retomado do up1 it6300 (100% em todas as classes, mas quadril/joelho no limite em ~86% dos passos: comando
 # chaveando entre extremos, act_rate 30 rad^2/passo; o torque aplicado e cortado e torque_limits nao enxerga).
@@ -343,7 +343,7 @@ getup:
   w_action_rate: -0.1
   w_dof_vel_limits: -1.0
   w_torque_limits: -2.0
-  torque_anneal_start: 1289000001
-  torque_anneal_end: 1489000001
+  torque_anneal_start: 1393923137
+  torque_anneal_end: 1593923137
   torque_anneal_end_scale: 0.05
   w_torque_cmd_excess: -500.0

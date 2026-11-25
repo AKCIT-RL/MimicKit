@@ -69,6 +69,10 @@ _DEFAULTS = {
     "dof_soft_vel": 0.8,
     "w_torque_limits": 0.0,             # AGILE -0.01 (sum of N.m over soft_tau * lim)
     "dof_soft_tau": 0.9,
+    # up1c: the applied torque is clipped at the effort limit, so torque_limits cannot see a policy that
+    # commands far past it (up1: hip/knee at the limit ~86 % of the steps while standing). This term reads the
+    # COMMANDED pd_explicit torque kp * (target - q) - kd * qd, unclipped, as a fraction of the limit
+    "w_torque_cmd_excess": 0.0,         # sum over joints of max(|tau_cmd| / lim - dof_soft_tau, 0)
     # T1 URDF (resources/T1/T1_locomotion.urdf) velocity limits, rad/s, matched on the sim joint names
     "dof_vel_lim": {"aahead_.*": 12.56, ".*_shoulder_.*": 18.84, ".*_elbow_.*": 18.84, "waist_yaw_joint": 10.88,
                     ".*_hip_pitch_joint": 12.5, ".*_hip_roll_joint": 10.9, ".*_hip_yaw_joint": 10.9,
@@ -121,12 +125,15 @@ class GetupMode:
         # torque limits: with pd_explicit PhysX reports 1e9 (env._torque_lim), the real effort limit is
         # in the engine's pd_explicit_gains {regex: [kp, kd, effort]}, matched on the joint names
         self.tau_lim = env._torque_lim.clone()
+        self.kp = torch.zeros_like(self.tau_lim)  # pd_explicit gains, 0 when the engine has none
+        self.kd = torch.zeros_like(self.tau_lim)
         gains = getattr(env._engine, "_pd_explicit_gains", None)
         if gains:
             for i, nm in enumerate(self._dof_names()):
                 for rx, v in gains.items():
                     if re.fullmatch(rx, nm):
                         self.tau_lim[i] = float(v[2])
+                        self.kp[i], self.kd[i] = float(v[0]), float(v[1])
                         break
         assert bool((self.tau_lim < 1e6).all()), "getup: torque limits not resolved %s" % self.tau_lim.tolist()
         self.vel_lim = torch.full_like(self.tau_lim, -1.0)
@@ -352,6 +359,10 @@ class GetupMode:
             torch.clamp(torch.abs(qd) - float(c["dof_soft_vel"]) * self.vel_lim, min=0.0), dim=-1)
         reg["torque_limits"] = c["w_torque_limits"] * torch.sum(
             torch.clamp(torch.abs(tau) - float(c["dof_soft_tau"]) * self.tau_lim, min=0.0), dim=-1)
+        a_clip = torch.minimum(torch.maximum(self.act0, env._action_bound_low), env._action_bound_high)
+        cmd_ratio = torch.abs(self.kp * (a_clip - q) - self.kd * qd) / self.tau_lim
+        reg["torque_cmd_excess"] = c["w_torque_cmd_excess"] * torch.sum(
+            torch.clamp(cmd_ratio - float(c["dof_soft_tau"]), min=0.0), dim=-1)
         if (float(c["w_hip_roll"]) != 0.0):
             reg["hip_roll"] = c["w_hip_roll"] * torch.sum(
                 torch.square(q.index_select(-1, self.hip_roll_ids) - q0[:, self.hip_roll_ids]), dim=-1)
@@ -385,6 +396,8 @@ class GetupMode:
             d.add_mean("up_vel_over_soft", torch.mean((torch.abs(qd[m]) > float(c["dof_soft_vel"])
                                                        * self.vel_lim).float(), dim=-1))
             d.add_mean("up_vel_ratio_max", torch.max(torch.abs(qd[m]) / self.vel_lim, dim=-1)[0])
+            d.add_mean("up_tau_cmd_ratio_max", torch.max(cmd_ratio[m], dim=-1)[0])
+            d.add_mean("up_tau_cmd_over1", torch.mean((cmd_ratio[m] > 1.0).float(), dim=-1))
             d.add_mean("up_act_rate", torch.sum(torch.square(self.act0[m] - self.act1[m]), dim=-1))
         return
 

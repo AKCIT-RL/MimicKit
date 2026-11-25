@@ -1,0 +1,12 @@
+# kps1j (exp power/kps1j): kps1i com sigma de velocidade mais estreito (0.10+0.03*v0); retomado do kps1i it4500.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1j_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1000000000
+--out_dir output/t1_soccer_kps1j/

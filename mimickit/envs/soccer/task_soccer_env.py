@@ -763,6 +763,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._gait_air_min = float(env_config.get("gait_air_min", 0.25))
         self._gait_air_max = float(env_config.get("gait_air_max", 0.5))
         self._gait_contact_n = float(env_config.get("gait_contact_n", 5.0))
+        # kps1p: feet_slip from the steering env (doc 29, Booster Gym): squared xy speed of the lowest corner of the
+        # foot box (not the origin, which moves during the heel-toe roll) while the foot is in contact. Contact here is
+        # the force sensor (>= gait_contact_n), not the steering env's sole height < 1 cm: the soccer ground is uneven
+        # (+-1 mm .. +-5 cm tiles) and this env has no terrain height lookup. Same gate as the terms above.
+        self._reward_gait_feet_slip_w = float(env_config.get("reward_gait_feet_slip_w", 0.0))
+        self._gait_foot_box_corners = steering_util.build_foot_box_corners(
+            tuple(env_config.get("foot_box_half", steering_util.DEFAULT_FOOT_BOX_HALF)),
+            tuple(env_config.get("foot_box_pos", steering_util.DEFAULT_FOOT_BOX_POS)))
 
         # ball-state reward gating (T1 ball_rolling_scale): while the ball
         # rolls, the robot->ball approach potential is zeroed so chasing the
@@ -2608,6 +2616,13 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             gait_air_r, gait_slide_pen, self._gait_air_t[:] = soccer_util.compute_gait_air_slide(
                 fcontact, self._engine.get_body_vel(cid)[:, self._foot_body_ids, 0:2], self._gait_air_t,
                 pow_act & (self._kick_pow_k < 0), self._engine.get_timestep(), self._gait_air_min, self._gait_air_max)
+            fids = self._foot_body_ids
+            sole_z, cp_vel = steering_util.compute_sole_contact_state(
+                self._engine.get_body_pos(cid)[:, fids, :], self._engine.get_body_rot(cid)[:, fids, :],
+                self._engine.get_body_vel(cid)[:, fids, :], self._engine.get_body_ang_vel(cid)[:, fids, :],
+                self._gait_foot_box_corners.to(self._device))
+            gait_feet_slip = steering_reward.compute_feet_slip_penalty(cp_vel, fcontact) \
+                * (pow_act & (self._kick_pow_k < 0)).float()
             (self._kick_pow_n, self._kick_pow_peak, self._kick_pow_derr, self._kick_pow_paid, self._kick_pow_paid_t,
              pow_speed_r, pow_dir_r, pow_retouch_r, pow_pay, pow_err) = soccer_util.step_kick_pow(
                 pow_act, kick_event, ball_speed, ball_vel[:, 0:2], self._kick_tgt - self._kick_pow_b0,
@@ -2715,7 +2730,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             pow_r = (self._reward_kick_pow_speed_w * pow_speed_r + self._reward_kick_pow_dir_w * pow_dir_r
                      + self._reward_kick_pow_retouch_w * pow_retouch_r
                      + self._reward_kick_pow_knee_w * pow_knee_r
-                     + self._reward_gait_air_w * gait_air_r + self._reward_gait_slide_w * gait_slide_pen)
+                     + self._reward_gait_air_w * gait_air_r + self._reward_gait_slide_w * gait_slide_pen
+                     + self._reward_gait_feet_slip_w * gait_feet_slip)
             self._task_reward_buf += pow_r
             d = self._diag
             d.add_mean("reward_kick_pow_speed", self._reward_kick_pow_speed_w * pow_speed_r)
@@ -2728,6 +2744,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             d.add_mean("gait_contact_frac", fcontact.float().mean(dim=-1))
             d.add_mean("reward_gait_air", self._reward_gait_air_w * gait_air_r)
             d.add_mean("reward_gait_slide", self._reward_gait_slide_w * gait_slide_pen)
+            d.add_mean("gait_feet_slip", gait_feet_slip)
+            d.add_mean("reward_gait_feet_slip", self._reward_gait_feet_slip_w * gait_feet_slip)
 
         # diagnostics: weighted per-term means (goal stream decomposition)
         d = self._diag

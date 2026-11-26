@@ -1,0 +1,12 @@
+# kps1n (exp power/kps1n): ver data/envs/mcwamp_t1_soccer_kps1n_env.yaml; retomado do kps1k it3800 (1,249B). Teto 1,65B amostras.
+--num_envs 2048
+--visualize false
+
+--engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1n_env.yaml
+--agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
+
+--logger wandb
+--save_int_models true
+--max_samples 1650000000
+--out_dir output/t1_soccer_kps1n/

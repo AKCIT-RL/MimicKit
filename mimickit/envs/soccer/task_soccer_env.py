@@ -750,6 +750,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_kick_pow_speed_w = float(env_config.get("reward_kick_pow_speed_w", 0.0))
         self._reward_kick_pow_dir_w = float(env_config.get("reward_kick_pow_dir_w", 0.0))
         self._reward_kick_pow_retouch_w = float(env_config.get("reward_kick_pow_retouch_w", 0.0))
+        # kps1l: locked knee of the kicking leg (the foot nearest the ball at the first contact) during
+        # kick_pow_knee_s after that contact, below kick_pow_knee_min rad; weight 0 = off (diag still logged)
+        self._reward_kick_pow_knee_w = float(env_config.get("reward_kick_pow_knee_w", 0.0))
+        self._kick_pow_knee_min = float(env_config.get("kick_pow_knee_min", 0.15))
+        self._kick_pow_knee_s = float(env_config.get("kick_pow_knee_s", 1.0))
 
         # ball-state reward gating (T1 ball_rolling_scale): while the ball
         # rolls, the robot->ball approach potential is zeroed so chasing the
@@ -1309,6 +1314,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_paid = torch.zeros([num_envs], device=self._device, dtype=torch.bool)
         self._kick_pow_paid_t = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._kick_pow_b0 = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._kick_pow_foot = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
+        self._kick_pow_k = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
 
         self._prev_root_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._prev_ball_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
@@ -2576,6 +2583,16 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             start = pow_act & kick_event & (self._kick_pow_n < 0) & ~self._kick_pow_paid
             # the aim is the ball->target direction at the first contact
             self._kick_pow_b0[:] = torch.where(start.unsqueeze(-1), self._prev_ball_pos[:, 0:2], self._kick_pow_b0)
+            # kicking leg = foot nearest the ball at the first contact; k counts steps since that contact
+            fd = torch.linalg.norm(self._engine.get_body_pos(self._get_char_id())[:, self._foot_body_ids, :]
+                                   - self._prev_ball_pos.unsqueeze(1), dim=-1)
+            self._kick_pow_foot[:] = torch.where(start, fd.argmin(dim=1), self._kick_pow_foot)
+            self._kick_pow_k[:] = torch.where(start, torch.zeros_like(self._kick_pow_k),
+                                              torch.where(self._kick_pow_k >= 0, self._kick_pow_k + 1, self._kick_pow_k))
+            knee_steps = int(round(self._kick_pow_knee_s / self._engine.get_timestep()))
+            pow_knee_r = pow_act.float() * soccer_util.compute_kick_leg_knee_penalty(
+                self._engine.get_dof_pos(self._get_char_id()), self._knee_dof_ids, self._kick_pow_foot,
+                self._kick_pow_k, knee_steps, self._kick_pow_knee_min)
             (self._kick_pow_n, self._kick_pow_peak, self._kick_pow_derr, self._kick_pow_paid, self._kick_pow_paid_t,
              pow_speed_r, pow_dir_r, pow_retouch_r, pow_pay, pow_err) = soccer_util.step_kick_pow(
                 pow_act, kick_event, ball_speed, ball_vel[:, 0:2], self._kick_tgt - self._kick_pow_b0,
@@ -2681,12 +2698,15 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             + self._reward_ball_oob_w * oob_pen
         if (pow_act is not None):
             pow_r = (self._reward_kick_pow_speed_w * pow_speed_r + self._reward_kick_pow_dir_w * pow_dir_r
-                     + self._reward_kick_pow_retouch_w * pow_retouch_r)
+                     + self._reward_kick_pow_retouch_w * pow_retouch_r
+                     + self._reward_kick_pow_knee_w * pow_knee_r)
             self._task_reward_buf += pow_r
             d = self._diag
             d.add_mean("reward_kick_pow_speed", self._reward_kick_pow_speed_w * pow_speed_r)
             d.add_mean("reward_kick_pow_dir", self._reward_kick_pow_dir_w * pow_dir_r)
             d.add_mean("reward_kick_pow_retouch", self._reward_kick_pow_retouch_w * pow_retouch_r)
+            d.add_mean("kick_pow_knee_pen", pow_knee_r)
+            d.add_mean("reward_kick_pow_knee", self._reward_kick_pow_knee_w * pow_knee_r)
 
         # diagnostics: weighted per-term means (goal stream decomposition)
         d = self._diag
@@ -5376,6 +5396,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_derr[env_ids] = 0.0
         self._kick_pow_paid[env_ids] = False
         self._kick_pow_paid_t[env_ids] = 0.0
+        self._kick_pow_foot[env_ids] = -1
+        self._kick_pow_k[env_ids] = -1
         return
 
     def _kick_pow_active(self):

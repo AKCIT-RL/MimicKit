@@ -369,6 +369,19 @@ def compute_knee_bend_penalty(dof_pos, knee_ids, min_angle: float):
 
 
 @torch.jit.script
+def compute_kick_leg_knee_penalty(dof_pos, knee_ids, foot, k, steps: int, min_angle: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, int, float) -> Tensor
+    """Locked knee of the kicking leg after a power kick (kps1l, docs/t1/44): normalised shortfall
+    clamp(min_angle - q_knee, 0) / min_angle of the knee of ``foot`` (index into knee_ids, -1 = none),
+    while 0 <= k < steps (k = steps since the first kick contact). 0 elsewhere; 1 = leg fully straight."""
+    on = (foot >= 0) & (k >= 0) & (k < steps)
+    knee = dof_pos.index_select(-1, knee_ids)
+    q = torch.gather(knee, 1, foot.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    pen = torch.clamp_min(min_angle - q, 0.0) / max(min_angle, 1.0e-6)
+    return on.float() * pen
+
+
+@torch.jit.script
 def compute_torso_lean_penalty(root_rot, max_lean: float):
     # type: (Tensor, float) -> Tensor
     """Forward lean of the torso beyond ``max_lean`` (unit-vector component, about

@@ -1,0 +1,30 @@
+# up1i (exp getup/up1i): copia do pdx com hip_pitch kp 80->40, kd 5.096->3.6, SO para o professor (nao usar no deploy/aluno).
+# PD EXPLICITO (exp power/kps, 2026-11-23): isaac_lab_engine_flat_field.yaml com control_mode pd_explicit e os ganhos
+# do isaac_lab_engine_terrain_all_pdx.yaml (deploy MJCF t1_deploy). Gemeo Lab do isaac_gym_engine_flat_field_pdx.yaml
+# (motor da grade de chute e da nav nas avaliacoes da linha power).
+engine_name: "isaac_lab"
+
+control_mode: "pd_explicit"
+
+# Explicit PD gains per joint {regex: [kp, kd, effort_limit N.m]}: the deploy MJCF data/assets/t1_deploy/t1.xml
+# (stiffness, damping, actuatorfrcrange), the same values the implicit drive reads from the USD in "pos"
+pd_explicit_gains:
+  "aahead_.*": [4.0, 0.2548, 7.0]
+  ".*_shoulder_.*": [4.0, 0.2548, 18.0]
+  ".*_elbow_.*": [4.0, 0.2548, 18.0]
+  "waist_yaw_joint": [80.0, 5.096, 25.0]
+  ".*_hip_pitch_joint": [40.0, 3.6, 45.0]
+  ".*_hip_roll_joint": [80.0, 5.096, 25.0]
+  ".*_hip_yaw_joint": [80.0, 5.096, 25.0]
+  ".*_knee_pitch_joint": [80.0, 5.096, 60.0]
+  ".*_ankle_pitch_joint": [30.0, 1.911, 24.0]
+  ".*_ankle_roll_joint": [30.0, 1.911, 15.0]
+control_freq: 30
+sim_freq: 120
+env_spacing: 0
+
+ground:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0

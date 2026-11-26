@@ -755,6 +755,14 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._reward_kick_pow_knee_w = float(env_config.get("reward_kick_pow_knee_w", 0.0))
         self._kick_pow_knee_min = float(env_config.get("kick_pow_knee_min", 0.15))
         self._kick_pow_knee_s = float(env_config.get("kick_pow_knee_s", 1.0))
+        # kps1o/kps1p: gait before the first ball contact of a power episode (shuffling approach with dragged feet).
+        # air: on each foot touchdown pay min(air time, gait_air_max) - gait_air_min; slide: xy speed of grounded feet.
+        # A foot is grounded when its contact force norm >= gait_contact_n. Weight 0 = off (diags still logged).
+        self._reward_gait_air_w = float(env_config.get("reward_gait_air_w", 0.0))
+        self._reward_gait_slide_w = float(env_config.get("reward_gait_slide_w", 0.0))
+        self._gait_air_min = float(env_config.get("gait_air_min", 0.25))
+        self._gait_air_max = float(env_config.get("gait_air_max", 0.5))
+        self._gait_contact_n = float(env_config.get("gait_contact_n", 5.0))
 
         # ball-state reward gating (T1 ball_rolling_scale): while the ball
         # rolls, the robot->ball approach potential is zeroed so chasing the
@@ -1315,6 +1323,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_paid_t = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._kick_pow_b0 = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._kick_pow_foot = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
+        self._gait_air_t = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._kick_pow_k = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
 
         self._prev_root_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
@@ -2593,6 +2602,12 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             pow_knee_r = pow_act.float() * soccer_util.compute_kick_leg_knee_penalty(
                 self._engine.get_dof_pos(self._get_char_id()), self._knee_dof_ids, self._kick_pow_foot,
                 self._kick_pow_k, knee_steps, self._kick_pow_knee_min)
+            cid = self._get_char_id()
+            fcontact = torch.linalg.norm(self._engine.get_contact_forces(cid)[:, self._foot_body_ids, :], dim=-1) \
+                >= self._gait_contact_n
+            gait_air_r, gait_slide_pen, self._gait_air_t[:] = soccer_util.compute_gait_air_slide(
+                fcontact, self._engine.get_body_vel(cid)[:, self._foot_body_ids, 0:2], self._gait_air_t,
+                pow_act & (self._kick_pow_k < 0), self._engine.get_timestep(), self._gait_air_min, self._gait_air_max)
             (self._kick_pow_n, self._kick_pow_peak, self._kick_pow_derr, self._kick_pow_paid, self._kick_pow_paid_t,
              pow_speed_r, pow_dir_r, pow_retouch_r, pow_pay, pow_err) = soccer_util.step_kick_pow(
                 pow_act, kick_event, ball_speed, ball_vel[:, 0:2], self._kick_tgt - self._kick_pow_b0,
@@ -2699,7 +2714,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         if (pow_act is not None):
             pow_r = (self._reward_kick_pow_speed_w * pow_speed_r + self._reward_kick_pow_dir_w * pow_dir_r
                      + self._reward_kick_pow_retouch_w * pow_retouch_r
-                     + self._reward_kick_pow_knee_w * pow_knee_r)
+                     + self._reward_kick_pow_knee_w * pow_knee_r
+                     + self._reward_gait_air_w * gait_air_r + self._reward_gait_slide_w * gait_slide_pen)
             self._task_reward_buf += pow_r
             d = self._diag
             d.add_mean("reward_kick_pow_speed", self._reward_kick_pow_speed_w * pow_speed_r)
@@ -2707,6 +2723,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             d.add_mean("reward_kick_pow_retouch", self._reward_kick_pow_retouch_w * pow_retouch_r)
             d.add_mean("kick_pow_knee_pen", pow_knee_r)
             d.add_mean("reward_kick_pow_knee", self._reward_kick_pow_knee_w * pow_knee_r)
+            d.add_mean("gait_air", gait_air_r)
+            d.add_mean("gait_slide", gait_slide_pen)
+            d.add_mean("gait_contact_frac", fcontact.float().mean(dim=-1))
+            d.add_mean("reward_gait_air", self._reward_gait_air_w * gait_air_r)
+            d.add_mean("reward_gait_slide", self._reward_gait_slide_w * gait_slide_pen)
 
         # diagnostics: weighted per-term means (goal stream decomposition)
         d = self._diag
@@ -5397,6 +5418,7 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_paid[env_ids] = False
         self._kick_pow_paid_t[env_ids] = 0.0
         self._kick_pow_foot[env_ids] = -1
+        self._gait_air_t[env_ids] = 0.0
         self._kick_pow_k[env_ids] = -1
         return
 

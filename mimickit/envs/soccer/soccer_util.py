@@ -382,6 +382,20 @@ def compute_kick_leg_knee_penalty(dof_pos, knee_ids, foot, k, steps: int, min_an
 
 
 @torch.jit.script
+def compute_gait_air_slide(contact, foot_vel_xy, air_t, on, dt: float, air_min: float, air_max: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float) -> Tuple[Tensor, Tensor, Tensor]
+    # contact [n, f] bool, foot_vel_xy [n, f, 2], air_t [n, f] seconds the foot has been off the ground, on [n] bool.
+    # air: on each touchdown pay min(air_t, air_max) - air_min (a short shuffle step is negative); slide: xy speed of
+    # the feet that are on the ground (a dragged foot). Both are zero where on is False. Returns (air_r, slide_pen, air_t).
+    touchdown = contact & (air_t > 0.0)
+    air_r = torch.sum(touchdown.float() * (torch.clamp_max(air_t, air_max) - air_min), dim=-1)
+    slide = torch.sum(contact.float() * torch.linalg.norm(foot_vel_xy, dim=-1), dim=-1)
+    new_air = torch.where(contact, torch.zeros_like(air_t), air_t + dt)
+    onf = on.float()
+    return air_r * onf, slide * onf, new_air
+
+
+@torch.jit.script
 def compute_torso_lean_penalty(root_rot, max_lean: float):
     # type: (Tensor, float) -> Tensor
     """Forward lean of the torso beyond ``max_lean`` (unit-vector component, about

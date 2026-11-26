@@ -768,6 +768,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         # the force sensor (>= gait_contact_n), not the steering env's sole height < 1 cm: the soccer ground is uneven
         # (+-1 mm .. +-5 cm tiles) and this env has no terrain height lookup. Same gate as the terms above.
         self._reward_gait_feet_slip_w = float(env_config.get("reward_gait_feet_slip_w", 0.0))
+        # kps1q: swing height. On each touchdown pay min(apex, gait_apex_max) - gait_apex_min, apex = highest lowest-corner
+        # height above the lift-off height since the foot left the ground. Same gate as the terms above.
+        self._reward_gait_apex_w = float(env_config.get("reward_gait_apex_w", 0.0))
+        self._gait_apex_min = float(env_config.get("gait_apex_min", 0.06))
+        self._gait_apex_max = float(env_config.get("gait_apex_max", 0.10))
         self._gait_foot_box_corners = steering_util.build_foot_box_corners(
             tuple(env_config.get("foot_box_half", steering_util.DEFAULT_FOOT_BOX_HALF)),
             tuple(env_config.get("foot_box_pos", steering_util.DEFAULT_FOOT_BOX_POS)))
@@ -1332,6 +1337,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_b0 = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._kick_pow_foot = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
         self._gait_air_t = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
+        self._gait_lift_z = torch.full([num_envs, 2], 1.0e3, device=self._device, dtype=torch.float)
+        self._gait_apex = torch.zeros([num_envs, 2], device=self._device, dtype=torch.float)
         self._kick_pow_k = torch.full([num_envs], -1, device=self._device, dtype=torch.long)
 
         self._prev_root_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
@@ -2613,14 +2620,17 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             cid = self._get_char_id()
             fcontact = torch.linalg.norm(self._engine.get_contact_forces(cid)[:, self._foot_body_ids, :], dim=-1) \
                 >= self._gait_contact_n
-            gait_air_r, gait_slide_pen, self._gait_air_t[:] = soccer_util.compute_gait_air_slide(
-                fcontact, self._engine.get_body_vel(cid)[:, self._foot_body_ids, 0:2], self._gait_air_t,
-                pow_act & (self._kick_pow_k < 0), self._engine.get_timestep(), self._gait_air_min, self._gait_air_max)
             fids = self._foot_body_ids
             sole_z, cp_vel = steering_util.compute_sole_contact_state(
                 self._engine.get_body_pos(cid)[:, fids, :], self._engine.get_body_rot(cid)[:, fids, :],
                 self._engine.get_body_vel(cid)[:, fids, :], self._engine.get_body_ang_vel(cid)[:, fids, :],
                 self._gait_foot_box_corners.to(self._device))
+            gait_apex_r, self._gait_lift_z[:], self._gait_apex[:] = soccer_util.compute_gait_apex(
+                fcontact, sole_z, self._gait_lift_z, self._gait_apex, self._gait_air_t,
+                pow_act & (self._kick_pow_k < 0), self._gait_apex_min, self._gait_apex_max)
+            gait_air_r, gait_slide_pen, self._gait_air_t[:] = soccer_util.compute_gait_air_slide(
+                fcontact, self._engine.get_body_vel(cid)[:, self._foot_body_ids, 0:2], self._gait_air_t,
+                pow_act & (self._kick_pow_k < 0), self._engine.get_timestep(), self._gait_air_min, self._gait_air_max)
             gait_feet_slip = steering_reward.compute_feet_slip_penalty(cp_vel, fcontact) \
                 * (pow_act & (self._kick_pow_k < 0)).float()
             (self._kick_pow_n, self._kick_pow_peak, self._kick_pow_derr, self._kick_pow_paid, self._kick_pow_paid_t,
@@ -2731,7 +2741,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                      + self._reward_kick_pow_retouch_w * pow_retouch_r
                      + self._reward_kick_pow_knee_w * pow_knee_r
                      + self._reward_gait_air_w * gait_air_r + self._reward_gait_slide_w * gait_slide_pen
-                     + self._reward_gait_feet_slip_w * gait_feet_slip)
+                     + self._reward_gait_feet_slip_w * gait_feet_slip
+                     + self._reward_gait_apex_w * gait_apex_r)
             self._task_reward_buf += pow_r
             d = self._diag
             d.add_mean("reward_kick_pow_speed", self._reward_kick_pow_speed_w * pow_speed_r)
@@ -2746,6 +2757,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
             d.add_mean("reward_gait_slide", self._reward_gait_slide_w * gait_slide_pen)
             d.add_mean("gait_feet_slip", gait_feet_slip)
             d.add_mean("reward_gait_feet_slip", self._reward_gait_feet_slip_w * gait_feet_slip)
+            d.add_mean("gait_apex", gait_apex_r)
+            d.add_mean("reward_gait_apex", self._reward_gait_apex_w * gait_apex_r)
 
         # diagnostics: weighted per-term means (goal stream decomposition)
         d = self._diag
@@ -5437,6 +5450,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_paid_t[env_ids] = 0.0
         self._kick_pow_foot[env_ids] = -1
         self._gait_air_t[env_ids] = 0.0
+        self._gait_apex[env_ids] = 0.0
+        self._gait_lift_z[env_ids] = 1.0e3  # no lift-off height until the first grounded step: apex stays 0
         self._kick_pow_k[env_ids] = -1
         return
 

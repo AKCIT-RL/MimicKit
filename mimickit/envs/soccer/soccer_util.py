@@ -396,6 +396,20 @@ def compute_gait_air_slide(contact, foot_vel_xy, air_t, on, dt: float, air_min: 
 
 
 @torch.jit.script
+def compute_gait_apex(contact, sole_z, lift_z, apex, air_t, on, h_min: float, h_max: float):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float) -> Tuple[Tensor, Tensor, Tensor]
+    # contact [n, f] bool, sole_z [n, f] lowest foot-box corner height (world), lift_z [n, f] sole_z at the last
+    # grounded step, apex [n, f] highest sole_z - lift_z since lift-off, air_t [n, f] air time BEFORE this step's update.
+    # On each touchdown pay min(apex, h_max) - h_min (a low shuffle step is negative). Relative to the lift-off height,
+    # so the uneven ground does not need a height lookup. Zero where on is False. Returns (apex_r, lift_z, apex).
+    touchdown = contact & (air_t > 0.0)
+    apex_r = torch.sum(touchdown.float() * (torch.clamp_max(apex, h_max) - h_min), dim=-1)
+    new_lift = torch.where(contact, sole_z, lift_z)
+    new_apex = torch.where(contact, torch.zeros_like(apex), torch.maximum(apex, sole_z - lift_z))
+    return apex_r * on.float(), new_lift, new_apex
+
+
+@torch.jit.script
 def compute_torso_lean_penalty(root_rot, max_lean: float):
     # type: (Tensor, float) -> Tensor
     """Forward lean of the torso beyond ``max_lean`` (unit-vector component, about

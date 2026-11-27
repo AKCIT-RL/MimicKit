@@ -1,12 +1,12 @@
-# kps1s (exp power/kps1): smoke do kps1a (512 envs, 6M amostras, logger txt). Conferir kick_pow_* e reward_* no log.txt e ausencia de Traceback.
---num_envs 512
+# kps1s (exp power/kps1s): ver data/envs/mcwamp_t1_soccer_kps1s_env.yaml; retomado do kps1p it5000 (1,577B). Teto 1,98B amostras.
+--num_envs 2048
 --visualize false
 
 --engine_config data/engines/isaac_lab_engine_terrain_all_pdx.yaml
---env_config data/envs/mcwamp_t1_soccer_kps1a_env.yaml
+--env_config data/envs/mcwamp_t1_soccer_kps1s_env.yaml
 --agent_config data/agents/mcwamp_t1_soccer_enc_kps1_agent.yaml
 
---logger txt
+--logger wandb
 --save_int_models true
---max_samples 6000000
+--max_samples 1980000000
 --out_dir output/t1_soccer_kps1s/

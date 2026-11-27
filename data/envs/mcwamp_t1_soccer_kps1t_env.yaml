@@ -1,4 +1,4 @@
-# kps1s (exp power/kps1s): kps1q com reward_gait_apex_w 100 -> 300
+# kps1t (exp power/kps1t): kps1q com reward_gait_apex_w 100 -> 300
 # kps1k (exp power/kps1k): kps1i com penalidade de retoque mais forte (reward_kick_pow_retouch_w -500 -> -1000); retomado do kps1i it7604 (fim, 1,0B).
 # kps1i (exp power/kps1i): kps1g com a cauda da velocidade mais forte (tail_w 0.5 -> 1.0, tail_s 2.0 -> 1.0): chute curto por 0,8 m/s passa a perder ~2,6x mais.
 # kps1g (exp power/kps1g): kps1f com kick_pow_speed_dir_mult true: a recompensa de velocidade so paga na direcao certa (r_speed *= r_dir).

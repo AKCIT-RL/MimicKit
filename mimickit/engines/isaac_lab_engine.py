@@ -561,6 +561,13 @@ class IsaacLabEngine(engine.Engine):
         torque_lim = torque_lim[dof_order_sim2common]
         return torque_lim.cpu().numpy()
     
+    def get_obj_effort_limits(self, obj_id):
+        """Actuator effort limits [num_envs, num_dofs] in the common dof order. With pd_explicit the PhysX
+        max force (get_obj_torque_limits) is the explicit-actuator placeholder, not the motor limit."""
+        obj = self._objs[obj_id]
+        lim = obj.actuators["actuators"].effort_limit
+        return lim[:, self._dof_order_sim2common[obj_id]]
+
     def get_obj_dof_limits(self, env_id, obj_id):
         obj = self._objs[obj_id]
         dof_limits = obj.root_physx_view.get_dof_limits()[env_id]

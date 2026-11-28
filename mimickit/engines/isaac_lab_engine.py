@@ -96,6 +96,12 @@ class IsaacLabEngine(engine.Engine):
         # pd_explicit: per-joint {regex: [kp, kd, effort_limit]}. The articulation reads 0 / 1e9 for explicit
         # actuators (the USD drive is not kept), so the gains must be given here (check_pd_explicit, 2026-11-16)
         self._pd_explicit_gains = config.get("pd_explicit_gains", None)
+        # exp power/kps7v: realistic motor envelope for pd_explicit. {regex: joint velocity limit rad/s} (T1 URDF,
+        # resources/T1/T1_locomotion.urdf) turns the IdealPD actuator into a per-joint DC motor: full effort_limit up
+        # to the corner speed, then linear drop to 0 at the velocity limit; stall torque = sat_ratio * effort_limit
+        # (sat_ratio 2: corner at half the limit). Absent: unchanged IdealPD (no velocity limit, as before).
+        self._pd_explicit_vel_limits = config.get("pd_explicit_vel_limits", None)
+        self._pd_explicit_sat_ratio = float(config.get("pd_explicit_sat_ratio", 2.0))
 
         self._env_offsets = self._compute_env_offsets(num_envs)
         self._build_ground()
@@ -922,10 +928,18 @@ class IsaacLabEngine(engine.Engine):
         elif (control_mode == engine.ControlMode.pd_explicit):
             gains = self._pd_explicit_gains
             assert(gains is not None), "pd_explicit needs pd_explicit_gains in the engine config"
-            actuator_cfg = IdealPDActuatorCfg(joint_names_expr=[".*"],
-                                              stiffness={k: float(v[0]) for k, v in gains.items()},
-                                              damping={k: float(v[1]) for k, v in gains.items()},
-                                              effort_limit={k: float(v[2]) for k, v in gains.items()})
+            kw = dict(joint_names_expr=[".*"],
+                      stiffness={k: float(v[0]) for k, v in gains.items()},
+                      damping={k: float(v[1]) for k, v in gains.items()},
+                      effort_limit={k: float(v[2]) for k, v in gains.items()})
+            if (self._pd_explicit_vel_limits is not None):
+                vl = self._pd_explicit_vel_limits
+                assert(set(vl.keys()) == set(gains.keys())), "pd_explicit_vel_limits needs the pd_explicit_gains regexes"
+                actuator_cfg = _per_joint_dc_motor_cfg()(velocity_limit={k: float(v) for k, v in vl.items()},
+                                                         saturation_effort=1.0,
+                                                         sat_ratio=self._pd_explicit_sat_ratio, **kw)
+            else:
+                actuator_cfg = IdealPDActuatorCfg(**kw)
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
 
@@ -1415,3 +1429,30 @@ class IsaacLabEngine(engine.Engine):
         self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self)
         Logger.print("Video recording enabled")
         return
+
+
+_PER_JOINT_DC_CFG = None
+
+
+def _per_joint_dc_motor_cfg():
+    """DCMotorCfg whose stall torque is per joint (sat_ratio * effort_limit); Isaac Lab's DCMotor takes one
+    scalar saturation_effort for the whole group. Built lazily: isaaclab imports only after the app starts."""
+    global _PER_JOINT_DC_CFG
+    if (_PER_JOINT_DC_CFG is None):
+        from isaaclab.actuators import DCMotorCfg
+        from isaaclab.actuators.actuator_pd import DCMotor
+        from isaaclab.utils import configclass
+
+        class PerJointDCMotor(DCMotor):
+            def __init__(self, cfg, *args, **kwargs):
+                super().__init__(cfg, *args, **kwargs)
+                self._saturation_effort = self.effort_limit * float(cfg.sat_ratio)
+                self._vel_at_effort_lim = self.velocity_limit * (1.0 + self.effort_limit / self._saturation_effort)
+
+        @configclass
+        class PerJointDCMotorCfg(DCMotorCfg):
+            class_type: type = PerJointDCMotor
+            sat_ratio: float = 2.0
+
+        _PER_JOINT_DC_CFG = PerJointDCMotorCfg
+    return _PER_JOINT_DC_CFG

@@ -699,6 +699,8 @@ class TaskSoccerEnv(smp_env.SMPEnv):
         self._kick_pow_vmin = float(env_config.get("kick_pow_vmin", 0.8))
         self._kick_pow_vmax = float(env_config.get("kick_pow_vmax", 7.0))
         self._kick_pow_p_lo = float(env_config.get("kick_pow_p_lo", 0.0))
+        # kps1x: upper bound of p (default 1). p > 1 extends v0 = vmin + p (vmax - vmin) past vmax on the same scale.
+        self._kick_pow_p_hi = float(env_config.get("kick_pow_p_hi", 1.0))
         self._kick_pow_p_slot4 = bool(env_config.get("kick_pow_p_slot4", False))  # kpx5: p also in steering slot 4
         # kpf6: kick_direction pays ~linearly in ball speed (100 * (v - min_vel), decayed); on in power episodes it
         # pulls the kick above v0. True masks it there (pow_dir_r already scores the aim)
@@ -5436,11 +5438,11 @@ class TaskSoccerEnv(smp_env.SMPEnv):
                 # half of the draws on the frontier [lo, lo + win), the rest on [lo, 1]
                 lo = self._kick_pow_adapt_lo
                 hi = torch.where(torch.rand([n], device=self._device) < self._kick_pow_adapt_front_prob,
-                                 torch.full([n], min(lo + self._kick_pow_adapt_win, 1.0), device=self._device),
-                                 torch.ones([n], device=self._device))
+                                 torch.full([n], min(lo + self._kick_pow_adapt_win, self._kick_pow_p_hi), device=self._device),
+                                 torch.full([n], self._kick_pow_p_hi, device=self._device))
                 p = lo + (hi - lo) * torch.rand([n], device=self._device)
             else:
-                p = lo + (1.0 - lo) * torch.rand([n], device=self._device)
+                p = lo + (self._kick_pow_p_hi - lo) * torch.rand([n], device=self._device)
         self._kick_pow_on[env_ids] = use
         self._kick_pow_p[env_ids] = torch.where(use, p, torch.zeros_like(p))
         self._kick_pow_n[env_ids] = -1
